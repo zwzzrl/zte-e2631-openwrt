@@ -157,9 +157,10 @@ DHCP DISCOVER，谁应答谁当 WAN」，两处硬伤都在真机上撞到了 �
 WAN 区 input 是 REJECT，SSH/HTTP 立刻全断、只剩 ping，只能到现场换网线才恢复。
 所以自动那套代码、开机服务、热插拔钩子、`udhcpc` 空脚本全部删除，`apply` 是唯一入口。
 
-**真机状态**：v4 镜像（含本功能）已经通过原厂 `supgrade.html` 写进 slot1 并启动，
-`OpenWrt SNAPSHOT 0e2631` / 内核 `6.18.55`；手动切口、网桥重排、MAC 固化与还原、
-LuCI 页面都在这台机器上验过。
+**真机状态**：v4 通过原厂 `supgrade.html` 写进 slot1，v5（手动版收尾）是**在
+OpenWrt 里用 `sysupgrade -n` 刷的**，都起来了：`OpenWrt SNAPSHOT 0e2631` / 内核
+`6.18.55`。手动切口、网桥重排、MAC 固化与还原、LuCI 页面都在这台机器上验过；
+`05-路由器操作脚本/verify-wanport.sh` 只读 15 项 + 真切换 6 项全过。
 
 ### 旧状态表（v1.2 口径，留作对照）
 
