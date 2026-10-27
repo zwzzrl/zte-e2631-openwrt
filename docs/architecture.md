@@ -128,8 +128,14 @@ What crosses the boundary, and what deliberately does not:
   valid callbacks that refuse, not with dangling ones.
 * The module is **autoloaded from `/etc/init.d/boot`**, before `/etc/rc.d/S19firewall`
   binds the nft flowtable through `ndo_setup_tc`; a bind that arrives with no engine
-  registered is refused and never retried. Reloading the module at runtime (which is the
-  point of the split) therefore ends with `/etc/init.d/firewall restart` to bind again.
+  registered is refused and never retried, so the order matters.
+* Reloading the module does **not** need a firewall restart: the TC blocks outlive the
+  unload, and the module's init asks the core (`zx_ppe_has_bound_blocks()`) whether a
+  flowtable is still bound and re-programs the hardware if so. What a reload does lose is
+  the flow entries themselves - the hashtable is flushed on stop - so connections that
+  were offloaded finish on the CPU path. There is no counter of bindings anywhere: the
+  driver list the core fills is the truth, because a counter cannot survive a ruleset
+  reload (bind new, then unbind old) or an unload (see PPE-BIND-ACCOUNTING).
 
 ## Wi-Fi, and why it is off by default
 

@@ -293,6 +293,30 @@ points at something in the repository or at a measurement.
   surface: contributing
   symptom: nothing runs on a push; the build happens on someone's machine
   note: deliberate (the owner publishes releases by hand). make check is the entry point that replaced the workflow's gates
+- id: PPE-BIND-ACCOUNTING
+  severity: major
+  status: fixed
+  surface: ethernet
+  symptom: the flowtable is bound and nft accepts flows, but the PPE is off - ppe_active=0, every packet takes the CPU path, no warning anywhere
+  verified: yes - 2026-10-28 on slot 1 serial 24 (kmod-e2631-ppe build): after rmmod/insmod plus /etc/init.d/firewall restart, /sys/kernel/debug/92000000.ethernet/dma_state read ppe_active=0 while `nft list flowtables` still listed the flowtable with all four devices, and the dmesg pairs ended "disabled"
+  cause: |
+    adapter->ppe_users was a counter, incremented on FLOW_BLOCK_BIND and decremented on FLOW_BLOCK_UNBIND.
+    nft replaces a ruleset by binding the NEW flowtable before unbinding the OLD one, so the decrement of
+    the old block took the counter to 0 while the new block was already bound and the driver called
+    zx_ppe_stop(). Nothing ever brought it back up: the next bind saw ppe_users != 0 and skipped
+    zx_ppe_start(). A module reload made it worse - the counter cannot know how many flowtables are
+    actually bound, so it drifted negative and the "if (!ppe_users)" guard could never fire again.
+  workaround: |
+    fixed in the driver on 2026-10-28: the counter is gone, and the answer to "is any flowtable bound"
+    comes from zx_ppe_block_cb_list (zx_ppe_has_bound_blocks(), exported), which the TC core itself
+    populates and drains. Bind starts the hardware only when ppe_active is 0, unbind stops it only when
+    the list is empty, and the module's init re-attaches to whatever it finds. Verified on slot 1
+    serial 26: ppe_active=1 at boot, fw4 restart leaves it at 1 (the log is now enabled, disabled,
+    enabled - the last transition is a bind), rmmod/insmod alone brings it back to 1 without touching
+    the firewall, and a 12 s IPv4 TCP stream through the router (VM 192.168.10.2 -> 192.168.1.243,
+    hairpin, so a genuinely forwarded flow) ran at 934 Mbit/s with ppe_flows=4, ppe_add_skip=0,
+    ppe_add_fail=0
+  next: none - but note that this counter existed in the built-in driver too, so this was not introduced by the module split, only exposed by it (the reload path was never reachable before)
 ```
 
 ## WIFI-ASSOC-HARD-HANG
@@ -462,3 +486,24 @@ UpTime 单调增长（没有重启循环），WebUI 响应正常（也没有 res
 剩下的线索：`CspHardCodeParamGet`（按参数名取 per-device 密钥）、`/etc/enhardcodefile`（9376 B）、
 `/etc/enwebdhardcodefile`（1712 B）。配置还原这个入口要用起来，得先把 per-device 密钥破了；
 在那之前它只是"能上传、会被内容校验拒"的空壳。
+
+## PPE 引擎拆成模块（v1.5，2026-10-28）
+
+目的只有一个：让"改一行分类器代码"不再等于"等一次 40~45 分钟的内核重编"。PPE
+（分类器 index/rule 表、两个哈希 bank、重写表、IPv6 表）现在是包
+`overlay/package/kernel/kmod-e2631-ppe`，内建驱动通过 `zx279128s-ppe.h` 里的钩子表
+调它。边界为什么这么划、什么不能跨过去，写在 `docs/architecture.md` 和
+`BUILD.md` 第 9 节，这里只记实测。
+
+- 快路：`make package/kernel/kmod-e2631-ppe/compile`，连 overlay 同步一共
+  **11.2 秒**（旧路：改 `files/` 下一次全量 45 分钟）。
+- 真机闭环（slot 1 serial 26）：改完 `.ko` → `scp` 到 `/tmp/new-ppe.ko` →
+  `rmmod zx279128s_ppe; insmod /tmp/new-ppe.ko` → 不用碰防火墙，模块 init 自己
+  把已经绑着的 flowtable 接管回来（`ppe_active=1`）→ 再打同一批 IPv4 流，930 Mbit/s、
+  `ppe_flows=4`。
+- 开机路径没变：模块由 `/etc/init.d/boot` 里的 `/sbin/kmodloader` 从
+  `/etc/modules.d/31-e2631-ppe` 加载，早于 `/etc/rc.d/S19firewall` 的 flowtable 绑定；
+  没有引擎时 `ndo_setup_tc` 的 BIND 返回 `-EOPNOTSUPP`，也就是"这条流不加速、走软件"，
+  不会崩也不会挂。
+- 新增的 sysfs 路径：`/sys/module/zx279128s_ppe/parameters/ipv6`（旧的
+  `zx279128s_eth` 那个随内建驱动一起没了）。
