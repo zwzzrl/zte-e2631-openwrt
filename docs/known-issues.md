@@ -70,6 +70,16 @@ points at something in the repository or at a measurement.
   cause: v1.2 shipped no flow offload (missing kmod-nft-offload + the firewall flag) although the gmac driver has had the full PPE hardware path (zx279128s-ppe.c, TC_SETUP_FT) all along; WiFi-originated flows are architecturally rejected by the PPE (ingress must be a switch port) and stay on the CPU software path (~200M) - the vendor reaches gigabit over WiFi only via its private IDM/NPP engines on the 4.1 kernel
   workaround: none needed for wired; do NOT use /proc/net/dev WAN counters to measure PPE traffic (hardware-forwarded packets are invisible there) - read ppe_flows in /sys/kernel/debug/92000000.ethernet/dma_state instead
   next: find an unthrottled server to probe the true PPE ceiling (395M was still climbing when stopped); PPPoE uplinks may not take the hardware path (sibling ZX279133 hit exactly that)
+- id: PPE-IPV6-TCP
+  severity: major
+  status: mitigated
+  surface: ethernet + ipv6
+  symptom: LAN client -> router over IPv6 TCP connects in ~1 ms and then no payload ever arrives (0 bytes, times out); IPv4 over the same port and ICMPv6 are fine, so it reads as a random hang. Also stalls IPv6 TCP through the router to the internet.
+  verified: yes - 2026-10-27 on a freshly flashed image: flow_offloading=1 + flow_offloading_hw=1 -> connect ok, 0 bytes in 6 s; hw=0 -> HTTP/1.0 200 OK in 1 ms; 0/0 -> same. Reproduced on ports 80/22/53 with both a ULA and a fe80 destination (fw4 stop/start flipped it every time)
+  cause: with flow_offloading_hw=1 fw4 hands the nft flow block to zx279128s-ppe.c via TC_SETUP_FT, and the PPE's IPv6 TCP offload path is broken on this SoC - offloaded TCP return traffic never leaves. ICMPv6 is not offloaded, which is why ping6 stays green
+  workaround: "since 2026-10-27 the image default is flow_offloading=0 + flow_offloading_hw=0 (etc/uci-defaults/99_e2631_flowoffload). The feature, kmod-nft-offload, the driver and both firewall options are unchanged - switch them on in LuCI for the wired throughput, accepting that IPv6 TCP will stall again"
+  next: reject IPv6 flows in zx_eth_setup_tc()/TC_SETUP_FT (-EOPNOTSUPP) so IPv4 keeps the PPE path while IPv6 stays on the CPU; not done, driver untouched
+  docs: 01-文档/BUILD-NOTES.md 2026-10-27 (both entries)
 - id: USERDATA-EXTROOT
   severity: minor
   status: mitigated
