@@ -49,6 +49,19 @@ for f in sbin/e2631-probe sbin/e2631-trial sbin/e2631-commit sbin/e2631-leds sbi
 	chmod +x "$TREE/target/linux/sanechips/base-files/$f"
 done
 
+# Same problem, one level deeper: rpcd execs the files in /usr/libexec/rpcd, so a
+# 0644 plugin is a page that shows an empty result and an rpcd log line nobody
+# reads. The v3 image was built exactly like that - /usr/libexec/rpcd/e2631 (the
+# board page) and the five luci.argon_* plugins are 0644 in the squashfs, so only
+# luci.zte-mesh, which happened to be committed executable, worked.
+# Walk the freshly copied package trees and set the bit; package/feeds/* are
+# symlinks into feeds/, and find does not follow them, so feeds stay untouched.
+plugins=$(find "$TREE/package" -type f -path '*/root/usr/libexec/rpcd/*' 2>/dev/null || true)
+if [ -n "$plugins" ]; then
+	echo "$plugins" | while read -r f; do chmod 0755 "$f"; done
+	echo "rpcd plugins made executable: $(echo "$plugins" | wc -l)"
+fi
+
 # rc.d enablement deliberately ships NO "S95..." files: a Windows checkout of
 # this repository cannot hold symlinks (the file becomes regular text and rcS
 # would execute it), and rootfs.mk already auto-enables every init script that
