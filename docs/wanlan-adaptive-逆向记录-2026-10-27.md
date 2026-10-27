@@ -179,6 +179,9 @@ switchtst -sdwan [port] [mode] [WANIDX]      ← 双 WAN：把某口绑到 WAN1/
 2. **绝不用 DHCP 探测正在当 WAN 的那个口**：netifd 自己的 udhcpc 正在它上面跑，
    再插一个同 MAC 的客户端会互相抢租约。现用口的死活改问
    `ubus call network.interface.wan status`——它 up 就直接返回，一个字节都不动。
+3. **`wan6` 绑的是 `@wan` 别名时一个字都不能写**：别名本来就跟着 `wan` 走，写成
+   具体设备名等于把别名换成固定设备，之后换口时 `wan6` 会落到一个不存在的 netdev
+   上——IPv6 静默哑掉，没有任何日志。只有显式写了设备名才跟着换。
 
 MAC 策略：WAN 固定用 DTS 给的 `wan` netdev 地址（`macaddr_tag_1e` base+1；
 LAN 口都是 base+0），换物理口时上游看到的 MAC 不变，租约、DUID、上游 MAC 绑定
@@ -203,8 +206,8 @@ LAN 口都是 base+0），换物理口时上游看到的 MAC 不变，租约、D
 ### 7.5 怎么验
 
 - 逻辑层（PC 上，不需要路由器）：`sh scripts/selftest-wanport.sh` —— 假
-  uci/ip/udhcpc/ubus + 假 `/sys`，12 个场景（含探测失败复原、MAC 借用与恢复、
-  rpcd 的 JSON 形状）。故意改坏「探测后放回网桥」和「不探现用口」都会报警。
+  uci/ip/udhcpc/ubus + 假 `/sys`，13 个场景（含探测失败复原、MAC 借用与恢复、
+  wan6 别名、rpcd 的 JSON 形状）。故意改坏「探测后放回网桥」和「不探现用口」都会报警。
 - 真机：`/sbin/e2631-wanport status` 看状态，`detect` 看探测结果，
   `DRY_RUN=1 apply lan2` 看要改哪些配置。
 

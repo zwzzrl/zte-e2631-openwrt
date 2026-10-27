@@ -143,8 +143,9 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
 - **WAN MAC 固定**在 `e2631_ports.global.wan_mac`，取值就是 DTS 给 wan netdev 的地址
   （`macaddr_tag_1e` base+1）。换物理口时上游看到的 MAC 不变，租约、DUID、上游的
   MAC 绑定都还能续。
-- **逻辑层自检在 PC 上跑**：`sh scripts/selftest-wanport.sh`（12 个场景：探测失败必须复原
-  网桥成员、探测期的 MAC 借用与还原、MANUAL/兜底猜测、DRY_RUN、rpcd 的 JSON 形状）。
+- **逻辑层自检在 PC 上跑**：`sh scripts/selftest-wanport.sh`（13 个场景：探测失败必须复原
+  网桥成员、探测期的 MAC 借用与还原、MANUAL/兜底猜测、DRY_RUN、wan6 的 @wan 别名、
+  rpcd 的 JSON 形状）。
   把「探测后放回网桥」或「不探现用口」故意改坏，它都会报警。
 
 **未验证**：这套东西还没在真机上跑过 —— 机器现在停在原厂系统上，刷不刷是用户的决定。
