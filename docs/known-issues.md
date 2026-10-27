@@ -111,6 +111,32 @@ points at something in the repository or at a measurement.
            trap_override=0, i.e. the flow exists before the frames stop being trapped.
        Conclusion: the hardware's IPv6 key is not the 19-homogeneous-window string the
        driver builds.  Where the real one comes from is now known, see "next".
+    4. The vendor's own flow-add path, executed on 2026-10-29 in a Unicorn ARM harness
+       (tm.ko loaded with its relocations, hardware access stubbed, every table setter
+       recorded), narrows this down a lot: the *table entries we build are not the
+       problem*, the missing piece is a write we never make.
+         * tm_acl_fast_init() re-emulated from scratch reproduces rule 144/145 (IPv4)
+           and rule 2/3 (IPv6) byte for byte, and rules 2/3 are exactly the
+           zx_ppe_v6_rule this driver already writes, so the IPv6 rule content is
+           no longer a guess.
+         * tm_acl_fast_add_v4v6() builds the hash entry as: control words, then the key
+           string from byte 16, windows from bit 24, byte 16 = 0x40 | extract index
+           (0x49 for IPv4 index 9) - the layout zx_ppe_hash_entry() uses.
+         * For an IPv6 flow (extract index 10) the same run also calls
+           cla_set_external_hash_table() - a table the driver never writes - and
+           re-patches the extract index through EN_V6FAST_EXTIDXTBL(), which is a
+           read-modify-write of bits 2..3 in the low half of the index entry's word 4
+           (4 = on, 12 = fast).  For an IPv4 flow neither call happens.
+         * The extract index itself comes from aclGetExtIdxRuleRamAddrByPort(): 9 for
+           one direction and 10 for the other, or else a 24-entry port->index table,
+           so "index 10 = the IPv6 extract" is consistent with finding 2.
+       What this rules out for IPv6: wrong rule content, wrong window placement in the
+       entry, and (now also measured on the board) the rule-table index.  Rule 2, rule
+       3, rule 160 (= 10 << 4, what the vendor's software uses as a rule base) and rule
+       153, each with extract-index word 4 both 0x00150004 and 0x00150154 and with the
+       entry written into all 384 slots, still sent every one of ~28,000 packets of a
+       forwarded burst through the CPU (far end counted them all, so nothing was
+       dropped).
   workaround: |
     IPv6 *works* in the configuration that ships: ipv6=0 keeps the IPv6 trap on, so
     IPv6 takes the CPU software path exactly as it did before any of this, and that
@@ -126,31 +152,27 @@ points at something in the repository or at a measurement.
     are in the hardware (zx_ppe_set_v6_offload()), so a module that fails to program
     them leaves the box on the old, safe path.
   next: |
-    * Find the hardware's IPv6 key layout.  The vendor does not use a homogeneous
-      window list: tm.ko's tm_acl_fast_add_v4v6() packs the 45-byte key out of a hash
-      rule computed in software by tm_acl_get_fastHashRule() (a 60-byte struct whose
-      halfword windows live at offsets 16..46), and switch.ko carries per-family flow
-      capability descriptors that differ between the families -
-      npu_ipv4_l3tcpup_cap and npu_ipv6_l3tcpup_cap are the same size (44 B) but not
-      the same field map, so the vendor's NPU really does have an IPv6 flow concept.
-      Two things checked on 2026-10-28 and *excluded*, so nobody repeats them:
-      (a) the "is the IPv6 hash lookup even switched on" bit is not in the low half of
-      the extract-index entry's word 4 - sweeping all sixteen values 0x00150050..15f
-      with the entry written into all 384 slots forwarded every packet through the CPU
-      and hit nothing (and EN_V4FAST_EXTIDXTBL/EN_V6FAST_EXTIDXTBL in tm.ko show those
-      two bits are 0..1 for v4 and 2..3 for v6 enable, i.e. our 0x00150154 already has
-      the v6 enable, 4, set); (b) the slot maths, because of that same all-slots run.
-      The newest lead is a *second* table: cla_set_external_hash_table() writes 40-byte
-      entries at (0x3c40000 + 0x800 + idx) << 6, and the vendor's
-      aclBuildHashAndAclRule() programs extra-rule + extra-index + hash table + that
-      external table together, i.e. vendor IPv6 flow entries may not live in the hash
-      banks our driver can reach at all.  Locating that window's base is the next step,
-      and it is the same unknown as the ONU register path below (tmOnuRegWrite() ends in
-      fpga_read_reg()/fpga_write_reg(), whose mapped base is in none of the modules
-      disassembled so far).
-      Reading the real tables off a running vendor system is *not* available (see
-      VENDOR-RUNTIME-TABLES below: a patched vendor rootfs booted and ran nothing of
-      ours, there is no shell and no serial).
+    * Write the table the IPv6 path needs and the driver does not touch.  The emulated
+      vendor code (see finding 4) makes cla_set_external_hash_table() part of the IPv6
+      flow add and never part of the IPv4 one; its entries are 40 bytes taken from the
+      same 60-byte hash rule, at (0x3c40000 + 0x800 + idx) << 6 with the low bit 6 of
+      byte 16 forced on, and the caller hands it a slot that aclGetAvailableHashAddr()
+      returned.  That address arithmetic is the same unknown as the ONU register path
+      below: whether 0xF0200000+64*idx is a directly addressable window on this part or
+      a bit address that has to go through the indirect command register is exactly
+      what to measure next - an ioremap plus one read tells the difference, and a bad
+      guess costs a reboot on a box that boots from an untouched slot 0.
+      Reproducing a *complete* IPv6 flow add (19-window key, external entry, index
+      re-patch) needs the flow descriptor layout, which the harness has only partly
+      mapped so far: descriptor +98 is the protocol, +100..103 and +108..111 the two
+      IPv4 addresses, +116..119 the ports, +12 the rule type (3/4 IPv4, 5/6 IPv6,
+      7/8 L2), +8..11 the source port id (a bad one prints "invalid sorce port"), and
+      the IPv6 addresses are in a part of the descriptor not yet found.
+      Two things checked and *excluded*, so nobody repeats them: (a) the "is the IPv6
+      hash lookup even switched on" bit is not in the low half of the extract-index
+      entry's word 4 - sweeping all sixteen values 0x00150050..15f with the entry
+      written into all 384 slots forwarded every packet through the CPU and hit nothing;
+      (b) the slot maths, because of that same all-slots run.
     * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
       bench's only peer filters inbound IPv6, hence UDP above), then decide whether
       ipv6=1 becomes the default.
