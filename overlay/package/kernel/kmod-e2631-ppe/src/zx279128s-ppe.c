@@ -48,8 +48,26 @@
  */
 
 static bool zx_ppe_ipv6;
-module_param_named(ipv6, zx_ppe_ipv6, bool, 0644);
-MODULE_PARM_DESC(ipv6, "program the IPv6 classifier tables (default off: IPv6 then keeps the CPU path)");
+MODULE_PARM_DESC(ipv6,
+	"program the IPv6 classifier tables and lift the IPv6 ethertype trap (writable at runtime)");
+
+/*
+ * Writable at runtime, and that is the point of it: the IPv6 ethertype trap is
+ * what makes *every* IPv6 frame cross the CPU, including the ones the switch
+ * would happily bridge (measured 2026-10-28: 2,000 LAN-to-LAN IPv6 UDP frames,
+ * trap on = 2,018 packets through the CPU, trap off = 18).  Flipping this
+ * switches between "IPv6 on the CPU but nothing can be missed" and "IPv6
+ * switched in hardware, routed IPv6 through the classifier and then the CPU".
+ * Both keep IPv6 working (see docs/known-issues.md, PPE-IPV6-TCP); the second
+ * is faster for LAN traffic.  A box that wedges can be recovered with
+ * "echo 0 > /sys/module/zx279128s_ppe/parameters/ipv6" or a power cycle.
+ */
+static int zx_ppe_ipv6_set(const char *val, const struct kernel_param *kp);
+static const struct kernel_param_ops zx_ppe_ipv6_ops = {
+	.set	= zx_ppe_ipv6_set,
+	.get	= param_get_bool,
+};
+module_param_cb(ipv6, &zx_ppe_ipv6_ops, &zx_ppe_ipv6, 0644);
 
 static bool zx_ppe_debug;
 module_param_named(debug, zx_ppe_debug, bool, 0644);
@@ -186,6 +204,85 @@ MODULE_PARM_DESC(v6_shot_lo, "first slot of the shotgun range (-1: 0)");
 static int zx_ppe_v6_shot_hi = -1;
 module_param_named(v6_shot_hi, zx_ppe_v6_shot_hi, int, 0644);
 MODULE_PARM_DESC(v6_shot_hi, "last slot of the shotgun range (-1: 383)");
+
+/*
+ * The vendor's way of telling the classifier "this IPv6 address is one of
+ * ours" without an ethertype trap (the stock firmware has no 0x86dd constant
+ * anywhere - it classifies by address, not by ethertype).  Two register
+ * files, both in the CLA window this driver already maps after the ONU
+ * register numbers are turned into byte offsets (descriptor table at tm.ko
+ * 0xac700: reg 19 = base 0x000e3028, 4 words, stride 1; reg 23 = base
+ * 0x000e303f, 8 words, stride 1; byte offset = register * 4, which is the
+ * same rule that puts the CLA command register at 0x38c014):
+ *
+ *   reg 19 -> 0x38c0a0 + 4*i, i = 0..3   one local IPv6 address (128 bit)
+ *   reg 23 -> 0x38c0fc + 4*i, i = 0..7   ONU side SIP then DIP (two addresses)
+ *
+ * cla_set_local_ipv6_addr() in tm.ko writes exactly reg 19/idx 0..3 and
+ * refuses idx > 3.  The import order (which 32-bit word is the high one) is
+ * not documented by any code we have, so local6_rev flips it for the test.
+ */
+#define ZX_CLA_LOCAL_IPV6	0x38c0a0
+#define ZX_CLA_ONU_IPV6		0x38c0fc
+
+static unsigned int zx_ppe_local6[4];
+static int zx_ppe_local6_n;
+module_param_array_named(local6, zx_ppe_local6, uint, &zx_ppe_local6_n, 0644);
+MODULE_PARM_DESC(local6,
+	"the router's own IPv6 address as four 32-bit words (0 0 0 0 = leave alone)");
+
+static unsigned int zx_ppe_onu6s[4];
+static int zx_ppe_onu6s_n;
+module_param_array_named(onu6s, zx_ppe_onu6s, uint, &zx_ppe_onu6s_n, 0644);
+MODULE_PARM_DESC(onu6s, "ONU side source IPv6 address, four words");
+
+static unsigned int zx_ppe_onu6d[4];
+static int zx_ppe_onu6d_n;
+module_param_array_named(onu6d, zx_ppe_onu6d, uint, &zx_ppe_onu6d_n, 0644);
+MODULE_PARM_DESC(onu6d, "ONU side destination IPv6 address, four words");
+
+static bool zx_ppe_local6_rev;
+module_param_named(local6_rev, zx_ppe_local6_rev, bool, 0644);
+MODULE_PARM_DESC(local6_rev, "store the four words in reverse order (word order test)");
+
+static void zx_ppe_write_v6_addr(struct zx_eth_adapter *adapter, u32 reg,
+				 const unsigned int *w, int n)
+{
+	int i;
+
+	for (i = 0; i < n && i < 4; i++) {
+		int k = zx_ppe_local6_rev ? 3 - i : i;
+
+		writel(w[k], adapter->base + reg + 4 * i);
+	}
+}
+
+static void zx_ppe_program_v6_addrs(struct zx_eth_adapter *adapter)
+{
+	u32 back[12];
+	int i;
+
+	if (zx_ppe_local6_n == 4)
+		zx_ppe_write_v6_addr(adapter, ZX_CLA_LOCAL_IPV6, zx_ppe_local6, 4);
+	if (zx_ppe_onu6s_n == 4)
+		zx_ppe_write_v6_addr(adapter, ZX_CLA_ONU_IPV6, zx_ppe_onu6s, 4);
+	if (zx_ppe_onu6d_n == 4)
+		zx_ppe_write_v6_addr(adapter, ZX_CLA_ONU_IPV6 + 16, zx_ppe_onu6d, 4);
+	if (!zx_ppe_local6_n && !zx_ppe_onu6s_n && !zx_ppe_onu6d_n)
+		return;
+
+	/* read back: a register that does not hold what was written is a
+	 * wrong offset, which is cheaper to see here than in a packet test
+	 */
+	for (i = 0; i < 4; i++)
+		back[i] = readl(adapter->base + ZX_CLA_LOCAL_IPV6 + 4 * i);
+	for (i = 0; i < 8; i++)
+		back[4 + i] = readl(adapter->base + ZX_CLA_ONU_IPV6 + 4 * i);
+	dev_info(adapter->dev,
+		 "IPv6 address files: local %08x %08x %08x %08x, onu %08x %08x %08x %08x / %08x %08x %08x %08x\n",
+		 back[0], back[1], back[2], back[3], back[4], back[5], back[6],
+		 back[7], back[8], back[9], back[10], back[11]);
+}
 
 static unsigned int zx_ppe_v6_entry_idx(void)
 {
@@ -929,6 +1026,52 @@ static void zx_ppe_v6_tune(void)
 		zx_ppe_v6_index[4] = zx_ppe_v6_idxw4;
 }
 
+/* Put the IPv6 extract rule and index into the hardware.  Split out of
+ * zx_ppe_start() because the runtime ipv6 switch below has to do the same.
+ */
+static int zx_ppe_v6_tables(struct zx_eth_adapter *adapter)
+{
+	int ret;
+
+	zx_ppe_v6_tune();
+	ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE,
+			  zx_ppe_v6_rule_idx, zx_ppe_v6_rule, 17);
+	if (!ret)
+		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
+				  zx_ppe_v6_ext_idx, zx_ppe_v6_index, 5);
+	return ret;
+}
+
+static void zx_ppe_v6_toggle_adapter(struct zx_eth_adapter *adapter, void *data)
+{
+	mutex_lock(&adapter->ppe_lock);
+	if (adapter->ppe_active) {
+		if (zx_ppe_ipv6 && zx_ppe_v6_tables(adapter))
+			dev_warn(adapter->dev,
+				 "IPv6 classifier tables could not be written, keeping the trap\n");
+		zx_ppe_set_v6_offload(zx_ppe_ipv6);
+		zx_update_traps(adapter);
+	}
+	mutex_unlock(&adapter->ppe_lock);
+}
+
+/*
+ * "echo 1 > .../parameters/ipv6" programmes the v6 tables and lifts the v6
+ * ethertype trap; "echo 0" writes the tables' enable off and traps IPv6 again.
+ * The trap half is the load-bearing part: with it on, no IPv6 frame can be
+ * missed (all of them cross the CPU); with it off, LAN-to-LAN IPv6 is switched
+ * in hardware and routed IPv6 goes through the classifier before the CPU.
+ */
+static int zx_ppe_ipv6_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (ret)
+		return ret;
+	zx_eth_for_each_adapter(zx_ppe_v6_toggle_adapter, NULL);
+	return 0;
+}
+
 /* classifier L3 MTU and actions, packet modifier padding of short frames.
  * The "other L3 packet" action (0x38c0cc) keeps the value 1 of the base
  * driver: with the stock value 0, IPv6 addressed to our MACs was dropped
@@ -975,11 +1118,7 @@ static int zx_ppe_start(struct zx_eth_adapter *adapter)
 		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
 				  ZX_PPE_V4_INDEX, zx_ppe_v4_index, 5);
 	if (!ret && zx_ppe_ipv6)
-		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE,
-				  zx_ppe_v6_rule_idx, zx_ppe_v6_rule, 17);
-	if (!ret && zx_ppe_ipv6)
-		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
-				  zx_ppe_v6_ext_idx, zx_ppe_v6_index, 5);
+		ret = zx_ppe_v6_tables(adapter);
 	if (ret) {
 		for (i = 0; i < ARRAY_SIZE(zx_ppe_regs); i++)
 			writel(adapter->ppe_saved[i], base + zx_ppe_regs[i]);
@@ -989,6 +1128,7 @@ static int zx_ppe_start(struct zx_eth_adapter *adapter)
 	adapter->ppe_active = true;
 	/* the IPv6 trap may only be lifted once its tables are in the hardware */
 	zx_ppe_set_v6_offload(zx_ppe_ipv6);
+	zx_ppe_program_v6_addrs(adapter);
 	zx_update_mac_tables(adapter);
 	zx_update_traps(adapter);
 	zx_ppe_apply_trap_override(adapter);

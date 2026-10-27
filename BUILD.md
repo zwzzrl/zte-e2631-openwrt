@@ -334,10 +334,19 @@ Three traps cost a day each before they were found, both worth remembering:
   `tm_acl_fast_add_v4v6()` + `tm_acl_get_fastHashRule()`) from per-family descriptors, so
   the fix is to reproduce that, see docs/known-issues.md PPE-IPV6-TCP.
 
+**(d) LAN traffic and routed traffic are different questions.** A frame the switch can
+bridge never needs the classifier, so an ethertype trap is what decides whether it crosses
+the CPU: 2,000 IPv6 UDP frames between two LAN hosts cost 2,018 CPU packets with the IPv6
+trap on and 18 with it off. `echo 1 > /sys/module/zx279128s_ppe/parameters/ipv6` flips
+that live (tables + trap), `echo 0` puts the trap back.  Do not use ICMPv6 to judge a trap
+experiment - it has its own trace/trap path and keeps working either way.
+
 The knobs that made those experiments possible are module parameters, so a wrong guess
-costs a reload rather than a kernel rebuild: `ipv6`, `debug`, `trap_override` (raw value
+costs a reload rather than a kernel rebuild: `ipv6` (writable at runtime, see (d)),
+`debug`, `trap_override` (raw value
 for the ethertype trap register, `-1` = driver decides; writable while loaded),
-`v6_ext`, `v6_entry`, `v6_rule`, `v6_key`, `v6_idxw4`, `v6_hashlen`, `v6_type`, `v6_hwn`
+`v6_ext`, `v6_entry`, `v6_rule`, `v6_key`, `v6_idxw4`, `v6_hashlen`, `v6_type`, `v6_hwn`,
+`local6`/`onu6s`/`onu6d`/`local6_rev` (the vendor's IPv6 address register files)
 (halfwords of the key, `-1` = all 19) and `v6_shotgun`/`v6_shot_lo`/`v6_shot_hi` (write an
 IPv6 flow into a range of hash slots to separate "wrong key" from "wrong slot"). Everything
 except `ipv6` and `debug` exists for diagnosis and can go once the IPv6 path has soaked.

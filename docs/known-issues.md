@@ -133,19 +133,37 @@ points at something in the repository or at a measurement.
       capability descriptors that differ between the families -
       npu_ipv4_l3tcpup_cap and npu_ipv6_l3tcpup_cap are the same size (44 B) but not
       the same field map, so the vendor's NPU really does have an IPv6 flow concept.
+      Two things checked on 2026-10-28 and *excluded*, so nobody repeats them:
+      (a) the "is the IPv6 hash lookup even switched on" bit is not in the low half of
+      the extract-index entry's word 4 - sweeping all sixteen values 0x00150050..15f
+      with the entry written into all 384 slots forwarded every packet through the CPU
+      and hit nothing (and EN_V4FAST_EXTIDXTBL/EN_V6FAST_EXTIDXTBL in tm.ko show those
+      two bits are 0..1 for v4 and 2..3 for v6 enable, i.e. our 0x00150154 already has
+      the v6 enable, 4, set); (b) the slot maths, because of that same all-slots run.
+      The newest lead is a *second* table: cla_set_external_hash_table() writes 40-byte
+      entries at (0x3c40000 + 0x800 + idx) << 6, and the vendor's
+      aclBuildHashAndAclRule() programs extra-rule + extra-index + hash table + that
+      external table together, i.e. vendor IPv6 flow entries may not live in the hash
+      banks our driver can reach at all.  Locating that window's base is the next step,
+      and it is the same unknown as the ONU register path below (tmOnuRegWrite() ends in
+      fpga_read_reg()/fpga_write_reg(), whose mapped base is in none of the modules
+      disassembled so far).
       Reading the real tables off a running vendor system is *not* available (see
       VENDOR-RUNTIME-TABLES below: a patched vendor rootfs booted and ran nothing of
-      ours, there is no shell and no serial), so the only route left is to port those
-      two functions into the existing armemu harness (experiments/ppe-v6/armemu.py) and
-      reproduce the key for a synthetic v6 tuple, then diff it against
-      zx_ppe_slots()/zx_ppe_hash_entry().
-    * Once the key is right: measure a *TCP* IPv6 flow end to end (the bench's only
-      peer filters inbound IPv6, hence UDP above), then decide whether ipv6=1 becomes
-      the default.
-    * The local IPv6 address register file (ONU reg 19, 0xe3028) and the ONU S/D IPv6
-      file (reg 23, 0xe303f) are still not programmed.  Nothing in the forwarding path
-      above consults them, but they are the vendor's answer to "which IPv6 addresses
-      are ours".
+      ours, there is no shell and no serial).
+    * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
+      bench's only peer filters inbound IPv6, hence UDP above), then decide whether
+      ipv6=1 becomes the default.
+    * The local IPv6 address register file (ONU reg 19) and the ONU S/D IPv6 file (reg
+      23) are now programmable - module parameters local6/onu6s/onu6d take the address
+      as four 32-bit words, and the offsets were derived from the vendor's register
+      descriptors (base 0x000e3028/0x000e303f, stride 1, count 4/8; byte offset =
+      register number * 4, the same rule that puts the CLA command register at
+      0x38c014), so they land at 0x38c0a0 and 0x38c0fc.  Read-back confirms the writes
+      stick word for word.  What they *do* is still unproven: writing the router's own
+      ULA there changed nothing observable, because a frame for our own address is
+      already handled by the classifier's "other L3 -> CPU" default action.  Their
+      real job is probably on the vendor's ACL/DPI path, not on ours.
     Measurement note, because it cost a wrong conclusion once: tx_submitted in
     /sys/kernel/debug/92000000.ethernet/dma_state proves that the CPU did *not* touch
     a packet, which is not the same as proving the hardware forwarded it - a dropped
@@ -154,6 +172,49 @@ points at something in the repository or at a measurement.
     on its own NIC (non-zero means forwarded, 0 means dropped).  Both tricks are in
     BUILD.md "Measuring the packet processor".
   docs: 01-文档/BUILD-NOTES.md 2026-10-27; 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md; 06-分析与对比/拿原厂运行时表内容-方案-2026-10-27.md
+- id: PPE-IPV6-TRAP-CPU
+  severity: minor
+  status: mitigated
+  surface: ethernet + ipv6
+  symptom: every IPv6 frame on the LAN crosses the CPU, including the ones the switch would bridge on its own, so IPv6 traffic between two LAN hosts is capped by the CPU and shows up in softirq while the same traffic over IPv4 is hardware switched.
+  verified: yes - 2026-10-28 on this board, 2,000 LAN-to-LAN IPv6 UDP frames per run, four switches of the runtime knob, numbers repeat exactly
+  cause: |
+    The IPv6 ethertype trap.  It is set whenever the engine has no IPv6 classifier
+    tables (that is the v1.4 fix for the PPE-IPV6-TCP stall), and a trapped frame is
+    diverted to the CPU *before* the classifier, so nothing the switch could have
+    bridged ever gets bridged in hardware.  The IPv4 trap has been lifted whenever
+    offload is active since v1.0, which is why only IPv6 had this cost.
+    Measured with the far-end-free method: 2,000 UDP frames from one LAN host to
+    another, CPU tx_submitted delta 2,018 with the trap on and 18 with it off (the 18
+    is the ARP/ND/setup floor seen in every run).  The same knob was toggled 0 -> 1 ->
+    0 -> 1 with the matching numbers each time.
+  workaround: |
+    The module parameter `ipv6` is now writable at runtime and does exactly this
+    switch - it programmes the v6 extract tables and lifts the trap, or traps IPv6
+    again:
+
+      echo 1 > /sys/module/zx279128s_ppe/parameters/ipv6      # hardware switching
+      echo 0 > /sys/module/zx279128s_ppe/parameters/ipv6      # trap back on
+
+    No reload, no firewall restart, no reboot, and `echo 0` is the recovery path if a
+    box ever behaves badly with the trap lifted.
+    With it on (ipv6=1) all three IPv6 paths were re-measured on the same box:
+      * LAN host -> LAN host            : 2,000 UDP frames, CPU +18   (was +2,018)
+      * LAN host -> routed through it   : 1,800 UDP frames, 1,800 arrive at the far
+        end, CPU +1,819 (classifier -> CPU, no fast path; see PPE-IPV6-TCP)
+      * LAN host -> the router itself   : TCP/80 3/3, ICMPv6 3/3
+    ICMPv6 is not a usable probe for trap experiments - it has its own trace/trap path
+    and keeps working even when the ethertype trap diverts everything (that is why the
+    ping numbers above prove nothing on their own; the TCP and UDP numbers do).
+  next: |
+    * Make ipv6=1 the shipped default, but from the boot side rather than from the
+      compiled-in default: a UCI option that the init script applies after the module
+      loads, so a bad default is fixable from failsafe instead of needing a power
+      cycle.  Until then the image stays on ipv6=0 and the switch is a one-liner.
+    * Untested with the trap lifted: MLD/multicast IPv6 (the switch has its own MLD
+      tables in the vendor design - `drv_add_mld_addr_gpon_sfu` - and our port does not
+      program them), and IPv6 over the (unused) WAN.
+  docs: BUILD.md "Measuring the packet processor"; 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md
 - id: USERDATA-EXTROOT
   severity: minor
   status: mitigated

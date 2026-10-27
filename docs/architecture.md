@@ -161,6 +161,14 @@ there, while the other indices looked good because the frames were being dropped
 unnoticed. With a far end that counts what arrives, index 10 forwards 2,800 of 2,800
 packets and index 11 forwards none. The driver uses 10.
 
+The trap has a second cost that is worth its own paragraph: it catches *every* IPv6
+frame, including the ones the switch would bridge without help, so on the factory
+setting all LAN-to-LAN IPv6 traffic crosses the CPU (2,000 UDP frames, 2,018 CPU
+packets) while the same IPv4 traffic never does. The `ipv6` parameter is writable at
+runtime for exactly this reason - it programs the v6 tables and lifts the trap, or
+puts it back - and with it on those 2,000 frames cost 18 CPU packets
+(`docs/known-issues.md`, PPE-IPV6-TRAP-CPU).
+
 That leaves the third finding, which is why this section is not called "the fix": with the
 trap lifted and the extract in place, the classifier hands IPv6 to the CPU, the driver
 writes the hash entry, and the hardware still never matches it - not with the entry in all
