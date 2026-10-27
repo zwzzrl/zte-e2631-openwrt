@@ -141,6 +141,17 @@ points at something in the repository or at a measurement.
     slot 1 match the package body per-MiB, and with ipv6=0 the defaults behave exactly as before
     (dmesg "hardware flow offload enabled", IPv6 ping6 and TCP 22/80 all fine). What remains
     unverified is only the ipv6=1 path itself.
+    Step 1 of that bisect was then run on the same boot (03:24): `echo 1 >
+    /sys/module/zx279128s_eth/parameters/ipv6` followed by `/etc/init.d/firewall restart` to
+    rebind the flowtable. zx_ppe_start() programmed both v6 tables and still reached its
+    "hardware flow offload enabled" line, which only prints when those writes returned 0;
+    uptime stayed continuous (292 -> 324 s, no reboot) and dmesg showed no fault. From the LAN
+    side, IPv6 ping6 was 4/4, TCP 22 and 80 connected, and HTTP over IPv6 returned 200 - so
+    these tables do not wedge the switch the way the extrapolated ones did on 2026-10-27, where
+    the first IPv6 frame killed the whole box. The parameter was then set back to 0 (it is a
+    module parameter, nothing persisted) and IPv6 still answered. Still unproven: an IPv6
+    *forwarded* flow - an uplink is needed, since lan1..lan3 and wan are in the flowtable but wan
+    had no link.
     To finish this properly, either dump the vendor's live tables from a running stock firmware, or
     build the IPv6 key/window layout from scratch and bisect it one table at a time on hardware
     (program only the extract index first, then the rule, then a flow) - each wrong step costs a
