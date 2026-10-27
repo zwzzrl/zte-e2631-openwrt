@@ -623,22 +623,44 @@ static const u32 zx_ppe_v4_rule[16] = {
 };
 
 /*
- * IPv6 versions.  The index entry names the 16 extract fields of index 10
- * and the rule entry has 19 windows, one per halfword of the tuple: the
- * next header (offset 6, mask 0xff00) at byte 6 of the IPv6 header, the
- * eight source and eight destination halfwords at their header offsets and
- * the two ports after them.  Address family 3 = IPv6, hash length 19.
+ * IPv6 versions, taken from the stock firmware instead of extrapolated.
+ *
+ * Source (static, reproducible offline -- docs/known-issues.md):
+ *   tm.ko, aclRamInit.part.9 -> cla_set_extra_index_table(10, ...)
+ *       ids 0..15, tail 00 00 15 00
+ *   tm.ko, tm_acl_fast_init  -> cla_set_extra_index_table(10, ...) word 4
+ *       |= 0x04 (EN_V6FAST_EXTIDXTBL) = the v6 fast-path enable bit
+ *   tm.ko, tm_acl_fast_init  -> cla_set_extra_rule_table(2, ...)  up
+ *                                cla_set_extra_rule_table(3, ...)  down
+ *
+ * That extraction is trustworthy because the same function also programs
+ * rule 144/145 for IPv4, and those two entries are byte-for-byte the
+ * zx_ppe_v4_rule table above, which runs on real hardware.  Note how the
+ * extrapolated values this driver carried before were wrong in five places
+ * (rule words 0, 3, 4, 15 and the whole index entry), which is consistent
+ * with the wedge seen when they were first written to the hardware.
+ *
+ * The index entry names the 16 extract fields of index 10 (ids 0..15, not
+ * 160..175), byte 18 = 0x15 is the extract length and byte 17 = 0x01 the
+ * "look up the hash banks" bit, as in the v4 entry.  Word 4 is the proven
+ * v4 entry with its own enable bit (bit 0) replaced by the v6 one (bit 2).
+ *
+ * The rule entry has 19 windows, one per halfword of the tuple: the next
+ * header (offset 6, mask 0xff00) at byte 6 of the IPv6 header, the eight
+ * source and eight destination halfwords at their header offsets and the
+ * two ports after them.  Address family 3 = IPv6, hash length 19, and the
+ * up/down entries differ only in word 14 like the IPv4 pair does.
  */
 static const u32 zx_ppe_v6_index[5] = {
-	0xa3a2a1a0, 0xa7a6a5a4, 0xabaaa9a8, 0xafaeadac,
-	0x00190155,	/* bit 8: look up the hash banks */
+	0x03020100, 0x07060504, 0x0b0a0908, 0x0f0e0d0c,
+	0x00150154,	/* bit 2: v6 fast enable, bit 8: hash banks */
 };
 
 static const u32 zx_ppe_v6_rule[17] = {
-	0xe1828406, 0x16284880, 0x01e3868c, 0x94264889, 0xfff0000a,
+	0x01828406, 0x16284880, 0x01e3868c, 0x14264889, 0xfaf0000a,
 	0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
 	0xffffffff, 0xffffffff, 0xffffffff, 0x0fffffff, 0x01300000,
-	0xdb6db6db, 0x00db6db6,
+	0x1b6db6db, 0x00db6db6,
 };
 
 static const u32 zx_ppe_sub[2] = { 0xfc000000, 0x00001fff };

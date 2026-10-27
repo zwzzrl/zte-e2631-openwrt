@@ -126,6 +126,21 @@ points at something in the repository or at a measurement.
       * the vendor's own IPv6 template is inconsistent (window 5 reads offset 0, the last two
         windows both read offset 40, window 0 masks 0xaf00, window 11 has type 0), which is the
         other reason not to trust it.
+    The driver's IPv6 constants were replaced on 2026-10-28 with the values above instead of the
+    extrapolated ones: index 10 = extract ids 0..15, word 4 = 0x00150154 (the proven v4 entry
+    0x00150151 with its own enable bit 0 swapped for the v6 bit 2, hash-bank bit 8 and byte 18 = 0x15
+    kept), and the rule words taken verbatim from rule 2. Five words changed: 0xe1828406 ->
+    0x01828406, 0x94264889 -> 0x14264889, 0xfff0000a -> 0xfaf0000a, 0xdb6db6db -> 0x1b6db6db, plus
+    the whole index entry (0xa3a2a1a0.. with ids 160..175 -> 0x03020100.. with ids 0..15). What makes
+    that extraction trustworthy despite the caveats above is the cross-check: the very same function
+    programs rule 144/145 for IPv4 and those entries are byte-identical to zx_ppe_v4_rule, which runs
+    on hardware. It is still unproven on hardware - ipv6=1 has never been booted with these values,
+    and each wrong step costs a power cycle. The image that carries them was flashed to slot 1 on
+    2026-10-28 03:16 through the vendor web upgrade page (real 8B8.000 header template, package
+    sha256 c413e123...): both gates passed, the box came up in 21 s, the first 0xE60000 bytes of
+    slot 1 match the package body per-MiB, and with ipv6=0 the defaults behave exactly as before
+    (dmesg "hardware flow offload enabled", IPv6 ping6 and TCP 22/80 all fine). What remains
+    unverified is only the ipv6=1 path itself.
     To finish this properly, either dump the vendor's live tables from a running stock firmware, or
     build the IPv6 key/window layout from scratch and bisect it one table at a time on hardware
     (program only the extract index first, then the rule, then a flow) - each wrong step costs a
@@ -372,3 +387,40 @@ UpTime 单调增长（没有重启循环），WebUI 响应正常（也没有 res
 原厂 WebUI 的 `SoftwareVer`/`VerDate` 在我们**没有重启**的情况下就变成了新包里的串
 （v3 的 9100 → v5 的 9201 都是刷完、还没重启时就变了）。所以它反映的是"flash 上最新的镜像"，
 **不是"这次启动的是哪个镜像"**。拿它当启动证据会直接把结论带偏。
+
+## VENDOR-WEB-SHELL - 判定：死路（2026-10-28）
+
+目的：在原厂 8B8 上拿一个 root shell，用它 dump PPE 运行时表、或改 `TelnetCfg`。
+（`VENDOR-RUNTIME-TABLES` 之后换的路子：不再刷镜像，只打它自己的 WebUI。）
+
+手段与结果都在 `192.168.5.1` 实测，本轮**零 flash 写入**，slot0 仍是原厂镜像：
+
+| 入口 | 实测结果 |
+| --- | --- |
+| `ping_diag_data` 的 `Host` | 白名单：`;`、`|`、`$()`、反引号、`127.0.0.1`、`0.0.0.0` 全被 `IF_ERRORPARAM=Host`（`-257`）拒；`localhost`、`192.168.5.50` 通过。而且诊断**从不执行**：`DiagnosticsState` 恒为 `Requested`、`PingAck` 恒为 `NULL` —— 既没回显也没副作用 |
+| `do_restore_usrcfg` 上传的文件名 | 14 种载荷（`;`、`$(curl …)`、`${IFS}`、反引号、换行、`|`、`&`、`../`、`%00`）全部 `IF_ERRORID=414`，宿主机 `:8000` 监听**零命中**。`414` 与文件名无关（纯 `cfg.bin` 同样 `414`），是内容校验 |
+| `do_download_usercfg` 配置备份 | HTTP 200 + `application/octet-stream`，**0 字节** |
+| 网络面 | 80/443/8085 开，23/22/2323 全关；131 个 thinklua tag 里没有命令/调试类 |
+
+协议要点（后面还会用到）：令牌**轮换** —— 每个响应的 `x_xsrf_token` 头就是下一个请求要带的令牌；
+登录前用 `login_token_json` 的 `_sessionToken`；登录 JSON 里的 `sess_token` 不是令牌，是前端加密 key。
+在 URL 上追加 `&_=<ts>` 会 404。令牌错 → `<IF_ERRORSTR>页面过期，请刷新后重试</IF_ERRORSTR>`（`-1452`）。
+
+## VENDOR-CFG-CRYPTO - 默认密钥已逆出，但那份 usercfg 不是它封的（2026-10-28）
+
+已确证（`libhardcode.so` 反汇编 + `.rodata` 静态数据，`decry@0xf44`、`CspHardCodeDecryDefaultKey@0x130c`）：
+
+- `_HCGetVerVal()`：`fopen("/etc/hardcode")` → 读 `0x40` 字节 → CR/LF 清 0 → 字符串。实测内容 `E2631_QD_MESH`（13 B）。
+- 默认密钥 = `oss_snprintf_s(buf, 0x100, "%s%s%s", "0x1351", "0x5211", hardcode)` → 25 字符
+  `0x13510x5211E2631_QD_MESH`（`%s%s%s`@`.rodata+0x17df`、`0x1351`@`+0x17e6`、`0x5211`@`+0x17ed`）。
+- `decry(in, out, key)`：`memset(keybuf, 0, 0x21)` → `snprintf(keybuf, 0x21, "%s", key)` →
+  按 `0x400` 块读、每 `0x10` 字节一次 `AES_set_decrypt_key(keybuf, 0x100, &ctx)` + `AES_decrypt(in, out, &ctx)`
+  ⇒ **AES-256-ECB**，密钥 32 B = 25 字符 + 7 个 `0x00`（缓冲区先清零，`snprintf` 只写 26 B）。
+
+但拿它解 `usercfg` 分区那份 25,704 B（头 `01020304 00000004` + BE 长度 `0x641c`/`0x6420`，
+负载自 `0x48` 起、25632 B），在偏移 `0x44/0x48/0x4c/0x50` × AES-128/192/256 下**全是乱码**
+（可打印率 `0.379`）⇒ 那份文件不是默认密钥封的。
+
+剩下的线索：`CspHardCodeParamGet`（按参数名取 per-device 密钥）、`/etc/enhardcodefile`（9376 B）、
+`/etc/enwebdhardcodefile`（1712 B）。配置还原这个入口要用起来，得先把 per-device 密钥破了；
+在那之前它只是"能上传、会被内容校验拒"的空壳。
