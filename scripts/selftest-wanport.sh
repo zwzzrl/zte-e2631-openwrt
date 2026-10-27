@@ -146,6 +146,7 @@ reset() {
 	setcfg e2631_ports.global.assume_single_link 0
 	setcfg network.wan.device wan
 	setcfg network.wan6.device wan
+	setcfg e2631_ports.global.candidates "lan1 lan2 lan3 wan"
 	setcfg network.@device[0].name br-lan
 	deletelist network.@device[0].ports
 	for p in lan1 lan2 lan3 wan; do
@@ -275,7 +276,46 @@ grep -q "ip link set dev lan2 address $(cat "$SYS/lan2/address")" "$TMP/ip.log" 
 	|| fail "探测后没有把 MAC 还回去"
 pass "MAC 借用/恢复"
 
-echo "== 11. status / selftest 能跑通 =="
+echo "== 11. LuCI 的 rpcd 后端：JSON 必须是对的 =="
+# 页面拿到的就是这个 JSON，字段写错在设备上只会表现成"页面空白"，
+# 所以在这里用 python 解一遍，顺带核对几个关键字段。
+RPCD="$HERE/../overlay/package/luci/luci-app-e2631-wanport/root/usr/libexec/rpcd/e2631-wanport"
+if [ -f "$RPCD" ] && command -v python3 >/dev/null 2>&1; then
+	reset
+	wanup
+	setcfg e2631_ports.global.wan_mac "00:11:22:33:44:55"
+	out=$(E2631_WANPORT="$SCRIPT" sh "$RPCD" call status 2>>"$TMP/syslog")
+	echo "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["installed"] is True, d
+assert d["device"] == "wan", d
+assert d["wan_up"] is True, d
+assert d["bridge"] == "br-lan", d
+assert d["wan_mac"] == "00:11:22:33:44:55", d
+assert len(d["ports"]) == 4, d
+names = [ p["name"] for p in d["ports"] ]
+assert names == [ "lan1", "lan2", "lan3", "wan" ], names
+roles = { p["name"]: p["role"] for p in d["ports"] }
+assert roles["wan"] == "wan" and roles["lan1"] == "lan", roles
+labels = { p["name"]: p["label"] for p in d["ports"] }
+assert labels["lan1"] == "LAN1" and labels["wan"] == "WAN", labels
+' 2>>"$TMP/syslog" || fail "status 返回的不是预期 JSON：$out"
+
+	# 未知端口必须被拒，而且不能把服务拉起来
+	out=$(E2631_WANPORT="$SCRIPT" sh "$RPCD" call set_port <<'JSON' 2>>"$TMP/syslog"
+{"port":"lan9"}
+JSON
+)
+	echo "$out" | grep -q '"ok":false' || fail "未知端口没有被拒绝：$out"
+	out=$(E2631_WANPORT="$SCRIPT" sh "$RPCD" list)
+	echo "$out" | grep -q '"set_port"' || fail "list 里没有 set_port：$out"
+	pass "rpcd 后端的 JSON 与参数校验"
+else
+	echo "skip: 没有 $RPCD 或 python3"
+fi
+
+echo "== 12. status / selftest 能跑通 =="
 reset
 wanup
 run status >/dev/null 2>&1 || fail "status 退出码非 0"

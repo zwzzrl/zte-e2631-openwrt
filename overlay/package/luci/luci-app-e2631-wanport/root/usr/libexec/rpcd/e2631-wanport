@@ -1,0 +1,206 @@
+#!/bin/sh
+# rpcd backend for the WAN port page. rpcd shell protocol, same shape as
+# luci-app-e2631's backend:
+#
+#   ubus call e2631-wanport list
+#   ubus call e2631-wanport status
+#   ubus call e2631-wanport set_port '{"port":"lan2"}'
+#   ubus call e2631-wanport redetect
+#   ubus call e2631-wanport reload
+#
+# status is built here rather than scraped from "/sbin/e2631-wanport status":
+# that one is a human-readable dump, and parsing it back would break the page
+# the first time a column changes.
+#
+# set_port / redetect / reload only *start* the service, detached, and return at
+# once: a probe costs probe_timeout (3 s) per candidate port, so a synchronous
+# call would hold the ubus request open for ~15 s in auto mode and the page
+# would look hung. The page polls status and shows the result when it lands.
+#
+# busybox ash: no ${var:offset}, no local outside functions, no arrays.
+set -u
+
+# E2631_* overrides exist for scripts/selftest-wanport.sh only (a fake /sys and a
+# fake uci on a PC); on the device none of them is set.
+WP=${E2631_WANPORT:-/sbin/e2631-wanport}
+CFG=e2631_ports
+SYSFS=${E2631_SYSFS:-/sys}
+LOG=/tmp/e2631-wanport.log
+
+# JSON string escape: backslash, quote, and the characters that would make the
+# response invalid JSON (values here are one-liners from sysfs/uci, but a
+# trailing newline from uci would be enough to break the parse).
+esc() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'
+}
+
+cfg() { uci -q get "$CFG.global.$1" 2>/dev/null; }
+
+# Same fallback as the service itself: a config without the candidate list still
+# means the four physical ports, not "no ports at all".
+candidates() {
+	local c
+	c=$(cfg candidates)
+	[ -n "$c" ] || c="lan1 lan2 lan3 wan"
+	echo "$c"
+}
+
+# The service is part of base-files on this board; if it is missing the page
+# says so instead of offering buttons that cannot work.
+installed() { [ -x "$WP" ]; }
+
+wan_device() { uci -q get network.wan.device 2>/dev/null; }
+
+wan_up() {
+	ubus call network.interface.wan status 2>/dev/null \
+		| grep -q '"up"[[:space:]]*:[[:space:]]*true'
+}
+
+# The WAN MAC is pinned by the service (see /sbin/e2631-wanport); before it has
+# run once, fall back to what the DTS-assigned netdev currently carries.
+wan_mac() {
+	local m
+	m=$(cfg wan_mac)
+	[ -n "$m" ] || m=$(cat "$SYSFS/class/net/wan/address" 2>/dev/null)
+	echo "$m"
+}
+
+# The br-lan bridge device section, found by name (the index is not fixed).
+bridge_section() {
+	local n=0 name
+	while :; do
+		name=$(uci -q get "network.@device[$n].name" 2>/dev/null) || break
+		[ -n "$name" ] || break
+		if [ "$name" = "br-lan" ]; then
+			echo "network.@device[$n]"
+			return 0
+		fi
+		n=$((n + 1))
+	done
+	echo ""
+}
+
+# LAN-vs-WAN is a role here, but the fourth port is labelled "WAN" on the case,
+# so show the labels the user can read off the back of the router.
+label_of() {
+	case "$1" in
+	wan) echo "WAN" ;;
+	lan1) echo "LAN1" ;;
+	lan2) echo "LAN2" ;;
+	lan3) echo "LAN3" ;;
+	*) echo "$1" ;;
+	esac
+}
+
+ports_json() {
+	local p cur sep= name label role state carrier speed mac master
+	cur=$(wan_device)
+	[ -n "$cur" ] || cur=wan
+	for p in $(candidates); do
+		[ -n "$p" ] || continue
+		[ -d "$SYSFS/class/net/$p" ] || continue
+		name=$p
+		label=$(label_of "$p")
+		role=lan
+		[ "$p" = "$cur" ] && role=wan
+		state=$(cat "$SYSFS/class/net/$p/operstate" 2>/dev/null)
+		[ -n "$state" ] || state="-"
+		carrier=$(cat "$SYSFS/class/net/$p/carrier" 2>/dev/null || echo 0)
+		speed=$(cat "$SYSFS/class/net/$p/speed" 2>/dev/null)
+		[ -n "$speed" ] || speed="-"
+		mac=$(cat "$SYSFS/class/net/$p/address" 2>/dev/null)
+		master=$(readlink -f "$SYSFS/class/net/$p/master" 2>/dev/null | sed 's|.*/||')
+		printf '%s{"name":"%s","label":"%s","role":"%s","state":"%s","carrier":%s,"speed":"%s","master":"%s","mac":"%s"}' \
+			"$sep" "$(esc "$name")" "$(esc "$label")" "$role" \
+			"$(esc "$state")" \
+			"$([ "$carrier" = "1" ] && echo true || echo false)" \
+			"$(esc "$speed")" "$(esc "$master")" "$(esc "$mac")"
+		sep=","
+	done
+}
+
+do_status() {
+	local up=false bp bname="" had=""
+	wan_up && up=true
+	bp=$(bridge_section)
+	if [ -n "$bp" ]; then
+		bname=$(uci -q get "$bp.name" 2>/dev/null)
+		had=$(uci -q get "$bp.ports" 2>/dev/null)
+	fi
+	printf '{"installed":%s,"enabled":"%s","mode":"%s","manual_port":"%s","probe_timeout":"%s","assume_single_link":"%s","device":"%s","wan_up":%s,"wan_mac":"%s","bridge":"%s","bridge_ports":"%s","ports":[%s]}' \
+		"$([ -x "$WP" ] && echo true || echo false)" \
+		"$(esc "$(cfg enabled)")" \
+		"$(esc "$(cfg mode)")" \
+		"$(esc "$(cfg manual_port)")" \
+		"$(esc "$(cfg probe_timeout)")" \
+		"$(esc "$(cfg assume_single_link)")" \
+		"$(esc "$(wan_device)")" \
+		"$up" \
+		"$(esc "$(wan_mac)")" \
+		"$(esc "$bname")" \
+		"$(esc "$had")" \
+		"$(ports_json)"
+}
+
+# start_detached <subcommand> [arg] - the service must not die with rpcd's child
+# reaper, hence setsid; the log is the only way to see why a probe failed.
+start_detached() {
+	: >"$LOG"
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$WP" "$@" >>"$LOG" 2>&1 &
+	else
+		"$WP" "$@" >>"$LOG" 2>&1 &
+	fi
+}
+
+# The method parameters arrive as a JSON object on stdin; only one string key
+# ever matters here, so a pattern match is enough (no JSON parser in ash).
+json_arg() {
+	input=$(cat)
+	case "$input" in
+	*"\"$1\":\""*) ;;
+	*) echo ""; return 0 ;;
+	esac
+	v=${input#*"\"$1\":\""}
+	echo "${v%%\"*}"
+}
+
+ok() { printf '{"ok":true}'; }
+err() { printf '{"ok":false,"error":"%s"}' "$(esc "$1")"; }
+
+case "${1:-}" in
+list)
+	printf '{ "status": {}, "set_port": { "port": "str" }, "redetect": {}, "reload": {} }\n'
+	;;
+call)
+	case "${2:-}" in
+	status)
+		do_status
+		;;
+	set_port)
+		port=$(json_arg port)
+		case " $(candidates) " in
+		*" $port "*) ;;
+		*)
+			err "unknown port"
+			exit 0
+			;;
+		esac
+		installed || { err "e2631-wanport is not installed"; exit 0; }
+		start_detached apply "$port"
+		ok
+		;;
+	redetect|reload)
+		# Same action: apply the saved settings once more. In manual mode that
+		# binds manual_port, in auto mode it probes again and lands where the
+		# upstream actually is.
+		installed || { err "e2631-wanport is not installed"; exit 0; }
+		start_detached auto
+		ok
+		;;
+	*)
+		err "no such method"
+		;;
+	esac
+	;;
+esac
