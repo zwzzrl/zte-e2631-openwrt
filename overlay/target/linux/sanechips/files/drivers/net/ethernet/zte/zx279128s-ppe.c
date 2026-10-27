@@ -10,6 +10,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/ip.h>
+#include <linux/module.h>
 #include <linux/rhashtable.h>
 #include <linux/slab.h>
 #include <net/flow_offload.h>
@@ -28,7 +29,17 @@
  * The WAN is a plain switch port here, so the hardware treats both
  * directions of a connection as upstream: both use the upstream key
  * header, and each direction has its own flow (rewrite) index.
+ *
+ * IPv6: the classifier has an IPv6 extract index and rule as well, and the
+ * driver can program them (zx_ppe_ipv6), but on this SoC they are not
+ * trusted yet -- with the IPv6 tables in place, a single IPv6 frame could
+ * wedge the switch and take IPv4 down with it, so they stay off and IPv6
+ * keeps the CPU path.  Details in docs/known-issues.md (PPE-IPV6-TCP).
  */
+
+static bool zx_ppe_ipv6;
+module_param_named(ipv6, zx_ppe_ipv6, bool, 0644);
+MODULE_PARM_DESC(ipv6, "program the IPv6 classifier tables (experimental, default off)");
 
 struct zx_ppe_entry {
 	struct rhash_head	node;
@@ -362,10 +373,13 @@ static int zx_ppe_flow_add(struct zx_eth_adapter *adapter,
 		struct flow_match_control match;
 
 		flow_rule_match_control(rule, &match);
-		if (match.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS)
+		if (match.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+			if (!zx_ppe_ipv6)
+				return -EOPNOTSUPP;
 			t.v6 = true;
-		else if (match.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS)
+		} else if (match.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
 			return -EOPNOTSUPP;
+		}
 	} else {
 		return -EOPNOTSUPP;
 	}
@@ -643,20 +657,26 @@ static const u32 zx_ppe_reg_vals[4] = { 0x7fff, 4, 0x7fff7fff, 0x3d };
  * payload (trap reason 0x2c), which would send every pure ACK of an
  * offloaded connection through the software path.  Both are off while
  * offload is active.  SYN, FIN and RST still reach the CPU, so conntrack
- * sees connections open and close.  Hardware LAN switching also needs the
- * IPv6 trap off.  Frames for the router, broadcast, multicast and unknown
- * unicast still reach the CPU through the other traps.
+ * sees connections open and close.  Frames for the router, broadcast,
+ * multicast and unknown unicast still reach the CPU through the other traps.
+ *
+ * The IPv6 ethertype trap stays on in every state: the classifier has no
+ * IPv6 rule it can trust (see zx_ppe_ipv6), and once offload is active the
+ * ports' MACs live in the ONU "routed" table instead of the trap table, so
+ * an un-trapped IPv6 frame would have no way back to the stack -- that is
+ * exactly how IPv6 TCP used to stall once the flowtable was handed to the
+ * PPE.  IPv6 therefore keeps the CPU path (it is still switched in
+ * hardware); only IPv4 is offloaded.
  */
 void zx_update_traps(struct zx_eth_adapter *adapter)
 {
 	void __iomem *base = adapter->base;
-	bool sw, fwd;
+	bool fwd;
 	u32 val;
 
 	spin_lock(&adapter->trap_lock);
-	sw = READ_ONCE(adapter->sw_members);
-	fwd = READ_ONCE(adapter->ppe_active) || sw;
-	writel((fwd ? 0 : ETH_P_IP << 16) | (sw ? 0 : ETH_P_IPV6),
+	fwd = READ_ONCE(adapter->ppe_active) || READ_ONCE(adapter->sw_members);
+	writel((fwd ? 0 : ETH_P_IP << 16) | ETH_P_IPV6,
 	       base + ZX_SPA_TRAP_ETH_TYPE);
 	val = readl(base + ZX_SPA_UP_REG_PKT_EN + 8);
 	if (fwd)
@@ -739,10 +759,10 @@ static int zx_ppe_start(struct zx_eth_adapter *adapter)
 	if (!ret)
 		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
 				  ZX_PPE_V4_INDEX, zx_ppe_v4_index, 5);
-	if (!ret)
+	if (!ret && zx_ppe_ipv6)
 		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE,
 				  ZX_PPE_V6_RULE, zx_ppe_v6_rule, 17);
-	if (!ret)
+	if (!ret && zx_ppe_ipv6)
 		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
 				  ZX_PPE_V6_INDEX, zx_ppe_v6_index, 5);
 	if (ret) {

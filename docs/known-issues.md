@@ -91,15 +91,46 @@ points at something in the repository or at a measurement.
     file at ONU reg 19 (0xe3028, 4x32 bit) and ONU S/D IPv6 at reg 23 (0xe303f, 8x32 bit) - and it
     never uses mainline nf_flow_table/TC_SETUP_FT at all: those strings appear 0 times in the stock
     vmlinux. The bug is ours, not inherited)
-  workaround: "since 2026-10-27 the image default is flow_offloading=0 + flow_offloading_hw=0 (etc/uci-defaults/99_e2631_flowoffload). The feature, kmod-nft-offload, the driver and both firewall options are unchanged - switch them on in LuCI for the wired throughput, accepting that IPv6 TCP will stall again"
+  workaround: |
+    fixed in the driver on 2026-10-27 (option (a) below, then tested on hardware): zx_update_traps()
+    now never lifts the IPv6 ethertype trap, so IPv6 always keeps the CPU path while IPv4 keeps the
+    PPE. With that in place the image default went back to flow_offloading=1 + flow_offloading_hw=1
+    (etc/uci-defaults/99_e2631_flowoffload) - wired IPv4 acceleration is on out of the box again and
+    IPv6 no longer stalls. Verified on a freshly flashed slot 1 (serial 13, kernel 6.18.55): with
+    1 / 1 the ULA/LL TCP reachability that used to hang now behaves, IPv4 SSH/ICMP unaffected, and
+    ppe_active=1 with ppe_flows tracking the IPv4 flowtable. IPv6 is NOT hardware-accelerated: it is
+    switched in hardware but its L3 forwarding stays on the CPU
   next: |
-    two options, both untested on hardware: (a) small change - in zx_update_traps() never clear the
-    IPv6 half (writel((fwd ? 0 : ETH_P_IP << 16) | ETH_P_IPV6, ...)), i.e. IPv4 keeps the PPE path
-    while IPv6 is always trapped to the CPU; costs IPv6 throughput (including LAN-to-LAN IPv6), keeps
-    correctness. (b) large change - give the classifier IPv6: IPv6 index/rule tables, the local-IPv6
-    and ONU S/D IPv6 register files, IPv6 flow entries, and let zx_ppe_flow_add() accept IPv6. That
-    is the vendor's actual design. Reverse-engineering notes: 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md
-  docs: 01-文档/BUILD-NOTES.md 2026-10-27 (both entries)
+    the classifier's IPv6 half is written and in the tree but disabled (module parameter ipv6=1,
+    off by default): IPv6 extract index 10, rule 0x99 (19 windows, hash_len 19), 15-word hash
+    entries, and zx_ppe_flow_add() accepting FLOW_DISSECTOR_KEY_IPV6_ADDRS. Do not just flip it on:
+    on 2026-10-27 a build that programmed those tables hung the box - SSH worked for ~30 s after
+    fw4 bound the flowtable (ppe_flows=0, no IPv6 flow installed), then the first IPv6 frame from a
+    LAN host wedged the switch: IPv4 and IPv6 both dead, ARP/NDP unanswered, link still up, no
+    self-recovery in 8 minutes, fixed only by a power cycle (the second hang of the day; the config
+    had persisted flow_offloading=1, so it also failed at boot until the VM's IPv6 traffic was
+    stopped). What the vendor firmware does have, recovered 2026-10-27 by emulating tm.ko:
+      * rule table: IPv4 fast-path templates at rule 144 (0x90) and 145 (0x91) - upstream/downstream
+        differ only in word 14 bit 25 (0x00700000 vs 0x02700000); IPv6 templates at rule 2/3 with
+        the same contract and hash_len 19 (0x01300000);
+      * extract index table: aclRamInit fills index 1..8 with field ids 16..143, index 9 with
+        144..159 and index 10 with 0..15 (byte 18 = 0x19 for 1..8, 0x15 for 9/10);
+      * tm_acl_fast_init only *enables* them: index 9 |= 1 (v4 fast) and index 10 |= 4 (v6 fast).
+        aclGetExtIdxRuleRamAddrByPort() returns 9 or 10 from two globals that
+        tm_acl_fast_add_v4v6() sets from the session's L3 type;
+      * tm_acl_fast_add_v4v6() builds the 45-byte hash key (__memzero 45) from the 60-byte entry
+        that tm_acl_get_fastHashRule() fills, packing each masked window into the key as
+        (hw & 0x7f) << 1 | (hw >> 15) - i.e. MSB-first within the window, which does NOT match what
+        our driver does (LSB-first put_bits) although our IPv4 code is proven on hardware, so those
+        templates are probably not the path the stock firmware runs in practice;
+      * the vendor's own IPv6 template is inconsistent (window 5 reads offset 0, the last two
+        windows both read offset 40, window 0 masks 0xaf00, window 11 has type 0), which is the
+        other reason not to trust it.
+    To finish this properly, either dump the vendor's live tables from a running stock firmware, or
+    build the IPv6 key/window layout from scratch and bisect it one table at a time on hardware
+    (program only the extract index first, then the rule, then a flow) - each wrong step costs a
+    power cycle.
+  docs: 01-文档/BUILD-NOTES.md 2026-10-27 (both entries); 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md
 - id: USERDATA-EXTROOT
   severity: minor
   status: mitigated

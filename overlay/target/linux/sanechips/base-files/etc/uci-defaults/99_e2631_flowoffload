@@ -1,46 +1,42 @@
 #!/bin/sh
-# Flow offloading: the feature, the packages and both options all stay - only the
-# DEFAULT is OFF as of 2026-10-27. Turn it on from LuCI (Network -> Firewall ->
-# General Settings -> "Software flow offloading" / "Hardware flow offloading") or:
+# Flow offloading: ON by default again (2026-10-27, second change of the day).
 #
-#   uci set firewall.@defaults[0].flow_offloading='1'
-#   uci set firewall.@defaults[0].flow_offloading_hw='1'    # needs the first one
+# History, so nobody flips this back by accident:
+#   v1.3 shipped flow_offloading=1 / flow_offloading_hw=1. Handing the nft
+#   flowtable to the PPE broke IPv6 TCP on this SoC (handshake in ~1 ms, then
+#   zero bytes ever); IPv4 was fine. So the defaults were flipped to 0 / 0 the
+#   same day, which cost the wired IPv4 acceleration (>=395 Mbit/s with the PPE
+#   vs the ~305/190 Mbit/s software ceiling).
+#
+# The cause was not "IPv6 in the PPE" but *where frames go* once the PPE is
+# active: zx_ppe_start() moves the ports' MACs from the trap table into the ONU
+# "routed" table, and the classifier had no IPv6 rule - so an IPv6 frame
+# addressed to the router had no path left to the CPU. The IPv6 ethertype trap
+# is now never lifted (zx_update_traps() in zx279128s-ppe.c keeps ETH_P_IPV6
+# armed in every state), which puts IPv6 back on the CPU path while IPv4 keeps
+# the hardware path. So 1 / 1 is safe again, and that is what this image ships.
+#
+# Still true, with hw offload on:
+#  - IPv6 is not accelerated. It is switched in hardware but the L3 forwarding
+#    stays on the CPU (see the note above). Wired IPv4 TCP/UDP is offloaded.
+#  - WiFi-originated flows are rejected by the PPE on purpose (ingress must be
+#    a switch port) - they stay on the CPU and top out around 200 Mbit/s.
+#  - PPPoE uplinks may not take the hardware path (sibling ZX279133 behaviour).
+#  - the hash table holds 384 entries; overflow falls back to software
+#    (counters ppe_add_skip / ppe_add_fail under
+#    /sys/kernel/debug/92000000.ethernet/)
+#  - the classifier's IPv6 tables do exist in the driver (zx279128s-ppe.c,
+#    extract index 10 + rule 0x99) but are off unless the module parameter
+#    ipv6=1 is set: on hardware they could wedge the switch, and the vendor's
+#    own IPv6 table templates are incomplete (docs/known-issues.md,
+#    PPE-IPV6-TCP). Do not enable them expecting working IPv6.
+#
+# Turn them off from LuCI (Network -> Firewall -> General Settings) or:
+#   uci set firewall.@defaults[0].flow_offloading_hw='0'
 #   uci commit firewall && fw4 restart
-#
-# What the options do (unchanged since v1.3): the gmac driver has the PPE
-# hardware path (zx279128s-ppe.c, TC_SETUP_FT) and the image carries
-# kmod-nft-offload, so with them fw4 installs an nft flowtable; with
-# flow_offloading_hw the flow block is handed to the PPE and established IPv4
-# TCP/UDP flows are forwarded without the CPU (v1.3 measured >=395 Mbit/s wired,
-# up from the ~305/190 Mbit/s software ceiling). If the PPE refuses the block,
-# fw4 falls back to the software flowtable.
-#
-# Why the default flipped: with flow_offloading_hw=1 the PPE's IPv6 TCP path is
-# broken on this SoC - the handshake completes in ~1 ms and then not a single
-# byte of payload moves. ICMPv6 is unaffected (never offloaded), IPv4 is fine,
-# which is what makes it look like a random hang. Re-measured on hardware on
-# 2026-10-27 against a freshly flashed image whose default was still 1 / 1:
-#
-#   flow_offloading=1 + flow_offloading_hw=1  -> IPv6 TCP: connect ok, 0 bytes, 6 s timeout
-#   flow_offloading=1 + flow_offloading_hw=0  -> IPv6 TCP: HTTP/1.0 200 OK in 1 ms
-#   flow_offloading=0 + flow_offloading_hw=0  -> same, works
-#
-# So the flowtable path is opt-in now, and the safe state is the shipped one.
-# Both keys are written explicitly even though 0 is the stock firewall default:
-# this script is the one place that states the policy, so an edit elsewhere
-# cannot silently re-enable the broken path.
-#
-# Known limits if you do turn it on (carried over from the sibling ZX279133
-# port, right.com.cn thread-8486503):
-#  - PPPoE flows may not take the hardware path - if your WAN is PPPoE and
-#    throughput looks software-bound, compare against a plain IP uplink;
-#  - the PPE hash table is small (384 entries on this driver); overflow flows
-#    fall back to software gracefully (driver counters: ppe_add_skip,
-#    ppe_add_fail, under /sys/kernel/debug/92000000.ethernet/);
-#  - IPv6 TCP will stall again - that is the PPE bug above, not a regression.
 uci -q batch <<-EOF
-	set firewall.@defaults[0].flow_offloading='0'
-	set firewall.@defaults[0].flow_offloading_hw='0'
+	set firewall.@defaults[0].flow_offloading='1'
+	set firewall.@defaults[0].flow_offloading_hw='1'
 	commit firewall
 EOF
 exit 0
