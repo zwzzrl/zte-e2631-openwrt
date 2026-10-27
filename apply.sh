@@ -29,6 +29,24 @@ if command -v git >/dev/null 2>&1 && [ -d "$TREE/.git" ]; then
 fi
 
 cp -r "$HERE/overlay/." "$TREE/"
+
+# cp -r only adds. A file deleted from overlay/ stays in a tree that was applied
+# before, so it still gets built into the image - that is how the removed
+# e2631-wanport init script, hotplug hook and udhcpc nop script survived a
+# re-apply in v1.4. overlay-removed.txt is the list apply.sh must delete.
+if [ -f "$HERE/overlay-removed.txt" ]; then
+	gone=0
+	while IFS= read -r f; do
+		case "$f" in ''|\#*) continue ;; esac
+		[ -e "$TREE/$f" ] || continue
+		rm -f "$TREE/$f"
+		gone=$((gone + 1))
+		echo "removed from tree: $f"
+		# Leave no empty directory behind either (usr/share/e2631-wanport/).
+		rmdir "$TREE/$(dirname "$f")" 2>/dev/null || true
+	done <"$HERE/overlay-removed.txt"
+	[ "$gone" = 0 ] || echo "apply.sh: $gone file(s) listed in overlay-removed.txt were deleted from the tree"
+fi
 mkdir -p "$TREE/tools"
 cp "$HERE/tools/mkfactory.mjs" "$TREE/tools/e2631-mkfactory.mjs"
 # The overlay is authored on a filesystem without exec bits; these have to be
@@ -59,6 +77,13 @@ if [ -n "$plugins" ]; then
 	echo "$plugins" | while read -r f; do chmod 0755 "$f"; done
 	echo "rpcd plugins made executable: $(echo "$plugins" | wc -l)"
 fi
+
+# /etc/config/* is 0644 in the image; an editor that writes 0600 into the repo
+# would otherwise ship a config only root can read (works, but every "why does
+# cat say permission denied" question starts here).
+for f in "$TREE/target/linux/sanechips/base-files/etc/config/"*; do
+	[ -f "$f" ] && chmod 0644 "$f"
+done
 
 # rc.d enablement deliberately ships NO "S95..." files: a Windows checkout of
 # this repository cannot hold symlinks (the file becomes regular text and rcS

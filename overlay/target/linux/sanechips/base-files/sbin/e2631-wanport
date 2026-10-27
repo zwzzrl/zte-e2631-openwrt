@@ -52,8 +52,19 @@ cfg() { uci -q get "$CFG.global.$1" 2>/dev/null; }
 # ---- 事实查询 -------------------------------------------------------------
 
 # 这个口现在挂在哪个网桥上（没有就空）
+# 注意必须先判存在：readlink -f 对不存在的路径也会回显解析后的路径字面量，
+# 不判的话没上网桥的口会显示成 "master"（真机上踩过）。
 master_of() {
-	readlink -f "$SYSFS/class/net/$1/master" 2>/dev/null | sed 's|.*/||'
+	local f="$SYSFS/class/net/$1/master"
+	[ -e "$f" ] || { echo ""; return 0; }
+	readlink -f "$f" 2>/dev/null | sed 's|.*/||'
+}
+
+# 口的出厂（DTS 分配）地址。sysfs 里没有 permaddr，只有 ip 通过 netlink 拿得到。
+# 这个值不受 ip link set 影响，所以是「这块板子给 wan 口的固定地址」的正确来源。
+perm_addr() {
+	ip -o link show dev "$1" 2>/dev/null \
+		| sed -n 's/.*permaddr \([0-9a-fA-F:]\{17\}\).*/\1/p' | head -n 1
 }
 
 # netifd 眼里 WAN 是否已经起来（拿到地址/拨号成功）
@@ -72,9 +83,16 @@ cur_wan_dev() {
 
 # WAN 侧用的 MAC。DTS 给 wan 口分的是 tag+0x1f，LAN 口都是 tag+0x1e；换口时保持
 # 这个地址不变：上游的 DHCP 租约、MAC 绑定、IPv6 DUID 都依赖它。
+#
+# 三个来源依次是：uci 固化值 → **wan 口的 permaddr**（DTS 出厂地址，不受 ip link
+# set 影响）→ wan 口当前活动地址。不能直接读当前活动地址：WAN 换到别的口之后，
+# 没人上联的 wan 口地址早就不是出厂值了（真机上就是读到 LAN 基址，于是把 WAN MAC
+# 记成了 LAN MAC）。
 wan_mac() {
 	local m
 	m=$(cfg wan_mac)
+	[ -n "$m" ] && { echo "$m"; return 0; }
+	m=$(perm_addr wan)
 	[ -n "$m" ] || m=$(cat "$SYSFS/class/net/wan/address" 2>/dev/null)
 	echo "$m"
 }
@@ -127,6 +145,8 @@ apply_port() {
 			[ "$p" = "$port" ] || echo "uci add_list $bp.ports=$p"
 		done
 		echo "uci commit network"
+		[ -n "$mac" ] && echo "ip link set dev $port address $mac"
+		[ "$cur" != "$port" ] && echo "ip link set dev $cur address <br-lan 的地址>（原来当 WAN 的口还原）"
 		return 0
 	fi
 
@@ -146,7 +166,8 @@ apply_port() {
 
 	log "WAN 口 -> $port（原来 $cur）"
 	[ -x /etc/init.d/network ] && /etc/init.d/network reload >/dev/null 2>&1
-	restore_lan_macs
+	ensure_port_mac "$port"
+	[ "$cur" != "$port" ] && restore_port_mac "$cur"
 	return 0
 }
 
@@ -154,20 +175,35 @@ apply_port() {
 # 它不会把 MAC 还回去：一个口当过 WAN 再回到 br-lan，会留着 WAN 的 MAC（真机上
 # 复现过：切回 wan 之后 lan2 还是 ...f0，而 br-lan/其他 LAN 口是 ...ef）。
 # 这不影响转发（网桥用自己的地址），但会让 status/页面里的 MAC 列容易看错，
-# 下次换口时也容易误判，所以每次 apply 之后把「已经不在 WAN 的口」里还带着
-# WAN MAC 的恢复成 br-lan 的地址。
-restore_lan_macs() {
-	local lanm wm cur p m
+# 下次换口时也容易误判。
+#
+# 只还原「刚刚不当 WAN 的那一个口」，不是遍历所有口。遍历的版本在真机上出过事：
+# WAN 换到 lan2 时，闲着没上联的 wan 口地址已经是 LAN 基址，而固化值是 ...f0，
+# 两个值不相等，于是它把 wan 口的出厂地址覆盖成了 LAN 基址——等于把这块板子唯一
+# 的 WAN MAC 弄丢了。
+restore_port_mac() {
+	local p=$1 lanm wm m
+	[ -n "$p" ] || return 0
 	lanm=$(cat "$SYSFS/class/net/br-lan/address" 2>/dev/null)
 	wm=$(wan_mac)
-	cur=$(cur_wan_dev)
 	[ -n "$lanm" ] && [ -n "$wm" ] || return 0
 	[ "$lanm" = "$wm" ] && return 0
-	for p in $PORTS; do
-		[ "$p" = "$cur" ] && continue
-		m=$(cat "$SYSFS/class/net/$p/address" 2>/dev/null)
-		[ "$m" = "$wm" ] && ip link set dev "$p" address "$lanm" 2>/dev/null
-	done
+	m=$(cat "$SYSFS/class/net/$p/address" 2>/dev/null)
+	[ "$m" = "$wm" ] || return 0
+	ip link set dev "$p" address "$lanm" 2>/dev/null
+	return 0
+}
+
+# 目标口手上应该是 WAN 的地址。netifd 只在口 up 的时候才写 macaddr，没插网线
+# 就一直留着老地址，status/页面看到的 MAC 就和配置对不上。这里直接写一遍，
+# 有载没载都不用猜。
+ensure_port_mac() {
+	local p=$1 mac m
+	mac=$(wan_mac)
+	[ -n "$mac" ] || return 0
+	m=$(cat "$SYSFS/class/net/$p/address" 2>/dev/null)
+	[ "$m" = "$mac" ] && return 0
+	ip link set dev "$p" address "$mac" 2>/dev/null
 	return 0
 }
 

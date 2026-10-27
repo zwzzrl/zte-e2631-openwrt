@@ -139,12 +139,16 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
   所属网桥 / MAC，每行一个「设为 WAN 口」；配置区只有「允许修改 WAN 口」和
   「WAN 口」两项。
 - **WAN MAC 固定**在 `e2631_ports.global.wan_mac`，取值就是 DTS 给 wan netdev 的地址
-  （`macaddr_tag_1e` base+1）。换物理口时上游看到的 MAC 不变，租约、DUID、上游的
-  MAC 绑定都还能续。口换走之后脚本会把它自己的 MAC 还原成 LAN 基址（netifd 不做这件事）。
-- **逻辑层自检在 PC 上跑**：`sh scripts/selftest-wanport.sh`（13 个场景：默认布局、手动
-  设口、回到默认、幂等、非法口、总开关、DRY_RUN、MAC 还原、wan6 的 @wan 别名、
-  `status`/`selftest`、功能面（不许再出现 `udhcpc`/`auto`/`detect`/开机服务）、rpcd 的
-  JSON 形状、随镜像发布的配置文件的 uci 语法）。
+  （`macaddr_tag_1e` base+1，也就是 `ip link show wan` 里的 `permaddr`——不是它当前的
+  活动地址：那个口不当 WAN 之后地址会被还原成 LAN 基址）。换物理口时上游看到的 MAC
+  不变，租约、DUID、上游的 MAC 绑定都还能续。口换走之后脚本会把它自己的 MAC 还原成
+  LAN 基址（netifd 不做这件事），但只还原"刚换走的那一个口"，不会顺手把 wan 口的
+  出厂地址也改成 LAN 基址。
+- **逻辑层自检在 PC 上跑**：`sh scripts/selftest-wanport.sh`（14 个场景：默认布局、手动
+  设口、回到默认、幂等、非法口、总开关、DRY_RUN、MAC 还原、WAN MAC 取的是 `permaddr`
+  而不是活动地址、wan6 的 @wan 别名、`status`/`selftest`、功能面（不许再出现
+  `udhcpc`/`auto`/`detect`/开机服务）、rpcd 的 JSON 形状、随镜像发布的配置文件的 uci
+  语法）。
 
 **为什么不自动**（2026-10-27 真机结论，详见逆向记录 7.6）：第一版做过「候选口各发一次
 DHCP DISCOVER，谁应答谁当 WAN」，两处硬伤都在真机上撞到了 ——

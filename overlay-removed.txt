@@ -1,0 +1,12 @@
+# 从 overlay/ 里删掉、但已经进过别人构建树的老文件。
+#
+# apply.sh 是「拷贝」不是「同步」（见 apply.sh 里那段说明）：一个文件从 overlay/
+# 删掉，之前构建过的树里那份还在，于是它继续被打进镜像。v1.4 就中了这个招——
+# 砍掉自动 WAN/LAN 识别时删了下面这三个文件，重新 apply 之后树里还在，镜像里
+# 也还在，只有对着 rootfs 才知道「明明删了怎么还有」。表里列出的路径在每次
+# apply.sh 时从树里删掉，删不到就跳过（新树本来就没有）。
+#
+# 路径相对 overlay/ 展开后的树根，一行一个，`#` 开头是注释。
+target/linux/sanechips/base-files/etc/init.d/e2631-wanport
+target/linux/sanechips/base-files/etc/hotplug.d/iface/21-e2631-wanport
+target/linux/sanechips/base-files/usr/share/e2631-wanport/nop.script

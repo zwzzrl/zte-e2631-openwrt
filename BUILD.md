@@ -218,7 +218,11 @@ Four rules that exist because breaking them cost hours:
   the tree and keeps being applied - that is how two abandoned SPI-NAND patches went on
   building into the kernel. `apply.sh` now lists those orphans (files in the tree's patch
   series that are in neither the base commit nor `overlay/`); remove them yourself, since
-  they may be your work rather than stale.
+  they may be your work rather than stale. Deleted *base-files* are the same trap with a
+  worse smell: the removed `e2631-wanport` init script, hotplug hook and udhcpc nop script
+  survived a re-apply and stayed in the rootfs. Anything you delete from `overlay/` that
+  may already sit in somebody's tree goes into `overlay-removed.txt`, which `apply.sh`
+  deletes on every run (missing file = skipped).
 * **Ask for a symbol where it is actually decided.** `target/linux/generic/config-6.18`
   wins over `target/linux/sanechips/config-6.18` for symbols generic names explicitly as
   "is not set" - that is why the lockup detectors are flipped in both files. The witness

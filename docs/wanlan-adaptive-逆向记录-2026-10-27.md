@@ -184,13 +184,22 @@ switchtst -sdwan [port] [mode] [WANIDX]      ← 双 WAN：把某口绑到 WAN1/
    上——IPv6 静默哑掉，没有任何日志。只有显式写了设备名才跟着换。
 2. **只认 `lan1 lan2 lan3 wan` 四个口名**（写死在脚本里，不读配置）：配置里写错
    一个字符串就会作用在不存在或者别的口上，而这一步的代价是断网。
-3. **换走的口要把 MAC 还回去**：netifd 只会把 `network.wan.macaddr` 写到当前 WAN
-   口，不会负责还原，所以脚本在每次 `apply` 之后扫一遍，把已经不在 WAN 的口里还
-   带着 WAN MAC 的恢复成 `br-lan` 的地址（真机上复现过这一点）。
+3. **换走的口要把 MAC 还回去，但只还原那一个口**：netifd 只会把
+   `network.wan.macaddr` 写到当前 WAN 口，不会负责还原，所以 `apply` 结束时把
+   "刚刚不当 WAN 的那个口"里还带着 WAN MAC 的恢复成 `br-lan` 的地址（真机上复现过
+   这一点）。这里**不能**"遍历四个口、谁带着 WAN MAC 就改谁"：WAN 换到 `lan2`
+   之后，没人上联的 `wan` 口活动地址已经是 LAN 基址，而固化值是 base+1，两个值不
+   相等 → 遍历版会把 `wan` 口的出厂地址也覆盖成 LAN 基址，等于把这块板子唯一的
+   WAN MAC 弄丢（2026-10-27 真机上就丢过一次）。
 
 MAC 策略：WAN 固定用 DTS 给的 `wan` netdev 地址（`macaddr_tag_1e` base+1；
 LAN 口都是 base+0），换物理口时上游看到的 MAC 不变，租约、DUID、上游 MAC 绑定
 都还能续。LAN 口共用 base+0，所以把某个口从 `br-lan` 里摘掉也不会改变网桥 MAC。
+
+取这个地址的顺序是：`e2631_ports.wan_mac` 固化值 → **`ip -o link show dev wan` 里
+的 `permaddr`**（DTS 分配的出厂地址，`ip link set` 改不掉）→ `wan` 口当前活动地址。
+不能直接读"当前活动地址"：那个口不当 WAN 之后地址会被还原成 LAN 基址，读到的是
+`...:ef`，于是固化下来的"WAN MAC"其实是 LAN MAC（同一天踩到的第二个坑）。
 
 ### 7.3 界面：`luci-app-e2631-wanport`
 
@@ -210,10 +219,11 @@ LAN 口都是 base+0），换物理口时上游看到的 MAC 不变，租约、D
 ### 7.5 怎么验
 
 - 逻辑层（PC 上，不需要路由器）：`sh scripts/selftest-wanport.sh` —— 假
-  uci/ip/ubus + 假 `/sys`，13 个场景：默认布局、手动设口、回到默认、幂等、非法口、
-  总开关、dry-run、MAC 还原、`wan6` 别名、`status`/`selftest`、功能面（脚本里不许
-  再有 `udhcpc`/`auto`/`detect`/开机服务）、rpcd 的 JSON 形状、随镜像发布的配置
-  文件的 uci 语法。
+  uci/ip/ubus + 假 `/sys`（假 `ip` 连 `permaddr` 也模拟），14 个场景：默认布局、
+  手动设口、回到默认、幂等、非法口、总开关、dry-run、MAC 还原、**WAN MAC 取的是
+  `wan` 口的 `permaddr` 而不是它的活动地址**、`wan6` 别名、`status`/`selftest`、
+  功能面（脚本里不许再有 `udhcpc`/`auto`/`detect`/开机服务）、rpcd 的 JSON 形状、
+  随镜像发布的配置文件的 uci 语法。
 - 真机：`/sbin/e2631-wanport status` 看状态；`DRY_RUN=1 apply lan2` 看要改哪些
   配置；`apply lan2` 再 `apply wan` 是最小的一次往返验证。切到**管理侧所在的口**
   会立刻失联，验证时目标口要选没插线的口（`05-路由器操作脚本/verify-wanport.sh`
@@ -222,7 +232,7 @@ LAN 口都是 base+0），换物理口时上游看到的 MAC 不变，租约、D
 ### 7.6 为什么把自动探测砍掉（2026-10-27 真机结论）
 
 第一版是「候选口各发一次 DHCP DISCOVER，谁应答谁当 WAN；`detect` 找不到就保持不动」，
-逻辑自检 13 条全过，但真机上暴露两个问题：
+当时的逻辑自检全过（手动版现在是 14 条），但真机上暴露两个问题：
 
 1. **探不到真实上行**。PPPoE、静态地址、对端不开 DHCP 的上行都不会应答，用户看到
    的就是"插上了但它不认"，反而比手动更容易误判。

@@ -66,14 +66,27 @@ EOF
 # ---- 假的 ip / ubus / logger ----------------------------------------------
 cat >"$BIN/ip" <<'EOF'
 #!/bin/sh
+S=${E2631_SYSFS:-$TMP/sys}
 echo "ip $*" >>"$TMP/ip.log"
-# 只模拟「改 MAC」这一种：真机上 netifd 改的是 netdev 地址，脚本里
-# restore_lan_macs 也靠 ip link set 还原，所以 sysfs 里的 address 得跟着动。
+# 只模拟两种：
+# 1) `ip -o link show dev X`：真机会带 permaddr（出厂地址，ip link set 改不掉），
+#    脚本用它当 WAN MAC 的来源，所以假 ip 也得能吐出来；
+# 2) `ip link set dev X address Y`：netifd 改的是 netdev 地址，脚本里也靠它还原，
+#    所以 sysfs 里的 address 得跟着动。
+if [ "${1:-}" = "-o" ] && [ "${2:-}" = "link" ] && [ "${3:-}" = "show" ]; then
+	dev=${5:-}
+	perm="$S/class/net/$dev/permaddr"
+	if [ -n "$dev" ] && [ -f "$perm" ]; then
+		printf '5: %s: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN\n' "$dev" \
+			| sed "s|\$|    link/ether $(cat "$S/class/net/$dev/address" 2>/dev/null) brd ff:ff:ff:ff:ff:ff permaddr $(cat "$perm")|"
+	fi
+	exit 0
+fi
 if [ "${1:-}" = "link" ] && [ "${2:-}" = "set" ] && [ "${3:-}" = "dev" ]; then
 	dev=$4; shift 4
 	while [ $# -gt 0 ]; do
 		if [ "$1" = "address" ] && [ -n "${2:-}" ]; then
-			echo "$2" >"${E2631_SYSFS:-$TMP/sys}/class/net/$dev/address" 2>/dev/null
+			echo "$2" >"$S/class/net/$dev/address" 2>/dev/null
 			shift
 		fi
 		shift
@@ -110,6 +123,8 @@ addlist() { "$BIN/uci" add_list "$1=$2"; }
 deletelist() { "$BIN/uci" delete "$1"; }
 getdb() { "$BIN/uci" -q get "$1" 2>/dev/null; }
 newmac() { echo "$2" >"$SYS/$1/address"; }
+# 出厂地址（DTS 分配的 permaddr）：ip link set 改不掉它，脚本拿它当 WAN MAC 的来源
+permmac() { echo "$2" >"$SYS/$1/permaddr"; }
 link() {
 	echo "$2" >"$SYS/$1/carrier"
 	if [ "$2" = "1" ]; then echo up >"$SYS/$1/operstate"; else echo down >"$SYS/$1/operstate"; fi
@@ -131,7 +146,12 @@ reset() {
 	deletelist network.@device[0].ports
 	for p in lan1 lan2 lan3 wan; do
 		addlist network.@device[0].ports "$p"
-		newmac "$p" "00:11:22:33:44:0${p#lan}"
+		case "$p" in
+		wan) mac=00:11:22:33:44:f0 ;;
+		*) mac="00:11:22:33:44:0${p#lan}" ;;
+		esac
+		newmac "$p" "$mac"
+		permmac "$p" "$mac"     # 真机上出厂地址和初始活动地址是一样的
 		link "$p" 0
 		mkdir -p "$SYS/br-lan"
 		ln -sfn "../../br-lan" "$SYS/$p/master" 2>/dev/null
@@ -318,6 +338,25 @@ if [ -f "$SHIPPED" ]; then
 else
 	echo "skip: 找不到 $SHIPPED"
 fi
+
+echo "== 14. WAN MAC 取 wan 口的出厂地址，不取它当前的活动地址 =="
+# 真机上踩到的：WAN 换到别的口之后，wan 口回到网桥、活动地址被还原成 LAN 基址，
+# 于是「读 wan 口当前地址」这种取法就把 LAN 基址当成了 WAN MAC 固化进去——上游
+# 的 DHCP 租约、MAC 绑定、IPv6 DUID 全跟着变。permaddr 不受 ip link set 影响。
+reset
+PWM=$(cat "$SYS/wan/permaddr")
+LANM=$(cat "$SYS/br-lan/address")
+run apply lan2 >/dev/null
+[ "$(getdb e2631_ports.global.wan_mac)" = "$PWM" ] || fail "固化值应取出厂地址 $PWM，实际 $(getdb e2631_ports.global.wan_mac)"
+[ "$(cat "$SYS/wan/address")" = "$LANM" ] || fail "wan 口回到网桥后没恢复 LAN 基址：$(cat "$SYS/wan/address")"
+# 再模拟真机现状：配置被重刷过（固化值丢了）、wan 口活动地址已经是 LAN 基址
+setcfg e2631_ports.global.wan_mac ''
+newmac wan "$LANM"
+out=$(run status)
+echo "$out" | grep -q "wan mac         : $PWM" || fail "status 读到的是活动地址：$(echo "$out" | grep 'wan mac')"
+run apply lan3 >/dev/null
+[ "$(getdb network.wan.macaddr)" = "$PWM" ] || fail "没有固化值时用了活动地址：$(getdb network.wan.macaddr)"
+pass "WAN MAC 取 permaddr：活动地址被还原成 LAN 基址也不影响"
 
 echo
 if [ "$FAILS" -eq 0 ]; then
