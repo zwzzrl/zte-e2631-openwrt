@@ -309,3 +309,66 @@ one, `ECCREQ(8,512)` with 128-byte OOB on the sibling, and getting that wrong is
 silently uncorrectable page. The decision on 2026-10-15 was to stop there. The method to
 resume it - carve the vendor kernel's flash table out of the package and diff it against
 upstream - is scripted in `wsl/vendor-flash-table.sh`.
+
+## VENDOR-RUNTIME-TABLES - 判定：死路（2026-10-28）
+
+目的：拿到原厂 PPE 分类器的运行时 index/rule/hash 表，用它替掉驱动里那份"外推版" v6 表。
+
+手段：把改过的**原厂 rootfs** 写进原厂**非活动槽**，启动后让盒子自己把
+`/proc/zte/verinfo/versionstates` 发回宿主机。一共刷了四轮（v1/v2/v3 是追加新版本节点；
+v5 是**原地替换** `/etc/inittab` 那个 88 字节的不压缩节点：同 ino、同 version、同 offset、
+同长度，只重算 data_crc/node_crc/hdr_crc），并做了一次真断电重启。
+
+结果：**零回调** —— 监听日志里没有任何来自盒子的请求，23/2323 端口全关，抓包零出站；
+UpTime 单调增长（没有重启循环），WebUI 响应正常（也没有 respawn 风暴）。
+
+2026-10-28 用回到 slot1 的 OpenWrt 直接读 flash 取证：
+
+| 读的是什么 | 结果 |
+| --- | --- |
+| 槽 A 版本头 `/dev/mtd5`+0x1440000 | `V1.0.0.8B8.9201`、`fs_crc=0x65c12a61`、`serial=19`、`slotStart=0x700000`、`isNew=1` |
+| 槽 A rootfs 17 MiB 回读 | crc32 `0x65c12a61`，与我们的 `patched-v5.cipher.bin` **逐字节相同** |
+| 槽 B 版本头 `/dev/mtd9`（OpenWrt 包） | `slotStart=0x2300000`、`serial=20`、`isNew=1` —— 升级器自己盖的章，完全正确 |
+
+⇒ 那次断电重启启动的**就是我们的 rootfs**（serial 19 最大），我们的 `/etc/inittab` 就在里面却没执行。
+于是"刷错槽/选错槽"这条解释被证伪，包结构、CRC1/CRC2、fs_crc、槽头盖章也全部排除。
+
+剩下的候选只有两个，都需要**原厂 shell 或串口**才能证实，而这台机器没有串口访问路径：
+
+1. 原厂内核的 `/` 来自**另一份明文副本**（升级器写了密文之后由别的东西解密到别处）；
+2. 它的 JFFS2 读路径**忽略我们新写的节点** —— 最可疑的是 NAND cleanmarker/OOB
+   （见 `tools/PROBE.md` 的 F1：cleanmarker 必须落在数据区，因为 on-die ECC 每次编程都重算页 ECC）。
+
+**任何"故意放一个坏镜像再启动去看看它用不用"的判定实验都不能做**：原厂选中的槽起不来
+不会自动换槽（`docs/01` §3），一次失手就是没有 shell、没有 WebUI、只能 TTL 救的砖。
+
+## SLOT0-WAS-REWRITTEN - 已按备份恢复（2026-10-28）
+
+原厂升级器写的是**非活动槽**，而活动槽随着每次新镜像赢得 serial 竞争在 A/B 之间轮换。
+所以到 2026-10-28，槽 A 里躺的是我们改过的原厂镜像（v5），**不是出厂镜像**。
+此前任何"slot0 原厂完好"的说法都是错的 —— 那是按"我们只让它写 slot1"的意图推的，不是读出来的。
+
+已恢复：把 `工作文件/03-固件备份/router-flash/mtd5_slot0.bin`
+（sha256 `4c7a83f6bcb48225440788a5aeaddba36ee135278163047311aa1ff8595fabcb`，
+头 `V1.0.0.8B8.8000` / `serial=4` / `slotStart=0x700000`，CRC1/CRC2/fs_crc 三处自洽）
+整段写回 slot0，回读整个 `0x1c00000` 分区，sha256 与备份一致。
+
+教训：**别用"我打算写哪个槽"去推断"实际写了哪个槽"**，原厂这条路是按它自己的开机快照挑的。
+
+## PACK-BUILD-FIELD-OVERRUN - 已修（2026-10-28）
+
+打包脚本把 16 字节的 build 串按 **0x40 字节**写进 `+0xa8`，越界把
+`+0xbc`/`+0xc0`（原厂 `0xffffffff`）、`+0xc4`（flash 容量 `0x08000000`）、
+`+0xc8`（块对齐 `0x10000`）清成了 0 —— v1、v2、v3 三个包都带着这个坏头刷进了槽。
+
+已修：build 只写 16 字节，并加"头部差异只允许出现在白名单字段"的硬断言
+（版本串 `0x10..0x30`、`fs_crc 0x48`、build `0xa8..0xb8`、serial `0x1f4`、CRC1、CRC2）。
+
+顺带记一笔：`host/verify_pkg.mjs` 只检查了 `+0xb8 integrity`，`+0xc4/+0xc8` 这两格
+值得在那里也加一条断言。
+
+## SOFTWAREVER-IS-A-FLASH-RECORD
+
+原厂 WebUI 的 `SoftwareVer`/`VerDate` 在我们**没有重启**的情况下就变成了新包里的串
+（v3 的 9100 → v5 的 9201 都是刷完、还没重启时就变了）。所以它反映的是"flash 上最新的镜像"，
+**不是"这次启动的是哪个镜像"**。拿它当启动证据会直接把结论带偏。
