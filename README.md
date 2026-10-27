@@ -38,7 +38,8 @@ flash/squashfs/jffs2 驱动是内建的、强制命令行生效、USB 与看门�
 
 与 H3600 那份板级文件**有意不同**的地方：
 
-* 一个 WAN + 三个 LAN，四个口全在集成 GbE PHY 上 —— 没有外置 PHY
+* 四个口全在集成 GbE PHY 上 —— 没有外置 PHY；出厂布局是一个 WAN + 三个 LAN，
+  但谁当 WAN 只是软件决定，v1.4 起可以换（见「WAN/LAN 自适应」一节）
 * 256 MiB 内存，不是 512
 * **整镜像 A/B 槽**（`0x700000` / `0x2300000`，各 28 MiB），而不是 4 MiB kernel 分区 + UBI
 * 没有 USB：原厂内核里根本没有 USB；在没焊控制器的板子上探测它会重启整颗 SoC
@@ -89,7 +90,7 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
 于是它报的是上一轮留在那儿的东西 —— 现在它先解包。任何"根文件系统里到底有什么"的回答，
 只要来自一个你本次没有刚解出来的目录，那就是个过期答案。
 
-## 真机上的状态（2026-10-24，v1.3；v1.2 及更早见 git 历史）
+## 真机上的状态（2026-10-24，v1.3；v1.4 的 WAN/LAN 自适应见下；v1.2 及更早见 git 历史）
 
 当前包：Release **`v1.3`** —— 主题"从能刷到能用"。相对 v1.2 的四件事，每件的证据链在
 [docs/known-issues.md](docs/known-issues.md)：
@@ -122,6 +123,33 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
 
 历史包（v1.0 首个能刷能启、v1.1 加 `e2631-wifi-ap` 并改手动武装回退、v1.2 修 wifi-ap 三个真机问题）
 的注记随 release 保留；v1.3 起手动开射频的旧流程退居后备（`e2631-wifi-on 0` + `e2631-wifi-ap` 仍可用）。
+
+### v1.4：WAN/LAN 自适应（任意有线口当 WAN，待真机验证）
+
+原厂叫「WAN/LAN 自适应」/ 盲插。原厂是在 cspd 的 NetAdapt 里探测，再 ioctl 给交换芯片设
+端口角色（逆向记录见 [docs/wanlan-adaptive-逆向记录-2026-10-27.md](docs/wanlan-adaptive-逆向记录-2026-10-27.md)）。
+这里完全不碰芯片：四个口本来就是四个独立 netdev，"谁当 WAN"只等于
+**wan 接口绑在哪个 netdev、那个 netdev 不在 br-lan 里**。
+
+- **界面**：`网络 → WAN 口`（包 `luci-app-e2631-wanport`）—— 四个口的角色 / 链路 /
+  所属网桥 / MAC，每行一个「设为 WAN 口」，下面还有模式设置和「立即探测」。
+- **命令行**：`e2631-wanport status | detect | auto | apply <口>`；
+  `DRY_RUN=1 e2631-wanport apply lan2` 只打印要改的 uci，不动配置。
+- **默认 auto（盲插）**：netifd 眼里 WAN 还 up 就一个字节都不动；没 up 才对**其他**口各跑
+  一次 DHCP DISCOVER，谁应答谁当上行。正在当 WAN 的那个口永远不用 DHCP 去探 —— 那个口上
+  有 netifd 自己的 udhcpc，同一个 MAC 上第二个客户端会互相抢租约。
+- **PPPoE / 静态上行**探测不到（对端不应答 DHCP）：用 `mode manual` + `manual_port`，
+  或者打开 `assume_single_link` 让它按「只插了一根线」猜（代价见配置文件里的注释）。
+- **WAN MAC 固定**在 `e2631_ports.global.wan_mac`，取值就是 DTS 给 wan netdev 的地址
+  （`macaddr_tag_1e` base+1）。换物理口时上游看到的 MAC 不变，租约、DUID、上游的
+  MAC 绑定都还能续。
+- **逻辑层自检在 PC 上跑**：`sh scripts/selftest-wanport.sh`（12 个场景：探测失败必须复原
+  网桥成员、探测期的 MAC 借用与还原、MANUAL/兜底猜测、DRY_RUN、rpcd 的 JSON 形状）。
+  把「探测后放回网桥」或「不探现用口」故意改坏，它都会报警。
+
+**未验证**：这套东西还没在真机上跑过 —— 机器现在停在原厂系统上，刷不刷是用户的决定。
+`auto` 的探测时序（换线后多久收敛）、换口后 dnsmasq / IPv6 RA 的表现、与 relayd 组网
+并存的情况，都还需要真机确认。
 
 ### 旧状态表（v1.2 口径，留作对照）
 
