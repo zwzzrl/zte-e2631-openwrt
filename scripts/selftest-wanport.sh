@@ -315,7 +315,20 @@ else
 	echo "skip: 没有 $RPCD 或 python3"
 fi
 
-echo "== 12. status / selftest 能跑通 =="
+echo "== 12. wan6 跟着走，但别把 @wan 别名写成设备名 =="
+# 显式绑设备时 wan6 必须跟着换；绑 @wan 时整条都不能碰——写成设备名等于把别名
+# 换成固定 device，之后 IPv6 就静默哑掉。
+reset
+run apply lan2 >/dev/null
+[ "$(getdb network.wan6.device)" = "lan2" ] || fail "显式绑设备的 wan6 没跟上：$(getdb network.wan6.device)"
+reset
+setcfg network.wan6.device "@wan"
+run apply lan3 >/dev/null
+[ "$(getdb network.wan6.device)" = "@wan" ] || fail "wan6 的 @wan 别名被改成了 $(getdb network.wan6.device)"
+[ "$(getdb network.wan.device)" = "lan3" ] || fail "wan 没换到 lan3：$(getdb network.wan.device)"
+pass "wan6 显式设备跟随、@wan 别名不动"
+
+echo "== 13. status / selftest 能跑通 =="
 reset
 wanup
 run status >/dev/null 2>&1 || fail "status 退出码非 0"

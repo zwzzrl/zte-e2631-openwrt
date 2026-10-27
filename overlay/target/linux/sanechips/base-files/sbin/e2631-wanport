@@ -201,17 +201,25 @@ detect() {
 # ---- 落地 -----------------------------------------------------------------
 
 apply_port() {
-	local port=$1 cur bp p mac
+	local port=$1 cur bp p mac w6
 	[ -n "$port" ] || return 1
 	[ -d "$SYSFS/class/net/$port" ] || { log "没有 $port 这个口"; return 1; }
 	cur=$(cur_wan_dev)
 	bp=$(bridge_section)
 	[ -n "$bp" ] || { log "uci 里找不到 br-lan 的 device 段，放弃"; return 1; }
 	mac=$(wan_mac)
+	# wan6 只有在「显式绑了某个设备」时才需要跟着改。绑的是 @wan 别名时它自己
+	# 就跟着 wan 走，再写成设备名等于把别名换掉——下次谁改了 wan.device，
+	# wan6 就落到一个不存在的 netdev 上（IPv6 整个哑掉，而且不报错）。
+	w6=$(uci -q get network.wan6.device 2>/dev/null)
+	case "$w6" in
+	''|@*) w6="" ;;
+	esac
 
 	if [ "${DRY_RUN:-0}" = "1" ]; then
 		echo "uci set network.wan.device=$port"
 		[ -n "$mac" ] && echo "uci set network.wan.macaddr=$mac"
+		[ -n "$w6" ] && echo "uci set network.wan6.device=$port"
 		echo "uci -q delete $bp.ports"
 		for p in $(candidates); do
 			[ "$p" = "$port" ] || echo "uci add_list $bp.ports=$p"
@@ -222,10 +230,7 @@ apply_port() {
 
 	uci set network.wan.device="$port"
 	[ -n "$mac" ] && uci set network.wan.macaddr="$mac"
-	# wan6 若显式绑了设备，跟着走（绑 @wan 的不用管）
-	if [ -n "$(uci -q get network.wan6.device 2>/dev/null)" ]; then
-		uci set network.wan6.device="$port"
-	fi
+	[ -n "$w6" ] && uci set network.wan6.device="$port"
 	# MAC 只在第一次算出来时固化，之后一直用它
 	[ -n "$mac" ] && [ -z "$(cfg wan_mac)" ] && uci set "$CFG.global.wan_mac"="$mac"
 
