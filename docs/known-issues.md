@@ -76,9 +76,29 @@ points at something in the repository or at a measurement.
   surface: ethernet + ipv6
   symptom: LAN client -> router over IPv6 TCP connects in ~1 ms and then no payload ever arrives (0 bytes, times out); IPv4 over the same port and ICMPv6 are fine, so it reads as a random hang. Also stalls IPv6 TCP through the router to the internet.
   verified: yes - 2026-10-27 on a freshly flashed image: flow_offloading=1 + flow_offloading_hw=1 -> connect ok, 0 bytes in 6 s; hw=0 -> HTTP/1.0 200 OK in 1 ms; 0/0 -> same. Reproduced on ports 80/22/53 with both a ULA and a fe80 destination (fw4 stop/start flipped it every time)
-  cause: with flow_offloading_hw=1 fw4 hands the nft flow block to zx279128s-ppe.c via TC_SETUP_FT, and the PPE's IPv6 TCP offload path is broken on this SoC - offloaded TCP return traffic never leaves. ICMPv6 is not offloaded, which is why ping6 stays green
+  cause: |
+    flow_offloading_hw=1 makes fw4 bind an nft flowtable, and zx_eth_setup_tc()/FLOW_BLOCK_BIND calls
+    zx_ppe_start() unconditionally - that programs the classifier with the IPv4-ONLY index/rule tables
+    (zx_ppe_v4_index/zx_ppe_v4_rule; zx_ppe_flow_add() rejects anything that is not
+    FLOW_DISSECTOR_KEY_IPV4_ADDRS/ETH_P_IP), then sets ppe_active=1, which moves our MACs from the
+    trap-DMAC table into the ONU "routed" table and clears the trap-DMAC entries. The IPv6 ethertype
+    trap is already off whenever sw_members != 0 (three LAN ports in br-lan => always), so with
+    ppe_active=1 an IPv6 frame addressed to the router has NO path left to the CPU: the SYN gets
+    through by another trap, the payload and the replies do not. hw=0 restores the MACs to the
+    trap-DMAC table and everything works, which is why the switch is what flips it
+    (vendor comparison, 2026-10-27: the stock firmware has an IPv6-capable classifier - per-class NPU
+    caps npu_ipv6_l3tcp{up,down}_cap, IPv6 SNAT/DNAT RAM, NPTv6, plus a local-IPv6-address register
+    file at ONU reg 19 (0xe3028, 4x32 bit) and ONU S/D IPv6 at reg 23 (0xe303f, 8x32 bit) - and it
+    never uses mainline nf_flow_table/TC_SETUP_FT at all: those strings appear 0 times in the stock
+    vmlinux. The bug is ours, not inherited)
   workaround: "since 2026-10-27 the image default is flow_offloading=0 + flow_offloading_hw=0 (etc/uci-defaults/99_e2631_flowoffload). The feature, kmod-nft-offload, the driver and both firewall options are unchanged - switch them on in LuCI for the wired throughput, accepting that IPv6 TCP will stall again"
-  next: reject IPv6 flows in zx_eth_setup_tc()/TC_SETUP_FT (-EOPNOTSUPP) so IPv4 keeps the PPE path while IPv6 stays on the CPU; not done, driver untouched
+  next: |
+    two options, both untested on hardware: (a) small change - in zx_update_traps() never clear the
+    IPv6 half (writel((fwd ? 0 : ETH_P_IP << 16) | ETH_P_IPV6, ...)), i.e. IPv4 keeps the PPE path
+    while IPv6 is always trapped to the CPU; costs IPv6 throughput (including LAN-to-LAN IPv6), keeps
+    correctness. (b) large change - give the classifier IPv6: IPv6 index/rule tables, the local-IPv6
+    and ONU S/D IPv6 register files, IPv6 flow entries, and let zx_ppe_flow_add() accept IPv6. That
+    is the vendor's actual design. Reverse-engineering notes: 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md
   docs: 01-文档/BUILD-NOTES.md 2026-10-27 (both entries)
 - id: USERDATA-EXTROOT
   severity: minor
