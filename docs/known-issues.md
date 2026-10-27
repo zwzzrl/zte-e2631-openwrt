@@ -152,6 +152,31 @@ points at something in the repository or at a measurement.
     module parameter, nothing persisted) and IPv6 still answered. Still unproven: an IPv6
     *forwarded* flow - an uplink is needed, since lan1..lan3 and wan are in the flowtable but wan
     had no link.
+    Step 2 was run on 2026-10-28 03:5x with a second host on lan1, which was turned into a real
+    WAN interface (192.168.9.1/24 + fd99::1/64, odhcpd RA on it), so the LAN host's iperf3 client
+    reached the WAN host through the router: a genuine IPv6 forwarded TCP flow. Result: **it is
+    NOT offloaded**. Three configurations gave the same throughput and the same CPU load within
+    noise (`iperf3 -t 8/10`, one TCP stream, WAN host fd99::7592:7724:8ae4:3d61):
+      A ipv6=1 hw=1: 361 Mbit/s, softirq 38.1%
+      B ipv6=1 hw=0: 359 Mbit/s, softirq 37.3%
+      C ipv6=0 hw=1: 356 Mbit/s, softirq 36.7%
+    A ~= B ~= C with softirq pinned around 37% means every packet is still being forwarded by the
+    CPU, so the classifier never claims this flow. The box also stays healthy, i.e. writing the
+    vendor's rule 2 no longer breaks anything - it simply never matches.
+    Most likely reason (to be confirmed, not proven): the hardware extracts fields and hashes them
+    according to rule 2's own window layout, while the driver builds the hash key from a *clean*
+    19-window layout (next header at offset 6 mask 0xff00, then 0xffff at 8..42). Rule 2 decoded
+    from tm.ko is not clean - window 4 reads offset 0, windows 17 and 18 both read offset 40, and
+    window 10 has type 0 - so the key the driver writes cannot equal the key the hardware derives,
+    and the lookup misses. That also explains 2026-10-27: the *clean* tables used then changed
+    what the hardware extracts (and probably the key length), which is what wedged the switch,
+    instead of merely missing.
+    Next step, in order: (1) recover the exact extraction/type semantics of rule 2 from tm.ko's
+    aclBuildHashAndAclRule / tm_acl_fast_add_v4v6 so the driver can build the key the hardware
+    expects; (2) or construct our own rule whose layout equals the driver's key layout and verify
+    the hash_len/key-length encoding first, since that is the part that killed the box before.
+    Either way the A/B/C measurement above is the acceptance test: the A column has to separate
+    from B and C, and softirq has to drop.
     To finish this properly, either dump the vendor's live tables from a running stock firmware, or
     build the IPv6 key/window layout from scratch and bisect it one table at a time on hardware
     (program only the extract index first, then the rule, then a flow) - each wrong step costs a
