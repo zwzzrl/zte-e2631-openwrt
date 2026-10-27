@@ -27,9 +27,6 @@ msgstr "网桥"
 msgid "MAC address"
 msgstr "MAC 地址"
 
-msgid "Mode"
-msgstr "模式"
-
 msgid "WAN"
 msgstr "WAN"
 
@@ -42,11 +39,8 @@ msgstr "已连接"
 msgid "down"
 msgstr "未连接"
 
-msgid "WAN MAC"
-msgstr "WAN MAC"
-
-msgid "members"
-msgstr "成员"
+msgid "no cable"
+msgstr "无网线"
 
 msgid "connected"
 msgstr "已连接"
@@ -54,83 +48,44 @@ msgstr "已连接"
 msgid "connected, %s Mb/s"
 msgstr "已连接，%s Mb/s"
 
-msgid "no cable"
-msgstr "未插网线"
-
 msgid "not in a bridge"
-msgstr "不在任何网桥中"
-
-msgid "fixed port"
-msgstr "固定端口"
-
-msgid "automatic (blind plug)"
-msgstr "自动（盲插）"
-
-msgid "port %s"
-msgstr "端口 %s"
-
-msgid "settings: %s"
-msgstr "配置文件中的值：%s"
-
-msgid "Enable"
-msgstr "启用"
-
-msgid "Automatic (blind plug)"
-msgstr "自动（盲插）"
-
-msgid "Fixed port"
-msgstr "固定端口"
-
-msgid "Fixed WAN port"
-msgstr "固定 WAN 口"
-
-msgid "Only used in fixed mode."
-msgstr "仅在固定模式下有效。"
-
-msgid "Probe timeout (seconds)"
-msgstr "探测超时（秒）"
-
-msgid "Detect now"
-msgstr "立即探测"
+msgstr "不在网桥里"
 
 msgid "Use as WAN"
 msgstr "设为 WAN 口"
 
-msgid "Off: the WAN stays where it is, however the cables are plugged."
-msgstr "关闭后无论怎么插线，WAN 都停在原来的口上。"
+msgid "configured port"
+msgstr "配置的口"
 
-msgid "Automatic: whichever port has the uplink cable takes the WAN role. Fixed: always the port below (use this for PPPoE or a static address upstream, which cannot be detected)."
-msgstr "自动：上行线插在哪个口，哪个口就当 WAN。固定：始终使用下面选定的端口（上行为 PPPoE 或静态地址时用这个，那种情况探测不到）。"
+msgid "WAN MAC"
+msgstr "WAN MAC"
 
-msgid "How long each port is given to answer the probe. The worst case of a full scan is this times four."
-msgstr "每个端口等待应答的时间。全部扫一遍的最坏耗时是这个值的四倍。"
+msgid "members"
+msgstr "成员"
 
-msgid "Guess when only one cable is plugged in"
-msgstr "只有一根网线时按它猜"
-
-msgid "Automatic mode only finds an uplink that answers DHCP; PPPoE and static uplinks do not. With this on, a single cable that is not in the current WAN port is taken as the uplink. It also fires when a lone computer is the only thing plugged in, which would then lose its LAN connection — that is why it is off by default."
-msgstr "自动模式只能发现应答 DHCP 的上行；PPPoE 和静态上行不会应答。打开这一项后，如果只插了一根网线、且不在当前 WAN 口，就把它当上行口。但如果只接了一台电脑，也会命中，那台电脑就会失去 LAN 连接——所以默认关闭。"
-
-msgid "No candidate ports found: /sbin/e2631-wanport is not installed on this router."
-msgstr "没有找到候选端口：本路由器未安装 /sbin/e2631-wanport。"
-
-msgid "The switch could not be started: %s"
-msgstr "无法启动切换：%s"
-
-msgid "Detection could not be started: %s"
-msgstr "无法启动探测：%s"
+msgid "No ports found: /sbin/e2631-wanport is not installed on this router."
+msgstr "没找到端口：这台路由器上没装 /sbin/e2631-wanport。"
 
 msgid "Switching the WAN to %s. The uplink drops for a few seconds while the bridge and the WAN interface are moved."
-msgstr "正在把 WAN 切到 %s。移动网桥和 WAN 接口期间上行会中断几秒。"
+msgstr "正在把 WAN 切到 %s。网桥和 WAN 接口重建期间上行会中断几秒。"
 
-msgid "Detection started: the ports with a cable are probed one by one. The result appears in the table above within a few seconds."
-msgstr "已开始探测：逐个测试插了网线的端口，几秒内结果会出现在上表。"
+msgid "The switch could not be started: %s"
+msgstr "没能启动切换：%s"
 
-msgid "The service is switched off: nothing happens automatically until it is enabled below."
-msgstr "服务已关闭：在下面启用之前不会有任何自动动作。"
+msgid "LAN and WAN are roles here, not hardware: the WAN port is whichever port the WAN interface is bound to and which is out of the LAN bridge. Nothing is detected or switched automatically — a port becomes the WAN only when you say so. The WAN MAC stays the same across a port change, so the uplink lease and the IPv6 identity of this router survive it."
+msgstr "这里的 LAN / WAN 是角色而不是硬件：WAN 口就是 WAN 接口绑定的、且不在 LAN 网桥里的那个口。路由器不会自动探测、也不会自动切换——只有你指定了才会换。换口时 WAN MAC 保持不变，所以上游的租约和这台路由器的 IPv6 身份都能延续。"
 
-msgid "LAN and WAN are roles here, not hardware. In automatic mode the router DHCP-probes the ports that have a cable and gives the WAN role to the one that is answered; in fixed mode it always uses the chosen port. The WAN MAC stays the same either way, so the lease and the IPv6 identity of this router survive a port change."
-msgstr "这里的 LAN 和 WAN 是角色而不是硬件。自动模式下，路由器对插了网线的端口做一次 DHCP 探测，把 WAN 角色给有应答的那个；固定模式下始终使用选定的端口。两种模式的 WAN MAC 都不变，所以换口之后上游租约和本机的 IPv6 身份都能延续。"
+msgid "Changing the WAN port is switched off (enabled = 0). The current layout stays as it is."
+msgstr "已关闭换口功能（enabled = 0），当前布局保持不变。"
 
-msgid "Any of the four wired ports can carry the uplink. This is the same feature the factory calls \"WAN/LAN adaptive\", implemented without touching the switch: a port is a WAN port when the WAN interface is bound to it and it is out of the LAN bridge."
-msgstr "四个有线口都可以当上行口。这就是原厂说的「WAN/LAN 自适应」，只是不碰交换芯片：WAN 接口绑在哪个口上、且该口不在 LAN 网桥里，哪个口就是 WAN 口。"
+msgid "Any of the four wired ports can carry the uplink. This is the same feature the factory calls \"WAN/LAN adaptive\", implemented without touching the switch: a port is a WAN port when the WAN interface is bound to it and it is out of the LAN bridge. The default is the factory layout — the \"wan\" port is the WAN, LAN1..3 are the switch."
+msgstr "四个有线口里的任意一个都可以当上联口。这就是原厂说的「WAN/LAN 自适应」，只是不碰交换芯片：WAN 接口绑到哪个口、那个口又不在 LAN 网桥里，它就是 WAN 口。默认就是原厂布局——「WAN」口当 WAN，LAN1~3 是交换机。"
+
+msgid "Allow changing the WAN port"
+msgstr "允许修改 WAN 口"
+
+msgid "Off: the router keeps its current layout and the buttons on this page are disabled."
+msgstr "关掉后保持当前布局，本页的按钮也不可用。"
+
+msgid "The port that should carry the uplink. Saving applies it: the port leaves the LAN bridge, the WAN interface is bound to it, and the other three ports join the bridge. The uplink drops for a few seconds while that happens."
+msgstr "用来当上联的口。保存后立即生效：该口离开 LAN 网桥、WAN 接口绑到它，另外三个口加入网桥。这个过程中上行会中断几秒。"

@@ -140,48 +140,53 @@ switchtst -sdwan [port] [mode] [WANIDX]      ← 双 WAN：把某口绑到 WAN1/
 - 因为驱动给的是独立 netdev，「把 WAN 绑到 lan1」在 uci 层面本来就做得到，
   缺的是：**(a) 自动探测哪个口是上行；(b) 把重绑做成可管理的动作并持久化；(c) 界面。**
 
-## 7. 本仓库的实现（已落地）
+## 7. 本仓库的实现（手动版，已上真机）
 
 不碰交换芯片、不引 `switchtst`，纯用户态：**WAN 接口绑在哪个 netdev、那个 netdev
 不在 `br-lan` 里**，它就是 WAN 口。
+
+**自动探测已经砍掉**，只保留手动指定。原因见 7.6，两条都是 2026-10-27 真机上
+量出来的：PPPoE / 静态上行 / 对端不开 DHCP 的上行探不到；而自动切换能把管理侧
+关在门外（WAN 区 input=REJECT，SSH/HTTP 全断，只剩 ping）。
 
 ### 7.1 配置：`/etc/config/e2631_ports`
 
 | 选项 | 默认 | 含义 |
 | --- | --- | --- |
-| `enabled` | `1` | 总开关；关掉后无论怎么插线都不动作 |
-| `mode` | `auto` | `auto` 盲插 / `manual` 固定口 |
-| `manual_port` | `wan` | `manual` 模式下用哪个口 |
-| `probe_timeout` | `3` | 每个候选口等应答的秒数 |
-| `assume_single_link` | `0` | 兜底猜测：只有一根线插着时认它当上行 |
-| `candidates` | `lan1 lan2 lan3 wan` | 参与自适应的口 |
+| `enabled` | `1` | 总开关；`0` 时 `apply` 直接拒绝 |
+| `manual_port` | `wan` | 当前 WAN 口：`lan1`/`lan2`/`lan3`/`wan` |
 | `wan_mac` | 空 | 第一次落地后固化下来的 WAN MAC |
+
+默认布局就是镜像自带的原厂布局：`wan` 口当 WAN，`lan1/lan2/lan3` 在 `br-lan`。
+开机不做任何动作，没有开机服务、没有热插拔钩子。
 
 ### 7.2 服务：`/sbin/e2631-wanport`
 
-与第 4 节逐个函数对应：
+| 子命令 | 作用 |
+| --- | --- |
+| `status` | 当前绑定 / 网桥成员 / 四个口的链路与 MAC |
+| `apply <port>` | 把 WAN 绑到指定口：改 `wan.device`（+`wan6`）→ 该口离桥 → 其余口回桥 → `network reload` |
+| `selftest` | 不碰网络的自检（配置解析与命名） |
+
+与原厂 NetAdapt 的对照（原厂那几个函数现在没有对应物，因为不自动了）：
 
 | 原厂（cspd NetAdapt） | 这里 |
 | --- | --- |
-| `NetAdaptUpLinkProbeStart` / `NetAdaptUpLinkProbeOK` | 候选口上跑一次 DHCP DISCOVER（`udhcpc -f -n -t 1`，用 `/usr/share/e2631-wanport/nop.script` 屏蔽脚本副作用） |
-| `NetAdaptGetUpstreamByPhyID` | 有应答的那个 netdev 就是上行口 |
 | `SetWanLanMode`（ioctl）| `uci set network.wan.device=<口>`（+ `wan6`） |
 | `NetAdaptSetBrPermitPort` | 把该口从 `br-lan` 的 `ports` 里摘掉，其余口放回去 |
+| `NetAdaptUpLinkProbeStart/OK`、`NetAdaptEthPhyUpProc/DownProc`、开机探测 | **不做**（见 7.6） |
 | `NetAdaptDhcp6cStart` | `wan6` 跟着同一设备走，无需单独拉起 |
-| `NetAdaptEthPhyUpProc/DownProc` | `/etc/hotplug.d/iface/21-e2631-wanport`（带 20 s 去抖） |
-| 开机探测 | `/etc/init.d/e2631-wanport`（`START=98`，等 netifd 建好 lan/wan 再跑） |
 
-两条从坑里换来的规矩（实现时写进脚本头部注释）：
+三条写进脚本的规矩：
 
-1. **探测前必须让口离开网桥**，否则本机 dnsmasq 就在 `br-lan` 上应答这次
-   DISCOVER，任何一个 LAN 口都会被判成上行口；探测结束无论选中与否都要放回原来的
-   master，否则没被选中的口就永久掉出 `br-lan`。
-2. **绝不用 DHCP 探测正在当 WAN 的那个口**：netifd 自己的 udhcpc 正在它上面跑，
-   再插一个同 MAC 的客户端会互相抢租约。现用口的死活改问
-   `ubus call network.interface.wan status`——它 up 就直接返回，一个字节都不动。
-3. **`wan6` 绑的是 `@wan` 别名时一个字都不能写**：别名本来就跟着 `wan` 走，写成
+1. **`wan6` 绑的是 `@wan` 别名时一个字都不能写**：别名本来就跟着 `wan` 走，写成
    具体设备名等于把别名换成固定设备，之后换口时 `wan6` 会落到一个不存在的 netdev
    上——IPv6 静默哑掉，没有任何日志。只有显式写了设备名才跟着换。
+2. **只认 `lan1 lan2 lan3 wan` 四个口名**（写死在脚本里，不读配置）：配置里写错
+   一个字符串就会作用在不存在或者别的口上，而这一步的代价是断网。
+3. **换走的口要把 MAC 还回去**：netifd 只会把 `network.wan.macaddr` 写到当前 WAN
+   口，不会负责还原，所以脚本在每次 `apply` 之后扫一遍，把已经不在 WAN 的口里还
+   带着 WAN MAC 的恢复成 `br-lan` 的地址（真机上复现过这一点）。
 
 MAC 策略：WAN 固定用 DTS 给的 `wan` netdev 地址（`macaddr_tag_1e` base+1；
 LAN 口都是 base+0），换物理口时上游看到的 MAC 不变，租约、DUID、上游 MAC 绑定
@@ -190,26 +195,47 @@ LAN 口都是 base+0），换物理口时上游看到的 MAC 不变，租约、D
 ### 7.3 界面：`luci-app-e2631-wanport`
 
 `网络 → WAN 口`（`admin/network/e2631-wanport`）：当前 WAN/网桥/MAC、四个口的
-链路状态与角色（每行一个「设为 WAN 口」按钮）、模式与超时设置、「立即探测」。
-后端是 rpcd 的 shell 插件（`/usr/libexec/rpcd/e2631-wanport`），`set_port` 等动作
-只负责把服务拉起来就返回——探测一轮要十几秒，同步等待只会让页面像卡死。
+链路状态与角色（每行一个「设为 WAN 口」按钮），配置区只有「允许修改 WAN 口」和
+「WAN 口」两项。保存并应用后页面先写 uci，再让服务做一次 `apply`；`set_port`
+只负责把服务拉起来就返回（`apply` 会 reload network，同步等待会把这个 ubus 请求
+自己掐断），页面 5 s 轮询状态。
 
 ### 7.4 与原厂的差异（刻意不做）
 
+- **不做自动探测/盲插**：原厂 `auto` 那套在这里既不完整也不安全（7.6）。
 - **不做双 WAN**：原厂 `WAN2` 是交换芯片上第二个 WAN 角色，这里是单上行；要做
   得给第二个口再建一个 interface + 策略路由，是另一件事。
-- **不做面板级 `banport`**：原厂能禁用某些口不让它被选中；这里用 `candidates`
-  列表表达同样的意图，够用且更好懂。
-- **探测协议只有 DHCP**：原厂 `auto` 下 PPPoE / 静态上行也靠人肉选择，这里同样：
-  PPPoE 用 `manual` 模式，或打开 `assume_single_link` 让它按「只插了一根线」猜。
+- **不做面板级 `banport`**：原厂能禁用某些口不让它被选中；这里四个口一律可选。
 
 ### 7.5 怎么验
 
 - 逻辑层（PC 上，不需要路由器）：`sh scripts/selftest-wanport.sh` —— 假
-  uci/ip/udhcpc/ubus + 假 `/sys`，13 个场景（含探测失败复原、MAC 借用与恢复、
-  wan6 别名、rpcd 的 JSON 形状）。故意改坏「探测后放回网桥」和「不探现用口」都会报警。
-- 真机：`/sbin/e2631-wanport status` 看状态，`detect` 看探测结果，
-  `DRY_RUN=1 apply lan2` 看要改哪些配置。
+  uci/ip/ubus + 假 `/sys`，13 个场景：默认布局、手动设口、回到默认、幂等、非法口、
+  总开关、dry-run、MAC 还原、`wan6` 别名、`status`/`selftest`、功能面（脚本里不许
+  再有 `udhcpc`/`auto`/`detect`/开机服务）、rpcd 的 JSON 形状、随镜像发布的配置
+  文件的 uci 语法。
+- 真机：`/sbin/e2631-wanport status` 看状态；`DRY_RUN=1 apply lan2` 看要改哪些
+  配置；`apply lan2` 再 `apply wan` 是最小的一次往返验证。切到**管理侧所在的口**
+  会立刻失联，验证时目标口要选没插线的口（`05-路由器操作脚本/verify-wanport.sh`
+  会用 `brctl showmacs` 查管理侧 MAC 落在哪个口并拒绝切到那里）。
+
+### 7.6 为什么把自动探测砍掉（2026-10-27 真机结论）
+
+第一版是「候选口各发一次 DHCP DISCOVER，谁应答谁当 WAN；`detect` 找不到就保持不动」，
+逻辑自检 13 条全过，但真机上暴露两个问题：
+
+1. **探不到真实上行**。PPPoE、静态地址、对端不开 DHCP 的上行都不会应答，用户看到
+   的就是"插上了但它不认"，反而比手动更容易误判。
+2. **自动切换能把自己关在门外**。当天验证脚本执行 `apply lan2` 时，正好管理侧
+   网线就插在 `lan2` 上：`lan2` 被移出 `br-lan`、`wan.device=lan2`，于是 LAN 侧
+   整个消失；WAN 区 input 是 REJECT，SSH/HTTP 全部被拒，只剩 ping 能通（要确认
+   "盒子还活着"，得自己在对端起一个 DHCP 服务端把租约喂给它，再 `ping`）。恢复只能
+   到现场把网线换到另一个口。而 `detect` 的兜底逻辑帮不上忙：它第一步就是
+   "现用 WAN 在 netifd 眼里是 up 就什么都不做"，第 2 步探测又**跳过现用 WAN 口**，
+   所以哪怕在现用口上放 DHCP 也不会被认成上行，`assume_single_link` 默认还是 0。
+
+结论：这块板子上"哪个口是上行"只能由人来指定。自动那套代码、开机服务、热插拔
+钩子、`udhcpc` 空脚本全部删除，`apply` 变成唯一的动作入口。
 
 未解的疑问（不影响当前实现）：
 

@@ -7,13 +7,22 @@
 'require ui';
 
 /*
- * WAN/LAN adaptive: which wired port is the WAN.
+ * WAN port: which wired port carries the uplink.
  *
  * The vendor calls this "WAN/LAN 自适应" and drives a switch-chip ioctl from
  * cspd (see docs/wanlan-adaptive-逆向记录-2026-10-27.md). This board has four
- * separate GMAC netdevs, so back here the same feature is pure userspace: rebind
- * network.wan.device and move that port out of br-lan. /sbin/e2631-wanport does
- * the work; this page only reads its state and asks it to run.
+ * separate GMAC netdevs, so the same thing is pure userspace: rebind
+ * network.wan.device to the chosen port and take that port out of br-lan.
+ * /sbin/e2631-wanport does the work; this page only reads its state and asks
+ * it to run.
+ *
+ * There is deliberately no automatic mode: the router never decides on its own
+ * which port is the uplink. Two things came out of the hardware run on
+ * 2026-10-27: a DHCP probe cannot see a PPPoE/static uplink at all, and an
+ * automatic switch can move the WAN onto the very port this browser is coming
+ * in on (WAN zone input is REJECT, so the box then answers ping and nothing
+ * else). Default layout = the factory one: WAN on the "wan" port, LAN1..3 in
+ * the bridge.
  */
 
 var callStatus = rpc.declare({
@@ -29,18 +38,6 @@ var callSetPort = rpc.declare({
 	expect: { '': {} }
 });
 
-var callRedetect = rpc.declare({
-	object: 'e2631-wanport',
-	method: 'redetect',
-	expect: { '': {} }
-});
-
-var callReload = rpc.declare({
-	object: 'e2631-wanport',
-	method: 'reload',
-	expect: { '': {} }
-});
-
 /* LuCI's themes style ".label.success" / ".label.warning"; there is no
  * ".label.danger", so "off/down" is a warning, not an error. */
 function badge(text, cls) {
@@ -53,12 +50,6 @@ function linkText(p) {
 	return p.speed && p.speed !== '-'
 		? _('connected, %s Mb/s').format(p.speed)
 		: _('connected');
-}
-
-function modeText(s) {
-	return (s.mode === 'manual')
-		? _('fixed port')
-		: _('automatic (blind plug)');
 }
 
 return view.extend({
@@ -83,13 +74,13 @@ return view.extend({
 		if (!ports.length) {
 			rows.push(E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td', 'colspan': 6 },
-					E('em', _('No candidate ports found: /sbin/e2631-wanport is not installed on this router.')))
+					E('em', _('No ports found: /sbin/e2631-wanport is not installed on this router.')))
 			]));
 		}
 
 		ports.forEach(function(p) {
 			var action = '';
-			if (p.role !== 'wan') {
+			if (p.role !== 'wan' && s.enabled !== '0') {
 				action = E('button', {
 					'class': 'btn cbi-button cbi-button-action',
 					'click': ui.createHandlerFn(self, function() {
@@ -120,20 +111,16 @@ return view.extend({
 		dom.content(node, [
 			E('table', { 'class': 'table' }, rows),
 			E('p', { 'class': 'cbi-section-descr' },
-				_('LAN and WAN are roles here, not hardware. In automatic mode the router DHCP-probes the ports that have a cable and gives the WAN role to the one that is answered; in fixed mode it always uses the chosen port. The WAN MAC stays the same either way, so the lease and the IPv6 identity of this router survive a port change.'))
+				_('LAN and WAN are roles here, not hardware: the WAN port is whichever port the WAN interface is bound to and which is out of the LAN bridge. Nothing is detected or switched automatically — a port becomes the WAN only when you say so. The WAN MAC stays the same across a port change, so the uplink lease and the IPv6 identity of this router survive it.'))
 		]);
 	},
 
 	renderStatus: function(node, s) {
 		var state = [];
 		state.push(E('p', {}, [
-			_('Mode'), ': ', E('strong', {}, modeText(s)),
-			s.mode === 'manual' ? ' — ' + _('port %s').format(s.manual_port) : '',
-			' (', E('em', {}, _('settings: %s').format(s.mode || 'auto')), ')'
-		]));
-		state.push(E('p', {}, [
 			_('WAN'), ': ', E('strong', {}, s.device || '-'), ' — ',
-			s.wan_up ? badge(_('up'), 'success') : badge(_('down'), 'warning')
+			s.wan_up ? badge(_('up'), 'success') : badge(_('down'), 'warning'),
+			'   ', _('configured port'), ': ', E('code', {}, s.manual_port || '-')
 		]));
 		state.push(E('p', {}, [
 			_('WAN MAC'), ': ', E('code', {}, s.wan_mac || '-'), ' ',
@@ -141,7 +128,7 @@ return view.extend({
 			_('members'), ': ', E('code', {}, s.bridge_ports || '-')
 		]));
 		if (s.enabled === '0')
-			state.push(E('p', {}, E('em', _('The service is switched off: nothing happens automatically until it is enabled below.'))));
+			state.push(E('p', {}, E('em', _('Changing the WAN port is switched off (enabled = 0). The current layout stays as it is.'))));
 
 		dom.content(node, state);
 	},
@@ -163,74 +150,44 @@ return view.extend({
 			});
 		}, 5);
 
-		var redetect = E('button', {
-			'class': 'btn cbi-button cbi-button-action',
-			'click': ui.createHandlerFn(this, function() {
-				return callRedetect().then(function(res) {
-					if (res && res.ok)
-						ui.addNotification(null, E('p',
-							_('Detection started: the ports with a cable are probed one by one. The result appears in the table above within a few seconds.')), 'info');
-					else
-						ui.addNotification(null, E('p',
-							_('Detection could not be started: %s').format(res && res.error ? res.error : '?')), 'danger');
-				});
-			})
-		}, _('Detect now'));
-
 		var m = new form.Map('e2631_ports', _('WAN port'),
-			_('Any of the four wired ports can carry the uplink. This is the same feature the factory calls "WAN/LAN adaptive", implemented without touching the switch: a port is a WAN port when the WAN interface is bound to it and it is out of the LAN bridge.'));
+			_('Any of the four wired ports can carry the uplink. This is the same feature the factory calls "WAN/LAN adaptive", implemented without touching the switch: a port is a WAN port when the WAN interface is bound to it and it is out of the LAN bridge. The default is the factory layout — the "wan" port is the WAN, LAN1..3 are the switch.'));
 
 		var s2 = m.section(form.NamedSection, 'global', 'ports');
 		s2.addremove = false;
 		var o;
 
-		o = s2.option(form.Flag, 'enabled', _('Enable'));
+		o = s2.option(form.Flag, 'enabled', _('Allow changing the WAN port'));
 		o.default = '1';
 		o.rmempty = false;
-		o.description = _('Off: the WAN stays where it is, however the cables are plugged.');
+		o.description = _('Off: the router keeps its current layout and the buttons on this page are disabled.');
 
-		o = s2.option(form.ListValue, 'mode', _('Mode'));
-		o.value('auto', _('Automatic (blind plug)'));
-		o.value('manual', _('Fixed port'));
-		o.default = 'auto';
-		o.rmempty = false;
-		o.description = _('Automatic: whichever port has the uplink cable takes the WAN role. Fixed: always the port below (use this for PPPoE or a static address upstream, which cannot be detected).');
-
-		o = s2.option(form.ListValue, 'manual_port', _('Fixed WAN port'));
+		o = s2.option(form.ListValue, 'manual_port', _('WAN port'));
 		(s.ports || []).forEach(function(p) {
 			o.value(p.name, p.label);
 		});
 		o.default = 'wan';
-		o.depends('mode', 'manual');
-		o.description = _('Only used in fixed mode.');
-
-		o = s2.option(form.Value, 'probe_timeout', _('Probe timeout (seconds)'));
-		o.datatype = 'range(1,15)';
-		o.default = '3';
-		o.optional = true;
-		o.description = _('How long each port is given to answer the probe. The worst case of a full scan is this times four.');
-
-		o = s2.option(form.Flag, 'assume_single_link', _('Guess when only one cable is plugged in'));
-		o.default = '0';
-		o.optional = true;
-		o.description = _('Automatic mode only finds an uplink that answers DHCP; PPPoE and static uplinks do not. With this on, a single cable that is not in the current WAN port is taken as the uplink. It also fires when a lone computer is the only thing plugged in, which would then lose its LAN connection — that is why it is off by default.');
+		o.rmempty = false;
+		o.description = _('The port that should carry the uplink. Saving applies it: the port leaves the LAN bridge, the WAN interface is bound to it, and the other three ports join the bridge. The uplink drops for a few seconds while that happens.');
 
 		return m.render().then(function(formNode) {
 			var head = E('div', { 'class': 'cbi-section' }, [
-				E('h3', _('Current state')), statusBox,
-				E('div', { 'class': 'cbi-page-actions', 'style': 'text-align:left' }, redetect)
+				E('h3', _('Current state')), statusBox
 			]);
 			var ports = E('div', { 'class': 'cbi-section' }, [ E('h3', _('Ports')), portsBox ]);
 			return E([ head, ports, formNode ]);
 		});
 	},
 
-	/* The saved settings only take effect when the service runs once more, and
-	 * the page reloads right after an apply, so start it before applying: manual
-	 * mode then binds the chosen port immediately, automatic mode probes again. */
+	/* Saving the form only writes uci; the port move is a service action, so run
+	 * it right after the save and let it report through the status poll. */
 	handleSaveApply: function(ev, mode) {
 		return this.handleSave(ev).then(function() {
-			return callReload();
+			return callStatus();
+		}).then(function(res) {
+			var port = res && res.manual_port ? res.manual_port : null;
+			if (port)
+				return callSetPort(port);
 		}).then(function() {
 			ui.changes.apply(mode == '0');
 		});

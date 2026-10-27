@@ -124,33 +124,38 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
 历史包（v1.0 首个能刷能启、v1.1 加 `e2631-wifi-ap` 并改手动武装回退、v1.2 修 wifi-ap 三个真机问题）
 的注记随 release 保留；v1.3 起手动开射频的旧流程退居后备（`e2631-wifi-on 0` + `e2631-wifi-ap` 仍可用）。
 
-### v1.4：WAN/LAN 自适应（任意有线口当 WAN，待真机验证）
+### v1.4：WAN 口可选（任意有线口当 WAN，手动指定）
 
 原厂叫「WAN/LAN 自适应」/ 盲插。原厂是在 cspd 的 NetAdapt 里探测，再 ioctl 给交换芯片设
 端口角色（逆向记录见 [docs/wanlan-adaptive-逆向记录-2026-10-27.md](docs/wanlan-adaptive-逆向记录-2026-10-27.md)）。
 这里完全不碰芯片：四个口本来就是四个独立 netdev，"谁当 WAN"只等于
 **wan 接口绑在哪个 netdev、那个 netdev 不在 br-lan 里**。
 
+- **默认就是原厂布局**：`wan` 口当 WAN，`lan1/lan2/lan3` 在 `br-lan`。开机不做任何
+  动作，没有开机服务、没有热插拔钩子。
+- **只允许手动指定**：`e2631-wanport apply <lan1|lan2|lan3|wan>`，或者用
+  `网络 → WAN 口` 页面点某一行的「设为 WAN 口」。改完写进 uci，重启后保持。
 - **界面**：`网络 → WAN 口`（包 `luci-app-e2631-wanport`）—— 四个口的角色 / 链路 /
-  所属网桥 / MAC，每行一个「设为 WAN 口」，下面还有模式设置和「立即探测」。
-- **命令行**：`e2631-wanport status | detect | auto | apply <口>`；
-  `DRY_RUN=1 e2631-wanport apply lan2` 只打印要改的 uci，不动配置。
-- **默认 auto（盲插）**：netifd 眼里 WAN 还 up 就一个字节都不动；没 up 才对**其他**口各跑
-  一次 DHCP DISCOVER，谁应答谁当上行。正在当 WAN 的那个口永远不用 DHCP 去探 —— 那个口上
-  有 netifd 自己的 udhcpc，同一个 MAC 上第二个客户端会互相抢租约。
-- **PPPoE / 静态上行**探测不到（对端不应答 DHCP）：用 `mode manual` + `manual_port`，
-  或者打开 `assume_single_link` 让它按「只插了一根线」猜（代价见配置文件里的注释）。
+  所属网桥 / MAC，每行一个「设为 WAN 口」；配置区只有「允许修改 WAN 口」和
+  「WAN 口」两项。
 - **WAN MAC 固定**在 `e2631_ports.global.wan_mac`，取值就是 DTS 给 wan netdev 的地址
   （`macaddr_tag_1e` base+1）。换物理口时上游看到的 MAC 不变，租约、DUID、上游的
-  MAC 绑定都还能续。
-- **逻辑层自检在 PC 上跑**：`sh scripts/selftest-wanport.sh`（13 个场景：探测失败必须复原
-  网桥成员、探测期的 MAC 借用与还原、MANUAL/兜底猜测、DRY_RUN、wan6 的 @wan 别名、
-  rpcd 的 JSON 形状）。
-  把「探测后放回网桥」或「不探现用口」故意改坏，它都会报警。
+  MAC 绑定都还能续。口换走之后脚本会把它自己的 MAC 还原成 LAN 基址（netifd 不做这件事）。
+- **逻辑层自检在 PC 上跑**：`sh scripts/selftest-wanport.sh`（13 个场景：默认布局、手动
+  设口、回到默认、幂等、非法口、总开关、DRY_RUN、MAC 还原、wan6 的 @wan 别名、
+  `status`/`selftest`、功能面（不许再出现 `udhcpc`/`auto`/`detect`/开机服务）、rpcd 的
+  JSON 形状、随镜像发布的配置文件的 uci 语法）。
 
-**未验证**：这套东西还没在真机上跑过 —— 机器现在停在原厂系统上，刷不刷是用户的决定。
-`auto` 的探测时序（换线后多久收敛）、换口后 dnsmasq / IPv6 RA 的表现、与 relayd 组网
-并存的情况，都还需要真机确认。
+**为什么不自动**（2026-10-27 真机结论，详见逆向记录 7.6）：第一版做过「候选口各发一次
+DHCP DISCOVER，谁应答谁当 WAN」，两处硬伤都在真机上撞到了 ——
+一是 PPPoE / 静态地址 / 对端不开 DHCP 的上行根本探不到；
+二是自动切换能把管理侧关在门外：当天 `apply lan2` 时管理侧网线正好插在 `lan2` 上，
+WAN 区 input 是 REJECT，SSH/HTTP 立刻全断、只剩 ping，只能到现场换网线才恢复。
+所以自动那套代码、开机服务、热插拔钩子、`udhcpc` 空脚本全部删除，`apply` 是唯一入口。
+
+**真机状态**：v4 镜像（含本功能）已经通过原厂 `supgrade.html` 写进 slot1 并启动，
+`OpenWrt SNAPSHOT 0e2631` / 内核 `6.18.55`；手动切口、网桥重排、MAC 固化与还原、
+LuCI 页面都在这台机器上验过。
 
 ### 旧状态表（v1.2 口径，留作对照）
 

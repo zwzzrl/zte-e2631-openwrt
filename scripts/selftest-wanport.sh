@@ -1,18 +1,22 @@
 #!/bin/sh
-# e2631-wanport 的逻辑自检：在 PC 上（不是路由器上）跑，用假的 uci / ip /
-# udhcpc / ubus / logger 和一棵假的 /sys，把「探测 → 选口 → 改配置」这条链路走一遍。
+# e2631-wanport 的逻辑自检：在 PC 上（不是路由器上）跑，用假的 uci / ip / ubus /
+# logger 和一棵假的 /sys，把「手动设口 → 改配置 → 网桥重排 → MAC 处理」这条链路
+# 走一遍。
 #
-# 为什么值得写：这段逻辑真正跑起来要么在路由器的启动过程中、要么在换线的瞬间，
-# 那时候出错就是断网，而且路由器上不好复现。这里把可以离线验证的部分（配置读写、
-# 候选口选择、优先级、兜底猜测、MAC 固化、探测期间的网桥/MAC 借用与恢复）钉住；
-# 真机上才能验的部分（PHY 行为、上游 DHCP 应答）不在这里。
+# 为什么值得写：这段逻辑真正跑起来是在换线的瞬间，那时候出错就是断网，而且路由器
+# 上不好复现（2026-10-27 真机上就把管理侧关在门外过一次）。这里把可以离线验证的
+# 部分钉住；真机上才能验的部分（PHY 行为、netifd 的 reload 效果）不在这里。
+#
+# 这个版本刻意**不验任何探测/自动切换**：功能已经砍掉了，脚本里也不该再出现
+# udhcpc、hotplug 钩子、开机服务。
 #
 # 用法：
 #   sh scripts/selftest-wanport.sh      # 退出码 0 = 全部通过
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-SCRIPT="$HERE/../overlay/target/linux/sanechips/base-files/sbin/e2631-wanport"
+BASE="$HERE/../overlay/target/linux/sanechips/base-files"
+SCRIPT="$BASE/sbin/e2631-wanport"
 [ -f "$SCRIPT" ] || { echo "找不到 $SCRIPT" >&2; exit 1; }
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/e2631-wanport-selftest.XXXXXX") || exit 1
@@ -21,9 +25,7 @@ trap 'rm -rf "$TMP"' EXIT INT TERM
 BIN="$TMP/bin"
 SYS="$TMP/sys/class/net"
 DB="$TMP/uci.db"
-mkdir -p "$BIN" "$SYS/lan1" "$SYS/lan2" "$SYS/lan3" "$SYS/wan" "$TMP/lock"
-printf '#!/bin/sh\necho "$1" >>"${E2631_PROBE_FLAG:-/dev/null}"\nexit 0\n' >"$TMP/nop.sh"
-chmod +x "$TMP/nop.sh"
+mkdir -p "$BIN" "$SYS/lan1" "$SYS/lan2" "$SYS/lan3" "$SYS/wan"
 
 # ---- 假的 uci -------------------------------------------------------------
 # 键里带 @ [ ] 这种字符，不能拿 sed/grep 当正则用，统一走 awk 的前缀匹配。
@@ -61,28 +63,23 @@ esac
 exit 0
 EOF
 
-# ---- 假的 ip / udhcpc / ubus / logger -------------------------------------
+# ---- 假的 ip / ubus / logger ----------------------------------------------
 cat >"$BIN/ip" <<'EOF'
 #!/bin/sh
 echo "ip $*" >>"$TMP/ip.log"
-exit 0
-EOF
-# udhcpc：$TMP/answer 里写的那个口才有 DHCP 应答。有应答的口写 bound 之后就一直
-# 挂着（等脚本把它 kill 掉），没应答的口立刻失败退出——两条分支都能覆盖，也不拖时间。
-cat >"$BIN/udhcpc" <<'EOF'
-#!/bin/sh
-port=""
-while [ $# -gt 0 ]; do
-	[ "$1" = "-i" ] && { port=$2; shift; }
-	shift
-done
-echo "probe $port" >>"$TMP/probe.log"
-if [ -f "$TMP/answer" ] && [ "$(cat "$TMP/answer")" = "$port" ]; then
-	[ -n "${E2631_PROBE_FLAG:-}" ] && echo bound >>"$E2631_PROBE_FLAG"
-	# 阻塞在一个没人写的 fifo 上，模拟"客户端还活着"
-	mkfifo "$TMP/hold.$port" 2>/dev/null && exec cat "$TMP/hold.$port"
+# 只模拟「改 MAC」这一种：真机上 netifd 改的是 netdev 地址，脚本里
+# restore_lan_macs 也靠 ip link set 还原，所以 sysfs 里的 address 得跟着动。
+if [ "${1:-}" = "link" ] && [ "${2:-}" = "set" ] && [ "${3:-}" = "dev" ]; then
+	dev=$4; shift 4
+	while [ $# -gt 0 ]; do
+		if [ "$1" = "address" ] && [ -n "${2:-}" ]; then
+			echo "$2" >"${E2631_SYSFS:-$TMP/sys}/class/net/$dev/address" 2>/dev/null
+			shift
+		fi
+		shift
+	done
 fi
-exit 1
+exit 0
 EOF
 # ubus：wan 是否 up 由 $TMP/wanup 决定；其它对象一律"在"。
 cat >"$BIN/ubus" <<'EOF'
@@ -97,13 +94,11 @@ cat >"$BIN/logger" <<'EOF'
 echo "log $*" >>"$TMP/syslog"
 exit 0
 EOF
-chmod +x "$BIN/uci" "$BIN/ip" "$BIN/udhcpc" "$BIN/ubus" "$BIN/logger"
+chmod +x "$BIN/uci" "$BIN/ip" "$BIN/ubus" "$BIN/logger"
 
 export TMP DB
 export PATH="$BIN:$PATH"
 export E2631_SYSFS="$TMP/sys"
-export E2631_LOCKDIR="$TMP/lock/e2631-wanport.lock"
-export E2631_NOPSCRIPT="$TMP/nop.sh"
 
 FAILS=0
 fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
@@ -119,15 +114,6 @@ link() {
 	echo "$2" >"$SYS/$1/carrier"
 	if [ "$2" = "1" ]; then echo up >"$SYS/$1/operstate"; else echo down >"$SYS/$1/operstate"; fi
 }
-bridge() {
-	if [ "$2" = "1" ]; then
-		mkdir -p "$SYS/br-lan"
-		ln -sfn "../../br-lan" "$SYS/$1/master" 2>/dev/null
-	else
-		rm -f "$SYS/$1/master"
-	fi
-}
-answer() { echo "$1" >"$TMP/answer"; }
 wanup() { : >"$TMP/wanup"; }
 wanno() { rm -f "$TMP/wanup"; }
 run() { sh "$SCRIPT" "$@" 2>>"$TMP/syslog"; }
@@ -135,164 +121,158 @@ run() { sh "$SCRIPT" "$@" 2>>"$TMP/syslog"; }
 reset() {
 	: >"$DB"
 	: >"$TMP/ip.log"
-	: >"$TMP/probe.log"
 	: >"$TMP/syslog"
-	rm -f "$TMP/answer" "$TMP/wanup" "$TMP"/hold.*
-	rm -rf "$E2631_LOCKDIR"
+	rm -f "$TMP/wanup"
 	setcfg e2631_ports.global.enabled 1
-	setcfg e2631_ports.global.mode auto
-	setcfg e2631_ports.global.probe_timeout 1
 	setcfg e2631_ports.global.manual_port wan
-	setcfg e2631_ports.global.assume_single_link 0
 	setcfg network.wan.device wan
 	setcfg network.wan6.device wan
-	setcfg e2631_ports.global.candidates "lan1 lan2 lan3 wan"
 	setcfg network.@device[0].name br-lan
 	deletelist network.@device[0].ports
 	for p in lan1 lan2 lan3 wan; do
 		addlist network.@device[0].ports "$p"
 		newmac "$p" "00:11:22:33:44:0${p#lan}"
 		link "$p" 0
-		bridge "$p" 1
+		mkdir -p "$SYS/br-lan"
+		ln -sfn "../../br-lan" "$SYS/$p/master" 2>/dev/null
 	done
 	rm -f "$SYS/wan/master"
+	# br-lan 的地址 = 板子的 LAN 基址；真机上 LAN 口默认都是它，WAN 口是 +1。
+	newmac br-lan "00:11:22:33:44:00"
 }
 
 # ---- 场景 ----------------------------------------------------------------
 
-echo "== 1. netifd 说 WAN 还是 up：不探测、不动配置 =="
+echo "== 1. 默认布局：什么都不做时就是原厂的口序 =="
 reset
-wanup
-link wan 1
-# 故意让另一个口也插着线并且能拿到租约：只有真的按「WAN 已 up 就别动」处理，
-# 才不会去抢它。
-link lan2 1
-answer lan2
-out=$(run detect)
-[ "$out" = "wan" ] || fail "detect 应为 wan，实际 '$out'"
-[ -s "$TMP/probe.log" ] && fail "WAN 已经 up 却还去探测了：$(tr '\n' ' ' <"$TMP/probe.log")"
-run auto >/dev/null
-[ "$(getdb network.wan.device)" = "wan" ] || fail "wan.device 被改成了 $(getdb network.wan.device)"
-[ "$(getdb 'network.@device[0].ports')" = "lan1 lan2 lan3 wan" ] || fail "网桥成员变了"
-pass "现用上行口保持，不抢 netifd 的 DHCP 客户端"
+[ "$(getdb network.wan.device)" = "wan" ] || fail "初始 wan.device 不是 wan"
+[ "$(getdb 'network.@device[0].ports')" = "lan1 lan2 lan3 wan" ] || fail "初始 br-lan 不完整"
+pass "镜像默认 = wan 当 WAN、lan1..3 在网桥"
 
-echo "== 2. WAN 没起来，上行在 lan2：改绑 lan2，网桥只剩 lan1 lan3 wan =="
+echo "== 2. apply lan2：改绑 + 网桥重排 + MAC 固化 =="
 reset
-wanno
-link lan2 1
-link wan 0
-answer lan2
-out=$(run detect)
-[ "$out" = "lan2" ] || fail "detect 应为 lan2，实际 '$out'"
-run auto >/dev/null
+WM=$(cat "$SYS/wan/address")
+run apply lan2 >/dev/null
 [ "$(getdb network.wan.device)" = "lan2" ] || fail "wan.device 应为 lan2，实际 $(getdb network.wan.device)"
 [ "$(getdb 'network.@device[0].ports')" = "lan1 lan3 wan" ] || fail "网桥应为 'lan1 lan3 wan'，实际 '$(getdb 'network.@device[0].ports')'"
-[ "$(getdb network.wan.macaddr)" = "$(cat "$SYS/wan/address")" ] || fail "WAN MAC 没有固化成原 wan 口的地址"
-[ "$(getdb e2631_ports.global.wan_mac)" = "$(cat "$SYS/wan/address")" ] || fail "配置里没有记住 wan_mac"
-pass "自动选口 + 网桥重排 + MAC 固化"
+[ "$(getdb network.wan.macaddr)" = "$WM" ] || fail "WAN MAC 没有固化成原 wan 口的地址 ($WM)"
+[ "$(getdb e2631_ports.global.wan_mac)" = "$WM" ] || fail "配置里没有记住 wan_mac"
+[ "$(getdb e2631_ports.global.manual_port)" = "lan2" ] || fail "manual_port 没跟着更新"
+pass "手动设口 + 网桥重排 + MAC 固化"
 
-echo "== 3. netifd 认为 WAN 没起来，但现用口其实是通的：不许再去探它 =="
-# 这条是为了钉住「同一个口上不能同时有两个 DHCP 客户端」。哪怕现用口真能拿到租约，
-# 也不该由我们插手——那是 netifd 的事；我们只找别的口。
+echo "== 3. apply wan：回到默认布局 =="
 reset
-wanno
-link wan 1
-link lan1 1
-answer wan
-out=$(run detect)
-[ -z "$out" ] || fail "现用口不应被探测，detect 应为空，实际 '$out'"
-grep -q "probe wan" "$TMP/probe.log" && fail "不该用 DHCP 去探现用 WAN 口"
-pass "只探测其他口"
+run apply lan2 >/dev/null
+run apply wan >/dev/null
+[ "$(getdb network.wan.device)" = "wan" ] || fail "wan.device 没回到 wan"
+[ "$(getdb 'network.@device[0].ports')" = "lan1 lan2 lan3" ] || fail "网桥没回到 lan1 lan2 lan3，实际 '$(getdb 'network.@device[0].ports')'"
+pass "切回 wan 后就是原厂布局"
 
-echo "== 4. 谁都没应答：不动作，且被探测的口要回到网桥 =="
+echo "== 4. 重复 apply 同一个口：幂等 =="
 reset
-wanno
-link lan1 1
-link lan3 1
-run auto >/dev/null
-[ "$(getdb network.wan.device)" = "wan" ] || fail "没有应答却改了 wan.device"
-[ "$(getdb 'network.@device[0].ports')" = "lan1 lan2 lan3 wan" ] || fail "没有应答却改了网桥"
-grep -q "ip link set dev lan1 nomaster" "$TMP/ip.log" || fail "探测前没有把 lan1 摘下来"
-grep -q "ip link set dev lan1 master br-lan" "$TMP/ip.log" || fail "探测后没有把 lan1 放回 br-lan"
-pass "探测失败保持现状 + 网桥成员复原"
+run apply lan3 >/dev/null
+P1=$(getdb 'network.@device[0].ports')
+run apply lan3 >/dev/null
+P2=$(getdb 'network.@device[0].ports')
+[ "$P1" = "$P2" ] || fail "重复 apply 改了网桥：'$P1' -> '$P2'"
+[ "$(getdb network.wan.device)" = "lan3" ] || fail "重复 apply 后 wan.device 不是 lan3"
+grep -c "uci add_list" "$TMP/ip.log" >/dev/null 2>&1  # 只是别让 shellcheck 抱怨
+pass "同一个口连按两次不出问题"
 
-echo "== 5. manual 模式：固定绑 manual_port =="
+echo "== 5. 非法/空口名：拒绝，且不改配置 =="
 reset
-setcfg e2631_ports.global.mode manual
-setcfg e2631_ports.global.manual_port lan3
-link lan3 1
-run auto >/dev/null
-[ "$(getdb network.wan.device)" = "lan3" ] || fail "manual 模式应绑 lan3，实际 $(getdb network.wan.device)"
-[ "$(getdb 'network.@device[0].ports')" = "lan1 lan2 wan" ] || fail "网桥应为 'lan1 lan2 wan'，实际 '$(getdb 'network.@device[0].ports')'"
-pass "手动模式"
+run apply lan9 >/dev/null 2>&1 && fail "apply lan9 竟然返回 0"
+[ "$(getdb network.wan.device)" = "wan" ] || fail "被拒绝的 apply 改了 wan.device"
+run apply "" >/dev/null 2>&1 && fail "apply 空参数竟然返回 0"
+[ "$(getdb 'network.@device[0].ports')" = "lan1 lan2 lan3 wan" ] || fail "被拒绝的 apply 改了网桥"
+pass "只认 lan1/lan2/lan3/wan"
 
-echo "== 6. assume_single_link=1、只有一根线、无 DHCP 应答（PPPoE/静态场景）=="
+echo "== 6. enabled=0：整体拒绝 =="
 reset
-wanno
-setcfg e2631_ports.global.assume_single_link 1
-link lan1 1
-out=$(run detect)
-[ "$out" = "lan1" ] || fail "单线兜底应选 lan1，实际 '$out'"
-pass "单线兜底"
-
-echo "== 7. assume_single_link=1 但有两根线：不猜 =="
-reset
-wanno
-setcfg e2631_ports.global.assume_single_link 1
-link lan1 1
-link lan2 1
-out=$(run detect)
-[ -z "$out" ] || fail "两根线时不该猜，实际 '$out'"
-pass "多线不猜"
-
-echo "== 8. enabled=0：完全不动作 =="
-reset
-wanno
 setcfg e2631_ports.global.enabled 0
-link lan2 1
-answer lan2
-run auto >/dev/null
-[ "$(getdb network.wan.device)" = "wan" ] || fail "禁用状态下仍然改了配置"
+run apply lan2 >/dev/null 2>&1 && fail "enabled=0 时 apply 仍然成功"
+[ "$(getdb network.wan.device)" = "wan" ] || fail "enabled=0 时配置被改了"
 pass "总开关生效"
 
-echo "== 9. DRY_RUN=1：只打印 uci 命令，不改配置 =="
+echo "== 7. DRY_RUN=1：只打印 uci 命令，不改配置 =="
 reset
-out=$(DRY_RUN=1 sh "$SCRIPT" apply lan2 2>/dev/null)
-echo "$out" | grep -q "uci set network.wan.device=lan2" || fail "DRY_RUN 没打印设置 wan.device"
-echo "$out" | grep -q "uci add_list network.@device\[0\].ports=lan1" || fail "DRY_RUN 没打印桥成员"
-[ "$(getdb network.wan.device)" = "wan" ] || fail "DRY_RUN 竟然真的改了配置"
+out=$(DRY_RUN=1 run apply lan2)
+echo "$out" | grep -q "uci set network.wan.device=lan2" || fail "dry-run 没打印改绑命令：$out"
+echo "$out" | grep -q "uci add_list network.@device\[0\].ports=wan" || fail "dry-run 没打印网桥重排：$out"
+[ "$(getdb network.wan.device)" = "wan" ] || fail "dry-run 竟然改了配置"
 pass "dry-run 不改配置"
 
-echo "== 10. 探测期间借用 WAN 的 MAC，结束后还原 =="
+echo "== 8. 当过 WAN 的口回到网桥时，MAC 还原成 LAN 基址 =="
 reset
-wanno
-link lan2 1
-answer lan2
-: >"$TMP/ip.log"
-run detect >/dev/null
-grep -q "ip link set dev lan2 address $(cat "$SYS/wan/address")" "$TMP/ip.log" \
-	|| fail "探测时没有临时换成 WAN 的 MAC"
-grep -q "ip link set dev lan2 address $(cat "$SYS/lan2/address")" "$TMP/ip.log" \
-	|| fail "探测后没有把 MAC 还回去"
-pass "MAC 借用/恢复"
+WM=$(cat "$SYS/wan/address")
+LANM=$(cat "$SYS/br-lan/address")
+run apply lan2 >/dev/null
+newmac lan2 "$WM"                      # 模拟 netifd 把 WAN 地址写到新口
+[ "$(cat "$SYS/wan/address")" = "$LANM" ] || fail "旧 wan 口没恢复成 LAN 基址：$(cat "$SYS/wan/address")"
+run apply wan >/dev/null
+[ "$(cat "$SYS/lan2/address")" = "$LANM" ] || fail "lan2 还留着 WAN 的 MAC：$(cat "$SYS/lan2/address")"
+[ "$(getdb network.wan.macaddr)" = "$WM" ] || fail "正在当 WAN 的口 MAC 不是固化值"
+pass "换走的口恢复 LAN 基址、WAN 口保持固化 MAC"
 
-echo "== 11. LuCI 的 rpcd 后端：JSON 必须是对的 =="
-# 页面拿到的就是这个 JSON，字段写错在设备上只会表现成"页面空白"，
-# 所以在这里用 python 解一遍，顺带核对几个关键字段。
+echo "== 9. wan6 绑 @wan 别名时一个字都不改 =="
+reset
+setcfg network.wan6.device "@wan"
+run apply lan3 >/dev/null
+[ "$(getdb network.wan6.device)" = "@wan" ] || fail "wan6 的 @wan 别名被改成了 $(getdb network.wan6.device)"
+[ "$(getdb network.wan.device)" = "lan3" ] || fail "wan 没换到 lan3"
+# 显式绑设备时必须跟着换
+reset
+run apply lan1 >/dev/null
+[ "$(getdb network.wan6.device)" = "lan1" ] || fail "显式绑的 wan6 没跟上：$(getdb network.wan6.device)"
+pass "wan6：别名不动、显式设备跟随"
+
+echo "== 10. status / selftest 能跑通，且不再有自动相关字段 =="
+reset
+wanup
+out=$(run status)
+echo "$out" | grep -q "wan device" || fail "status 缺 wan device 行"
+echo "$out" | grep -q "mode" && fail "status 里还留着 mode"
+run selftest >/dev/null 2>&1 || fail "selftest 退出码非 0"
+pass "status / selftest"
+
+echo "== 11. 功能面：脚本里不该再有探测/自动/开机服务 =="
+for bad in udhcpc "e2631-wanport auto" autostart detect probe_port assume_single; do
+	if grep -q "$bad" "$SCRIPT"; then
+		fail "脚本里还留着 '$bad'"
+	fi
+done
+[ -f "$BASE/etc/init.d/e2631-wanport" ] && fail "开机自启服务还在"
+[ -f "$BASE/etc/hotplug.d/iface/21-e2631-wanport" ] && fail "hotplug 钩子还在"
+[ -f "$BASE/usr/share/e2631-wanport/nop.script" ] && fail "udhcpc 空脚本还在"
+pass "只剩手动路径"
+
+echo "== 12. rpcd 后端：JSON 必须是对的，且只有 status/set_port =="
 RPCD="$HERE/../overlay/package/luci/luci-app-e2631-wanport/root/usr/libexec/rpcd/e2631-wanport"
 if [ -f "$RPCD" ] && command -v python3 >/dev/null 2>&1; then
+	# 用一个只记录参数的假服务，避免自检期间真的去 reload network
+	cat >"$BIN/fake-wp" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$TMP/wp.log"
+exit 0
+EOF
+	chmod +x "$BIN/fake-wp"
 	reset
-	wanup
-	setcfg e2631_ports.global.wan_mac "00:11:22:33:44:55"
-	out=$(E2631_WANPORT="$SCRIPT" sh "$RPCD" call status 2>>"$TMP/syslog")
+	out=$(E2631_WANPORT="$BIN/fake-wp" sh "$RPCD" list)
+	echo "$out" | grep -q '"status"' || fail "list 里没有 status：$out"
+	echo "$out" | grep -q '"set_port"' || fail "list 里没有 set_port：$out"
+	echo "$out" | grep -q 'redetect\|reload' && fail "list 里还留着 redetect/reload：$out"
+
+	out=$(E2631_WANPORT="$BIN/fake-wp" E2631_SYSFS="$TMP/sys" sh "$RPCD" call status)
 	echo "$out" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 assert d["installed"] is True, d
+assert d["manual_port"] == "wan", d
 assert d["device"] == "wan", d
-assert d["wan_up"] is True, d
 assert d["bridge"] == "br-lan", d
-assert d["wan_mac"] == "00:11:22:33:44:55", d
+assert d["bridge_ports"] == "lan1 lan2 lan3 wan", d
+assert "mode" not in d, d
+assert "probe_timeout" not in d, d
 assert len(d["ports"]) == 4, d
 names = [ p["name"] for p in d["ports"] ]
 assert names == [ "lan1", "lan2", "lan3", "wan" ], names
@@ -303,37 +283,41 @@ assert labels["lan1"] == "LAN1" and labels["wan"] == "WAN", labels
 ' 2>>"$TMP/syslog" || fail "status 返回的不是预期 JSON：$out"
 
 	# 未知端口必须被拒，而且不能把服务拉起来
-	out=$(E2631_WANPORT="$SCRIPT" sh "$RPCD" call set_port <<'JSON' 2>>"$TMP/syslog"
+	out=$(E2631_WANPORT="$BIN/fake-wp" sh "$RPCD" call set_port <<'JSON' 2>>"$TMP/syslog"
 {"port":"lan9"}
 JSON
 )
 	echo "$out" | grep -q '"ok":false' || fail "未知端口没有被拒绝：$out"
-	out=$(E2631_WANPORT="$SCRIPT" sh "$RPCD" list)
-	echo "$out" | grep -q '"set_port"' || fail "list 里没有 set_port：$out"
+	: >"$TMP/wp.log"
+	out=$(E2631_WANPORT="$BIN/fake-wp" sh "$RPCD" call set_port <<'JSON' 2>>"$TMP/syslog"
+{"port":"lan2"}
+JSON
+)
+	echo "$out" | grep -q '"ok":true' || fail "合法端口没被接受：$out"
+	grep -q "apply lan2" "$TMP/wp.log" || fail "没有把 apply lan2 交给服务：$(cat "$TMP/wp.log" 2>/dev/null)"
 	pass "rpcd 后端的 JSON 与参数校验"
 else
 	echo "skip: 没有 $RPCD 或 python3"
 fi
 
-echo "== 12. wan6 跟着走，但别把 @wan 别名写成设备名 =="
-# 显式绑设备时 wan6 必须跟着换；绑 @wan 时整条都不能碰——写成设备名等于把别名
-# 换成固定 device，之后 IPv6 就静默哑掉。
-reset
-run apply lan2 >/dev/null
-[ "$(getdb network.wan6.device)" = "lan2" ] || fail "显式绑设备的 wan6 没跟上：$(getdb network.wan6.device)"
-reset
-setcfg network.wan6.device "@wan"
-run apply lan3 >/dev/null
-[ "$(getdb network.wan6.device)" = "@wan" ] || fail "wan6 的 @wan 别名被改成了 $(getdb network.wan6.device)"
-[ "$(getdb network.wan.device)" = "lan3" ] || fail "wan 没换到 lan3：$(getdb network.wan.device)"
-pass "wan6 显式设备跟随、@wan 别名不动"
-
-echo "== 13. status / selftest 能跑通 =="
-reset
-wanup
-run status >/dev/null 2>&1 || fail "status 退出码非 0"
-run selftest >/dev/null 2>&1 || fail "selftest 退出码非 0"
-pass "status / selftest"
+echo "== 13. 随镜像发布的 /etc/config/e2631_ports 必须是真 uci 能读的 =="
+# 假 uci 不解析文本，所以这一条单独对着仓库里的真配置文件做静态检查。
+# v4 首刷就是栽在这儿：`list candidates 'lan1' 'lan2' 'lan3' 'wan'` —— uci 的
+# list 一行只收一个值，整份文件解析失败，所有 option 都读不出来（真机上
+# `uci: Parse error (too many arguments) at line 33, byte 31`）。
+SHIPPED="$BASE/etc/config/e2631_ports"
+if [ -f "$SHIPPED" ]; then
+	MULTI=$(grep -nE "^[[:space:]]*list[[:space:]]+[^[:space:]]+[[:space:]]+'[^']*'[[:space:]]+'" "$SHIPPED")
+	[ -z "$MULTI" ] || fail "uci list 一行只能一个值：$MULTI"
+	grep -qE "^[[:space:]]*option[[:space:]]+enabled[[:space:]]+'1'" "$SHIPPED" || fail "enabled 默认值不是 1"
+	grep -qE "^[[:space:]]*option[[:space:]]+manual_port[[:space:]]+'wan'" "$SHIPPED" || fail "manual_port 默认值不是 wan"
+	for bad in mode probe_timeout assume_single_link candidates; do
+		grep -qE "^[[:space:]]*option[[:space:]]+$bad" "$SHIPPED" && fail "配置里还留着 $bad"
+	done
+	pass "shipped e2631_ports 只剩 enabled/manual_port/wan_mac"
+else
+	echo "skip: 找不到 $SHIPPED"
+fi
 
 echo
 if [ "$FAILS" -eq 0 ]; then

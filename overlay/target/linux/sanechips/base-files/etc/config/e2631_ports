@@ -1,33 +1,31 @@
-# WAN/LAN 口自适应（原厂叫「WAN/LAN 自适应」，见
-# docs/wanlan-adaptive-逆向记录-2026-10-27.md）
+# WAN 口选择（把任意有线口当 WAN），手动版。
 #
-# 这块板子的四个物理口是四个独立的 netdev（lan1 lan2 lan3 wan），谁当 WAN
-# 只需要把 wan 接口绑到哪个 netdev 上，不需要动交换芯片。所以这里只放策略：
+# 这块板子的四个物理口是四个独立 netdev（lan1 lan2 lan3 wan），谁当 WAN 只需要
+# 把 wan 接口绑到哪个 netdev 上，不涉及交换芯片。默认布局就是镜像自带的原厂布局：
 #
-#   mode auto    盲插：谁插了上行线、探测到 DHCP 应答，谁就当 WAN（默认）
-#   mode manual  手动：固定用 manual_port 指定的那个口
+#   wan             = WAN 口（唯一上联）
+#   lan1 lan2 lan3  = br-lan（局域网交换机）
 #
-# 探测方式与限界：只在候选口上作一次 DHCP DISCOVER（原厂 cspd 的
-# NetAdaptStartEthProbe 也是先探测再定角色）。所以「上行为 PPPoE / 静态地址、
-# 对端不应答 DHCP」的场景探测不到——那种情况用 manual 模式，或者打开
-# assume_single_link 让它按「只插了一根线」来猜。
+# 想换口只有一条路——显式指定，没有任何自动探测/自动切换：
+#
+#   uci set e2631_ports.global.manual_port='lan1'
+#   e2631-wanport apply lan1
+#
+# 或者用 LuCI 的「网络 → WAN 口」页面点一下。改完写进 uci，重启后保持。
+#
+# 为什么不自动：v1.4 第一版做过「候选口各发一次 DHCP DISCOVER，谁应答谁当 WAN」，
+# 真机上已经拔掉了。一是 PPPoE/静态上行/对端不开 DHCP 的场景根本探不到；二是自动
+# 切换本身能把管理侧关在门外（2026-10-27 实测：管理网线所在口被切成 WAN，WAN 区
+# input=REJECT，SSH/HTTP 全断，只能到现场换线）。详见
+# docs/wanlan-adaptive-逆向记录-2026-10-27.md 第 7 节。
 
 config ports 'global'
+	# 0 = 允许的口里禁止改动（apply 直接拒绝），1 = 允许手动改
 	option enabled '1'
 
-	# auto：盲插自动识别；manual：固定 manual_port
-	option mode 'auto'
-
-	# manual 模式下用哪个口当 WAN（lan1/lan2/lan3/wan 之一）
+	# 当前 WAN 口：lan1 / lan2 / lan3 / wan 之一，默认原厂布局的 wan
 	option manual_port 'wan'
 
-	# 每个候选口的探测超时（秒）。4 个口全探测最坏情况 4×这个值
-	option probe_timeout '3'
-
-	# 1 = 探测全失败时，如果只有一根网线插着且不是原来的 WAN 口，就认它当 WAN。
-	# 这是给 PPPoE / 静态上行用的兜底猜测，默认关：开了以后「WAN 没插线、只在
-	# LAN 口插了一台电脑」会被误判成上行。
-	option assume_single_link '0'
-
-	# 参与自适应的物理口（面板从左到右的正反关系见 DTS label）
-	list candidates 'lan1' 'lan2' 'lan3' 'wan'
+	# WAN 侧 MAC 固化值。第一次 apply 时写入，之后换口一直沿用：上游的 DHCP
+	# 租约、MAC 绑定、IPv6 DUID 都认这个地址。留空表示"用 wan 口自己的地址"。
+	option wan_mac ''
