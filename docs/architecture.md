@@ -137,6 +137,40 @@ What crosses the boundary, and what deliberately does not:
   driver list the core fills is the truth, because a counter cannot survive a ruleset
   reload (bind new, then unbind old) or an unload (see PPE-BIND-ACCOUNTING).
 
+## Traps, and the one thing that made IPv6 offload impossible
+
+The switch sends a frame to the CPU when a trap matches it, and a trapped frame is
+*diverted*: it never reaches the classifier, so it can never be offloaded. That is not
+obvious from either side - the flowtable hands the driver a flow, the driver programs a
+correct hash entry, and nothing ever hits it. Measured by trapping IPv4 the same way the
+IPv6 trap used to be: 167,000 forwarded packets, every one of them through the CPU, with
+the identical flow offloading (18 packets) as soon as the trap is lifted. `BUILD.md` §10
+has the recipe.
+
+So `zx_update_traps()` lifts the IPv6 ethertype trap only when the engine reports that its
+IPv6 tables are in the hardware (`zx_ppe_set_v6_offload()`, called by the module after the
+table writes returned 0). With no tables an un-trapped IPv6 frame would have nowhere to
+go - our MACs live in the ONU "routed" table once offload is active, not in the trap
+table - and that is exactly the stall of v1.4 (`docs/known-issues.md`, PPE-IPV6-TCP).
+
+`PPE-IPV6-TCP` has a second trap for the reader, and the first version of this paragraph
+got it backwards: extract index **10**, the one the stock firmware uses, is the only index
+that makes the classifier look at an IPv6 frame at all. The old sweep - "did the CPU stop
+seeing the packets" - read index 10 as dead because every packet went through the CPU
+there, while the other indices looked good because the frames were being dropped
+unnoticed. With a far end that counts what arrives, index 10 forwards 2,800 of 2,800
+packets and index 11 forwards none. The driver uses 10.
+
+That leaves the third finding, which is why this section is not called "the fix": with the
+trap lifted and the extract in place, the classifier hands IPv6 to the CPU, the driver
+writes the hash entry, and the hardware still never matches it - not with the entry in all
+384 slots at once, not with any window offset type, not with a key of 7 to 19 halfwords.
+The 45-byte IPv6 key this driver builds is not the hardware's key; the vendor computes it
+in software from per-family descriptors (`tm_acl_fast_add_v4v6()` in tm.ko), and until
+that is reproduced IPv6 stays on the CPU path. It works there - that is the shipped
+configuration (`ipv6=0`, trap on) and the measured one (`ipv6=1` forwards just as well,
+only without a fast path).
+
 ## Wi-Fi, and why it is off by default
 
 The MT7916 is a PCIe card at `0000:01:00.0` (`14c3:7906`) whose second function

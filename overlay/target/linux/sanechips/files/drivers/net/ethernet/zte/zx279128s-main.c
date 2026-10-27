@@ -485,23 +485,45 @@ EXPORT_SYMBOL_GPL(zx_set_trap_dmac);
  * sees connections open and close.  Frames for the router, broadcast,
  * multicast and unknown unicast still reach the CPU through the other traps.
  *
- * The IPv6 ethertype trap stays on in every state: the classifier has no
- * IPv6 rule it can trust (see zx_ppe_ipv6), and once offload is active the
- * ports' MACs live in the ONU "routed" table instead of the trap table, so
- * an un-trapped IPv6 frame would have no way back to the stack -- that is
- * exactly how IPv6 TCP used to stall once the flowtable was handed to the
- * PPE.  IPv6 therefore keeps the CPU path (it is still switched in
- * hardware); only IPv4 is offloaded.
+ * The IPv6 ethertype trap stays on unless the engine says its IPv6 tables are
+ * in the hardware: with no IPv6 rule the classifier cannot classify an
+ * IPv6 frame, and once offload is active the ports' MACs live in the ONU
+ * "routed" table instead of the trap table, so an un-trapped IPv6 frame would
+ * have no way back to the stack -- that is exactly how IPv6 TCP used to stall
+ * once the flowtable was handed to the PPE.  With the tables programmed the
+ * trap is lifted like the IPv4 one, because a trapped ethertype never reaches
+ * the classifier at all; measured on hardware, IPv6 frames then still reach
+ * the stack and IPv6 forwarding stays correct (2,800 of 2,800 packets per
+ * burst at both settings).  What it does not do is make IPv6 faster: the
+ * classifier does not match the IPv6 hash entries this driver writes yet, so
+ * the datapath stays on the CPU either way -- see PPE-IPV6-TCP in
+ * docs/known-issues.md.  Lifting the trap is still the prerequisite for a
+ * fast path, which is why the switch is the engine's to flip.
  */
+static bool zx_ppe_v6_offload;
+static DEFINE_SPINLOCK(zx_ppe_v6_offload_lock);
+
+void zx_ppe_set_v6_offload(bool on)
+{
+	spin_lock(&zx_ppe_v6_offload_lock);
+	zx_ppe_v6_offload = on;
+	spin_unlock(&zx_ppe_v6_offload_lock);
+}
+EXPORT_SYMBOL_GPL(zx_ppe_set_v6_offload);
+
 void zx_update_traps(struct zx_eth_adapter *adapter)
 {
 	void __iomem *base = adapter->base;
-	bool fwd;
+	bool fwd, v6;
 	u32 val;
+
+	spin_lock(&zx_ppe_v6_offload_lock);
+	v6 = zx_ppe_v6_offload;
+	spin_unlock(&zx_ppe_v6_offload_lock);
 
 	spin_lock(&adapter->trap_lock);
 	fwd = READ_ONCE(adapter->ppe_active) || READ_ONCE(adapter->sw_members);
-	writel((fwd ? 0 : ETH_P_IP << 16) | ETH_P_IPV6,
+	writel((fwd ? 0 : ETH_P_IP << 16) | (v6 ? 0 : ETH_P_IPV6),
 	       base + ZX_SPA_TRAP_ETH_TYPE);
 	val = readl(base + ZX_SPA_UP_REG_PKT_EN + 8);
 	if (fwd)

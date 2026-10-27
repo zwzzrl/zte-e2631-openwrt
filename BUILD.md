@@ -248,14 +248,19 @@ worked on. It is therefore package `overlay/package/kernel/kmod-e2631-ppe` inste
 third object of the built-in driver, and a change there is:
 
     make package/kernel/kmod-e2631-ppe/compile     # seconds, not minutes
-    scp build_dir/*/linux-*/kmod-e2631-ppe/zx279128s-ppe.ko root@192.168.1.1:/tmp/
-    ssh root@192.168.1.1 'modprobe -r zx279128s_ppe; \
-        insmod /tmp/zx279128s-ppe.ko; /etc/init.d/firewall restart'
+    scp -O build_dir/*/linux-*/kmod-e2631-ppe/zx279128s-ppe.ko root@192.168.1.1:/tmp/
+    ssh root@192.168.1.1 'rmmod zx279128s_ppe; insmod /tmp/zx279128s-ppe.ko'
 
-The `firewall restart` is not cosmetic: binding the nft flowtable happens through
-`ndo_setup_tc` at firewall start, and a bind that arrives with no engine registered is
-refused and never retried. `docs/architecture.md` describes what may and may not cross the
-boundary, and why the `flow_block` callbacks have to stay on the built-in side.
+(Use `rmmod`, not `modprobe -r`: busybox modprobe has no `-r`.  Use `scp -O`: this
+dropbear has no sftp-server.)  No firewall restart is needed: module init attaches to the
+flowtable that is already bound, so the tables come back and the first flow re-offloads
+within a second.  `bash 04-构建环境与脚本/ppe-kmod-inner.sh` inside the builder container
+does the compile half of this.
+
+A bind that arrives while no engine is registered is still refused and never retried
+(`ndo_setup_tc` runs at firewall start); that is why the module's init has to re-attach,
+and why `docs/architecture.md` keeps the `flow_block` callbacks on the built-in side - TC
+holds those pointers across an unload.
 
 Two things that will otherwise cost you a wasted build:
 
@@ -276,3 +281,63 @@ image/*.mk`); `image/Makefile.e2631` is neither, so adding a package there leave
 `kmod-mt7916-firmware` has an explicit line there). Confirm with `grep
 CONFIG_PACKAGE_kmod-e2631-ppe .config`, never with the image Makefile.
 
+
+## 10. Measuring the packet processor without a second host
+
+Proving that a flow is forwarded by the switch and not by the CPU needs (a) a flow the
+flowtable will offload and (b) a hardware-side signal. Both are cheaper than they look.
+
+**(a) One UDP packet already creates an offloadable flow.** `nft_flow_offload_eval()`
+requires an established TCP connection (it looks for FIN/RST and calls
+`nf_conntrack_tcp_established()`), but for UDP it only requires the conntrack entry to be
+confirmed, so a single `sendto()` that the router forwards makes fw4 add the flow, and the
+driver program a hash entry. No peer has to be listening, and no second host is needed
+beyond the far end of the route.
+
+**(b) A hardware-forwarded packet never touches the CPU DMA rings.** Read
+`tx_submitted` from `/sys/kernel/debug/92000000.ethernet/dma_state` before and after a
+burst: an offloaded flow leaves it flat (about 20 packets of setup), a software path adds
+one per packet. That is a finer signal than throughput, and it also says *which* family
+was offloaded, because the same file carries `ppe_flows` and the module can log per-entry
+hits (`insmod ... debug=1` prints every offloaded flow and the first hardware hit of each
+hash entry).
+
+**(c) A flat CPU counter does not prove the hardware forwarded anything.** A dropped frame
+also keeps the CPU out, and that ambiguity produced a wrong "IPv6 offload works" reading.
+Make the far end something that counts: `ip -6 route add fd88::/64 via <sender> dev br-lan`
+on the router, `ip -6 route replace fd88::/64 via <router> dev ens34` on the sender, and the
+frames come back to the sender's own NIC, where a 30-line AF_PACKET script counts them
+(.scratch/ppe-v6/cnt.py, non-zero = forwarded, 0 = dropped; the whole bench
+harness that drove these runs is next to it). A negative result then
+means something.
+
+Three traps cost a day each before they were found, both worth remembering:
+
+* **A trapped ethertype never reaches the classifier.** With the IPv4 trap set and
+  offload otherwise unchanged, a forwarded IPv4 flow stops offloading entirely (167,000
+  packets, all through the CPU); with it clear, the same flow offloads (18 packets). So a
+  family whose trap is on can never be offloaded, no matter how right its tables are. The
+  driver therefore lifts the IPv6 trap only when the engine has its IPv6 tables in the
+  hardware (`zx_ppe_set_v6_offload()`). The trap register is also writable at runtime
+  (`echo 0 > /sys/module/zx279128s_ppe/parameters/trap_override`), which is what lets a
+  flow be created first and then tested with the trap out of the way.
+* **Extract index 10 is the only one that works, and reading the sweep backwards hid it.**
+  The sweep asked "did the CPU stop seeing the packets", so index 10 looked dead (every
+  packet went through the CPU there) while 11 looked good (the packets were being dropped
+  without ever being looked at). With a far end that counts (b/c above) the same test says
+  the opposite: index 10 forwards 2,800 of 2,800, index 11 forwards 0 of 2,800 and shows
+  20 packets of CPU. The driver now uses 10, the stock firmware's choice.
+* **The IPv6 hash entry is never matched** - not even with the same entry written into all
+  384 slots (`v6_shotgun=1`), with every window offset type 0..7, with key lengths 7..19
+  halfwords, or with the index/rule byte swapped. The key layout the driver computes is
+  simply not the hardware's; the vendor builds it in software (tm.ko
+  `tm_acl_fast_add_v4v6()` + `tm_acl_get_fastHashRule()`) from per-family descriptors, so
+  the fix is to reproduce that, see docs/known-issues.md PPE-IPV6-TCP.
+
+The knobs that made those experiments possible are module parameters, so a wrong guess
+costs a reload rather than a kernel rebuild: `ipv6`, `debug`, `trap_override` (raw value
+for the ethertype trap register, `-1` = driver decides; writable while loaded),
+`v6_ext`, `v6_entry`, `v6_rule`, `v6_key`, `v6_idxw4`, `v6_hashlen`, `v6_type`, `v6_hwn`
+(halfwords of the key, `-1` = all 19) and `v6_shotgun`/`v6_shot_lo`/`v6_shot_hi` (write an
+IPv6 flow into a range of hash slots to separate "wrong key" from "wrong slot"). Everything
+except `ipv6` and `debug` exists for diagnosis and can go once the IPv6 path has soaked.

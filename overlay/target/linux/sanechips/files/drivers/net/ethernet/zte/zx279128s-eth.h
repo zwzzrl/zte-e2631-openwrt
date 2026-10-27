@@ -389,6 +389,12 @@ static inline void zx_mac_words(const u8 *mac, u32 *w)
 bool zx_eth_is_port(const struct net_device *dev);
 void zx_set_trap_dmac(struct zx_eth_adapter *adapter, int idx, const u8 *mac);
 void zx_update_traps(struct zx_eth_adapter *adapter);
+/* Whether the engine has the IPv6 classifier tables in the hardware.  Only
+ * then may the IPv6 ethertype trap be lifted: without tables, an IPv6 frame
+ * that the classifier does not know has no path to the CPU left.  Set by the
+ * engine (the module) around zx_update_traps().
+ */
+void zx_ppe_set_v6_offload(bool on);
 void zx_update_mac_tables(struct zx_eth_adapter *adapter);
 bool zx_ppe_has_bound_blocks(struct zx_eth_adapter *adapter);
 /* Visit every probed adapter.  For the packet processor module, which is

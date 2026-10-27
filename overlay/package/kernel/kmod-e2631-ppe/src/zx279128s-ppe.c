@@ -30,11 +30,13 @@
  * directions of a connection as upstream: both use the upstream key
  * header, and each direction has its own flow (rewrite) index.
  *
- * IPv6: the classifier has an IPv6 extract index and rule as well, and the
- * driver can program them (zx_ppe_ipv6), but on this SoC they are not
- * trusted yet -- with the IPv6 tables in place, a single IPv6 frame could
- * wedge the switch and take IPv4 down with it, so they stay off and IPv6
- * keeps the CPU path.  Details in docs/known-issues.md (PPE-IPV6-TCP).
+ * IPv6: the classifier has an IPv6 extract index (10, the only value that
+ * works) and a rule, and the driver can program them (zx_ppe_ipv6, default
+ * off).  With them in place IPv6 forwards exactly as well as with the trap on
+ * - measured, not assumed - but the hash entry is never matched, so there is
+ * no fast path yet.  The stock firmware's rule 2 re-encoded is not the whole
+ * story: the vendor builds the key itself in software from per-family
+ * descriptors.  Details in docs/known-issues.md (PPE-IPV6-TCP).
  *
  * This file is package kmod-e2631-ppe, not part of the kernel: the classifier,
  * the hash banks and the rewrite tables are exactly the part that keeps being
@@ -47,7 +49,208 @@
 
 static bool zx_ppe_ipv6;
 module_param_named(ipv6, zx_ppe_ipv6, bool, 0644);
-MODULE_PARM_DESC(ipv6, "program the IPv6 classifier tables (experimental, default off)");
+MODULE_PARM_DESC(ipv6, "program the IPv6 classifier tables (default off: IPv6 then keeps the CPU path)");
+
+static bool zx_ppe_debug;
+module_param_named(debug, zx_ppe_debug, bool, 0644);
+MODULE_PARM_DESC(debug,
+	"log every offloaded flow and the first hardware hit of each hash entry");
+
+/*
+ * Diagnostic only: the value the driver shall write to the ethertype trap
+ * register, -1 to leave that to zx_update_traps().  A trapped ethertype may
+ * take the frame away from the classifier, which would make the fast path
+ * unobservable no matter how right its tables are -- the two experiments
+ * that tell the two cases apart are "trap IPv4 too and see whether IPv4
+ * offload stops" and "stop trapping IPv6 and see whether it starts".
+ */
+static int zx_ppe_trap_override = -1;
+MODULE_PARM_DESC(trap_override,
+	"32-bit value for the ethertype trap register (0x0800<<16 | 0x86dd masks), -1 = driver decides");
+
+static void zx_ppe_apply_trap_override(struct zx_eth_adapter *adapter)
+{
+	if (!adapter->ppe_active || zx_ppe_trap_override < 0)
+		return;
+	writel(zx_ppe_trap_override, adapter->base + ZX_SPA_TRAP_ETH_TYPE);
+}
+
+static void zx_ppe_trap_reapply(struct zx_eth_adapter *adapter, void *data)
+{
+	mutex_lock(&adapter->ppe_lock);
+	zx_ppe_apply_trap_override(adapter);
+	mutex_unlock(&adapter->ppe_lock);
+}
+
+/*
+ * Writing this parameter takes effect immediately, which is what makes the
+ * trap question answerable on a live box: trap the family, let the first
+ * packets reach the CPU (and thereby create the flow), then stop trapping and
+ * send the same five-tuple again.  If the classifier owns those frames the
+ * hardware forwards them from its hash entry and the CPU transmit counter
+ * stays flat; if the trap was the only reason anything worked, they vanish.
+ */
+static int zx_ppe_trap_override_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (ret)
+		return ret;
+	zx_eth_for_each_adapter(zx_ppe_trap_reapply, NULL);
+	return 0;
+}
+
+static const struct kernel_param_ops zx_ppe_trap_override_ops = {
+	.set	= zx_ppe_trap_override_set,
+	.get	= param_get_int,
+};
+module_param_cb(trap_override, &zx_ppe_trap_override_ops, &zx_ppe_trap_override, 0644);
+
+/*
+ * Diagnostic knobs for the IPv6 fast path, all of them "default = what the
+ * driver ships".  The v4 tables are proven on hardware, so every IPv6 value
+ * that differs from its v4 sibling is a guess; these let a guess be changed
+ * on a loaded module instead of in a 45-minute kernel rebuild, and v6_ext,
+ * v6_rule and v6_key exist because where the hardware looks up that rule -
+ * and which id it puts into the hash key - is exactly what is unproven.
+ */
+/*
+ * The index the stock firmware hangs its IPv6 extract on, and the only one
+ * that means anything to the hardware: it is what tells the classifier that
+ * an IPv6 packet is a packet it has to look at.  Reading the old sweep by
+ * "did the CPU stop seeing the packets" got this exactly backwards -- the
+ * index 10 run sent everything through the CPU *because* the extract worked
+ * and the hash lookup missed, while 0/1/2/3/8/9/11..15 dropped the frames
+ * without ever looking at them (2026-10-28, measured again with a far end
+ * that counts what arrives: 2800 of 2800 packets arrive with index 10 and
+ * none with index 11).  So 10 it is, and 11 must never be the default.
+ */
+static int zx_ppe_v6_ext_idx = 10;
+module_param_named(v6_ext, zx_ppe_v6_ext_idx, int, 0644);
+MODULE_PARM_DESC(v6_ext, "classifier extract index the IPv6 rule is hung off");
+
+static int zx_ppe_v6_entry = -1;
+module_param_named(v6_entry, zx_ppe_v6_entry, int, 0644);
+MODULE_PARM_DESC(v6_entry,
+	"extract index byte inside the IPv6 hash entry (-1: same as v6_ext)");
+
+static int zx_ppe_v6_rule_idx = ZX_PPE_V6_RULE;
+module_param_named(v6_rule, zx_ppe_v6_rule_idx, int, 0644);
+MODULE_PARM_DESC(v6_rule, "extra rule table entry the IPv6 windows are written to");
+
+static int zx_ppe_v6_key = -1;
+module_param_named(v6_key, zx_ppe_v6_key, int, 0644);
+MODULE_PARM_DESC(v6_key, "id the IPv6 hash key carries (-1: same as v6_rule)");
+
+static int zx_ppe_v6_idxw4 = -1;
+module_param_named(v6_idxw4, zx_ppe_v6_idxw4, int, 0644);
+MODULE_PARM_DESC(v6_idxw4, "word 4 of the IPv6 extract index entry (-1: shipped value)");
+
+static int zx_ppe_v6_hashlen = -1;
+module_param_named(v6_hashlen, zx_ppe_v6_hashlen, int, 0644);
+MODULE_PARM_DESC(v6_hashlen, "hash length in the IPv6 rule (-1: shipped value)");
+
+static int zx_ppe_v6_type = -1;
+module_param_named(v6_type, zx_ppe_v6_type, int, 0644);
+MODULE_PARM_DESC(v6_type, "offset type of every IPv6 window (-1: shipped value)");
+
+/*
+ * How many of the extract rule's windows the hardware feeds into the hash
+ * key, and therefore how many halfwords the key holds.  For IPv4 that number
+ * is 7 (protocol, four address halfwords, two ports) and it is encoded in the
+ * rule's hash length field, so it doubles as the field's meaning: with all 19
+ * IPv6 windows the field has to hold 19, and if the hardware caps the key at
+ * some smaller size nothing ever matches.  Sweeping this is the cheapest way
+ * to find the cap.
+ */
+static int zx_ppe_v6_hwn = -1;
+module_param_named(v6_hwn, zx_ppe_v6_hwn, int, 0644);
+MODULE_PARM_DESC(v6_hwn,
+	"halfwords of the IPv6 key (windows hashed, -1: all 19)");
+
+/*
+ * Diagnostic: write the same IPv6 flow into a range of hash slots instead of
+ * only the one zx_ppe_slots() computed.  That separates the two remaining
+ * explanations for a flow the hardware never matches -- "the key string is
+ * wrong" from "the key string is right and only the software's idea of the
+ * slot is wrong" -- because if any slot hits, the string was fine.  Bisect
+ * the range to find out which slot the hardware actually looks in.
+ */
+static bool zx_ppe_v6_shotgun;
+module_param_named(v6_shotgun, zx_ppe_v6_shotgun, bool, 0644);
+MODULE_PARM_DESC(v6_shotgun,
+	"diagnostic: write an IPv6 flow into v6_shot_lo..v6_shot_hi instead of one slot");
+static int zx_ppe_v6_shot_lo = -1;
+module_param_named(v6_shot_lo, zx_ppe_v6_shot_lo, int, 0644);
+MODULE_PARM_DESC(v6_shot_lo, "first slot of the shotgun range (-1: 0)");
+static int zx_ppe_v6_shot_hi = -1;
+module_param_named(v6_shot_hi, zx_ppe_v6_shot_hi, int, 0644);
+MODULE_PARM_DESC(v6_shot_hi, "last slot of the shotgun range (-1: 383)");
+
+static unsigned int zx_ppe_v6_entry_idx(void)
+{
+	return zx_ppe_v6_entry < 0 ? (unsigned int)zx_ppe_v6_ext_idx
+				   : (unsigned int)zx_ppe_v6_entry;
+}
+
+static unsigned int zx_ppe_v6_key_byte(void)
+{
+	return zx_ppe_v6_key < 0 ? (unsigned int)zx_ppe_v6_rule_idx
+				 : (unsigned int)zx_ppe_v6_key;
+}
+
+/*
+ * The classifier keeps no packet counters, only one hit bit per entry, so
+ * "did the hardware really match this flow" is invisible from outside --
+ * the one thing worth knowing while a key format is being worked out.  With
+ * debug=1 zx_ppe_flow_stats() logs the first hit of every hash entry, which
+ * separates "the key never matches" from "no traffic was generated".
+ *
+ * The family has to be remembered here rather than read off the entry: the
+ * entry struct lives in the built-in header, and FLOW_CLS_STATS does not
+ * carry a flow_rule (nf_flow_table_offload.c sets cls_flow.rule for
+ * FLOW_CLS_REPLACE only).  A collision in this direct-mapped table costs a
+ * log line and nothing else.
+ */
+#define ZX_PPE_COOKIE_MAP	256
+static struct {
+	unsigned long	cookie;
+	bool		v6;
+	bool		used;
+} zx_ppe_cookie_map[ZX_PPE_COOKIE_MAP];
+static DECLARE_BITMAP(zx_ppe_hit_logged, ZX_PPE_HASH_SIZE);
+
+static unsigned int zx_ppe_cookie_slot(unsigned long cookie)
+{
+	return (cookie >> 4) & (ZX_PPE_COOKIE_MAP - 1);
+}
+
+static void zx_ppe_cookie_set(unsigned long cookie, bool v6)
+{
+	unsigned int i = zx_ppe_cookie_slot(cookie);
+
+	zx_ppe_cookie_map[i].cookie = cookie;
+	zx_ppe_cookie_map[i].v6 = v6;
+	zx_ppe_cookie_map[i].used = true;
+}
+
+static void zx_ppe_cookie_clear(unsigned long cookie)
+{
+	unsigned int i = zx_ppe_cookie_slot(cookie);
+
+	if (zx_ppe_cookie_map[i].used && zx_ppe_cookie_map[i].cookie == cookie)
+		zx_ppe_cookie_map[i].used = false;
+}
+
+static bool zx_ppe_cookie_get(unsigned long cookie, bool *v6)
+{
+	unsigned int i = zx_ppe_cookie_slot(cookie);
+
+	if (!zx_ppe_cookie_map[i].used || zx_ppe_cookie_map[i].cookie != cookie)
+		return false;
+	*v6 = zx_ppe_cookie_map[i].v6;
+	return true;
+}
 
 static u32 zx_pp_data_reg(u32 blk, int i)
 {
@@ -144,7 +347,7 @@ struct zx_ppe_tuple {
 static int zx_ppe_halfwords(const struct zx_ppe_tuple *t, u16 *hw)
 {
 	u32 s, d;
-	int i;
+	int i, n;
 
 	if (t->v6) {
 		hw[0] = t->proto << 8;
@@ -154,7 +357,10 @@ static int zx_ppe_halfwords(const struct zx_ppe_tuple *t, u16 *hw)
 			hw[9 + i] = t->daddr6[2 * i] << 8 | t->daddr6[2 * i + 1];
 		hw[17] = be16_to_cpu(t->sport);
 		hw[18] = be16_to_cpu(t->dport);
-		return ZX_PPE_V6_WINDOWS;
+		n = ZX_PPE_V6_WINDOWS;
+		if (zx_ppe_v6_hwn >= 0 && zx_ppe_v6_hwn < n)
+			n = zx_ppe_v6_hwn;
+		return n;
 	}
 
 	s = be32_to_cpu(t->saddr);
@@ -180,7 +386,7 @@ static void zx_ppe_slots(const struct zx_ppe_tuple *t, u16 slot[2])
 	int i, n;
 
 	n = zx_ppe_halfwords(t, hw);
-	zx_ppe_put_bits(key, 23, 8, t->v6 ? ZX_PPE_V6_RULE : ZX_PPE_V4_RULE);
+	zx_ppe_put_bits(key, 23, 8, t->v6 ? zx_ppe_v6_key_byte() : ZX_PPE_V4_RULE);
 	for (i = 0; i < n; i++)
 		zx_ppe_put_bits(key, 33 + 16 * i, 16, hw[i]);
 	slot[0] = zx_ppe_crc(0x04c11db7, key, sizeof(key)) & 0xff;
@@ -205,7 +411,7 @@ static int zx_ppe_hash_entry(const struct zx_ppe_tuple *t, u16 flow, int port,
 	n = zx_ppe_halfwords(t, hw);
 	/* valid, extract index, upstream */
 	zx_ppe_put_bits(key, 0, 8,
-			0x40 | (t->v6 ? ZX_PPE_V6_INDEX : ZX_PPE_V4_INDEX));
+			0x40 | (t->v6 ? zx_ppe_v6_entry_idx() : ZX_PPE_V4_INDEX));
 	for (i = 0; i < n; i++)
 		zx_ppe_put_bits(key, 24 + 16 * i, 16, hw[i]);
 	w[0] = FIELD_PREP(ZX_CLA_W0_FLOW, flow) | ZX_CLA_W0_FWD |
@@ -522,6 +728,23 @@ static int zx_ppe_flow_add(struct zx_eth_adapter *adapter,
 	if (ret)
 		goto err_nh;
 
+	if (t.v6 && zx_ppe_v6_shotgun) {
+		int lo = zx_ppe_v6_shot_lo < 0 ? 0 : zx_ppe_v6_shot_lo;
+		int hi = zx_ppe_v6_shot_hi < 0 ? ZX_PPE_HASH_SIZE - 1
+					      : zx_ppe_v6_shot_hi;
+		int s;
+
+		for (s = lo; s <= hi && s < ZX_PPE_HASH_SIZE; s++) {
+			if (s == slot[1])
+				continue;
+			zx_pp_write(adapter, ZX_CLA_BASE,
+				    s < ZX_PPE_HASH0_SIZE ? ZX_CLA_HASH0 : ZX_CLA_HASH1,
+				    s % ZX_PPE_HASH0_SIZE, w, words);
+		}
+		dev_info(adapter->dev, "IPv6 shotgun: hash %d..%d hold the same entry\n",
+			 lo, hi);
+	}
+
 	e->cookie = f->cookie;
 	e->hash = slot[1];
 	e->flow = flow;
@@ -532,6 +755,10 @@ static int zx_ppe_flow_add(struct zx_eth_adapter *adapter,
 		goto err_entry;
 	set_bit(e->hash, adapter->ppe_hash_used);
 	adapter->ppe_count++;
+	zx_ppe_cookie_set(f->cookie, t.v6);
+	if (zx_ppe_debug)
+		dev_info(adapter->dev, "offloaded %s flow into hash %u\n",
+			 t.v6 ? "an IPv6" : "an IPv4", slot[1]);
 	return 0;
 
 err_entry:
@@ -572,6 +799,7 @@ static int zx_ppe_flow_del(struct zx_eth_adapter *adapter,
 	if (!e)
 		return -ENOENT;
 	rhashtable_remove_fast(&adapter->ppe_flows, &e->node, zx_ppe_ht_params);
+	zx_ppe_cookie_clear(f->cookie);
 	zx_ppe_entry_remove(adapter, e);
 	kfree(e);
 	return 0;
@@ -582,6 +810,7 @@ static int zx_ppe_flow_stats(struct zx_eth_adapter *adapter,
 			     struct flow_cls_offload *f)
 {
 	struct zx_ppe_entry *e;
+	bool v6 = false;
 	u32 hit;
 
 	e = rhashtable_lookup_fast(&adapter->ppe_flows, &f->cookie, zx_ppe_ht_params);
@@ -592,6 +821,12 @@ static int zx_ppe_flow_stats(struct zx_eth_adapter *adapter,
 	if (hit & 1) {
 		f->stats.lastused = jiffies;
 		zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_AGING, e->hash, NULL, 0);
+		if (zx_ppe_debug && !test_and_set_bit(e->hash, zx_ppe_hit_logged)) {
+			zx_ppe_cookie_get(f->cookie, &v6);
+			dev_info(adapter->dev,
+				 "hash %u matched by the hardware (%s flow)\n",
+				 e->hash, v6 ? "IPv6" : "IPv4");
+		}
 	}
 	return 0;
 }
@@ -608,47 +843,91 @@ static const u32 zx_ppe_v4_rule[16] = {
 };
 
 /*
- * IPv6 versions, taken from the stock firmware instead of extrapolated.
+ * IPv6 versions.  The rule is not what the stock firmware's rule 2 reads
+ * literally: it is what rule 2 *means*, re-encoded from the layout the v4
+ * entry proves (window offset: 7 bits at bit 7n, window mask: 16 bits at
+ * bit 140+16n, window offset type: 3 bits at bit 480+3n, hash length: bit
+ * 468), because encoding the v4 tuple with that layout reproduces the whole
+ * zx_ppe_v4_rule above byte for byte.
  *
- * Source (static, reproducible offline -- docs/known-issues.md):
- *   tm.ko, aclRamInit.part.9 -> cla_set_extra_index_table(10, ...)
- *       ids 0..15, tail 00 00 15 00
- *   tm.ko, tm_acl_fast_init  -> cla_set_extra_index_table(10, ...) word 4
- *       |= 0x04 (EN_V6FAST_EXTIDXTBL) = the v6 fast-path enable bit
- *   tm.ko, tm_acl_fast_init  -> cla_set_extra_rule_table(2, ...)  up
- *                                cla_set_extra_rule_table(3, ...)  down
+ * Encoded that way, the stock rule 2 (tm.ko, tm_acl_fast_init ->
+ * cla_set_extra_rule_table(2, ...), emulated 2026-10-27) is a clean
+ * 19-window entry: next header at offset 6 with mask 0xff00, the eight
+ * source and eight destination halfwords at 8..38, the two ports at 40 and
+ * 42, window offset type 3 (IPv6) everywhere, hash length 19.  One caveat:
+ * that emulation captured 16 of the entry's 17 words, so the dump is one
+ * 0xffffffff mask word short and its tail decodes to nonsense.  Earlier
+ * revisions of this driver took the dump literally and "tidied" the tail by
+ * hand, clearing 7 bits that are not spare at all: w0 bits 29-31 are window
+ * 4's offset, w3 bit 31 is the last window's offset (40 -> 42), w4 bits 24
+ * and 26 are two bits of window 0's mask (0xff00 -> 0xaf00), w15 bits 30-31
+ * are window 10's offset type (3 -> 0).  The words below are rule 2 with its
+ * dropped mask word put back.
  *
- * That extraction is trustworthy because the same function also programs
- * rule 144/145 for IPv4, and those two entries are byte-for-byte the
- * zx_ppe_v4_rule table above, which runs on real hardware.  Note how the
- * extrapolated values this driver carried before were wrong in five places
- * (rule words 0, 3, 4, 15 and the whole index entry), which is consistent
- * with the wedge seen when they were first written to the hardware.
+ * What these clean tables do, measured on hardware 2026-10-28: the classifier
+ * recognises the frame as IPv6 and hands it to the CPU when the hash lookup
+ * misses, the flow is created, the entry is written - and the hardware never
+ * matches it.  Every other candidate was excluded first, on the same forwarded
+ * flow: the entry in the slot the software computes, then in all 384 slots at
+ * once (v6_shotgun), every window offset type 0..7 (v6_type), key lengths 7 to
+ * 19 halfwords (v6_hwn), and the index/rule byte inside the key (v6_key) as
+ * 0x99, 10, 11 and 0x98.  No combination hit, while the far end counted every
+ * one of the 2,800 packets, so the frames were being forwarded and not dropped.
+ * The remaining difference is the key string itself: the vendor does not build
+ * it from a homogeneous window list.  tm.ko's tm_acl_fast_add_v4v6() packs the
+ * 45 bytes out of a hash rule computed in software by tm_acl_get_fastHashRule()
+ * (60-byte struct, halfword windows at offsets 16..46), and switch.ko's
+ * per-family descriptors differ between the families (npu_ipv4_l3tcpup_cap vs
+ * npu_ipv6_l3tcpup_cap, same size, different field map).  Until that is
+ * reproduced ipv6=1 means "correct forwarding, no fast path" - which is why it
+ * is not the default.
  *
- * The index entry names the 16 extract fields of index 10 (ids 0..15, not
- * 160..175), byte 18 = 0x15 is the extract length and byte 17 = 0x01 the
- * "look up the hash banks" bit, as in the v4 entry.  Word 4 is the proven
- * v4 entry with its own enable bit (bit 0) replaced by the v6 one (bit 2).
+ * The index entry is aclRamInit's: extract field ids 0..15, word 4 the proven
+ * v4 entry (bit 0 = v4 fast enable) carrying the v6 enable bit 2 instead, byte
+ * 17 = 0x01 "look up the hash banks" and byte 18 = 0x15 as in the v4 entry.
  *
- * The rule entry has 19 windows, one per halfword of the tuple: the next
- * header (offset 6, mask 0xff00) at byte 6 of the IPv6 header, the eight
- * source and eight destination halfwords at their header offsets and the
- * two ports after them.  Address family 3 = IPv6, hash length 19, and the
- * up/down entries differ only in word 14 like the IPv4 pair does.
+ * The rule goes to 0x99 rather than the stock 2 because 0x98/0x99 is the id the
+ * hardware puts into the hash key of a v4/v6 fast-path frame - the v4 pair at
+ * 0x98 has been offloading traffic on hardware since v1.0 - and the extract
+ * index is 10, the only value that works (see zx_ppe_v6_ext_idx).
  */
-static const u32 zx_ppe_v6_index[5] = {
+static u32 zx_ppe_v6_index[5] = {
 	0x03020100, 0x07060504, 0x0b0a0908, 0x0f0e0d0c,
 	0x00150154,	/* bit 2: v6 fast enable, bit 8: hash banks */
 };
 
-static const u32 zx_ppe_v6_rule[17] = {
-	0x01828406, 0x16284880, 0x01e3868c, 0x14264889, 0xfaf0000a,
+static u32 zx_ppe_v6_rule[17] = {
+	0xe1828406, 0x16284880, 0x01e3868c, 0x94264889, 0xfff0000a,
 	0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
 	0xffffffff, 0xffffffff, 0xffffffff, 0x0fffffff, 0x01300000,
-	0x1b6db6db, 0x00db6db6,
+	0xdb6db6db, 0x00db6db6,
 };
 
 static const u32 zx_ppe_sub[2] = { 0xfc000000, 0x00001fff };
+
+/*
+ * Apply the v6_* overrides to the two tables above.  Bits are patched with
+ * the same little-endian bit numbering the tables were encoded with, so a
+ * patched table is what the encoder would have produced for that value.
+ */
+static void zx_ppe_v6_tune(void)
+{
+	u8 *rule = (u8 *)zx_ppe_v6_rule;
+	int hashlen = zx_ppe_v6_hashlen;
+	int i;
+
+	if (hashlen < 0 && zx_ppe_v6_hwn >= 0)
+		hashlen = zx_ppe_v6_hwn;
+	if (hashlen >= 0) {
+		zx_ppe_put_bits(rule, 468, 4, hashlen & 0xf);
+		zx_ppe_put_bits(rule, 472, 1, (hashlen >> 4) & 1);
+	}
+	if (zx_ppe_v6_type >= 0)
+		for (i = 0; i < ZX_PPE_V6_WINDOWS; i++)
+			zx_ppe_put_bits(rule, 480 + 3 * i, 3, zx_ppe_v6_type);
+	if (zx_ppe_v6_idxw4 >= 0)
+		zx_ppe_v6_index[4] = zx_ppe_v6_idxw4;
+}
 
 /* classifier L3 MTU and actions, packet modifier padding of short frames.
  * The "other L3 packet" action (0x38c0cc) keeps the value 1 of the base
@@ -672,11 +951,14 @@ static int zx_ppe_start(struct zx_eth_adapter *adapter)
 	void __iomem *base = adapter->base;
 	int i, ret;
 
+	zx_ppe_v6_tune();
 	for (i = 0; i < ZX_PPE_SUBNETS; i++)
 		adapter->ppe_subnet[i].refs = 0;
 	bitmap_zero(adapter->ppe_hash_used, ZX_PPE_HASH_SIZE);
 	bitmap_zero(adapter->ppe_flow_used, ZX_PPE_FLOWS);
 	bitmap_zero(adapter->ppe_nh_used, ZX_PPE_NEXT_HOPS);
+	bitmap_zero(zx_ppe_hit_logged, ZX_PPE_HASH_SIZE);
+	memset(zx_ppe_cookie_map, 0, sizeof(zx_ppe_cookie_map));
 
 	for (i = 0; i < ARRAY_SIZE(zx_ppe_regs); i++) {
 		adapter->ppe_saved[i] = readl(base + zx_ppe_regs[i]);
@@ -694,10 +976,10 @@ static int zx_ppe_start(struct zx_eth_adapter *adapter)
 				  ZX_PPE_V4_INDEX, zx_ppe_v4_index, 5);
 	if (!ret && zx_ppe_ipv6)
 		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE,
-				  ZX_PPE_V6_RULE, zx_ppe_v6_rule, 17);
+				  zx_ppe_v6_rule_idx, zx_ppe_v6_rule, 17);
 	if (!ret && zx_ppe_ipv6)
 		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
-				  ZX_PPE_V6_INDEX, zx_ppe_v6_index, 5);
+				  zx_ppe_v6_ext_idx, zx_ppe_v6_index, 5);
 	if (ret) {
 		for (i = 0; i < ARRAY_SIZE(zx_ppe_regs); i++)
 			writel(adapter->ppe_saved[i], base + zx_ppe_regs[i]);
@@ -705,8 +987,11 @@ static int zx_ppe_start(struct zx_eth_adapter *adapter)
 	}
 
 	adapter->ppe_active = true;
+	/* the IPv6 trap may only be lifted once its tables are in the hardware */
+	zx_ppe_set_v6_offload(zx_ppe_ipv6);
 	zx_update_mac_tables(adapter);
 	zx_update_traps(adapter);
+	zx_ppe_apply_trap_override(adapter);
 	dev_info(adapter->dev, "hardware flow offload enabled\n");
 	return 0;
 }
@@ -726,6 +1011,7 @@ static void zx_ppe_stop(struct zx_eth_adapter *adapter)
 
 	/* back to trapping everything, then drop the tables */
 	adapter->ppe_active = false;
+	zx_ppe_set_v6_offload(false);
 	zx_update_traps(adapter);
 	zx_update_mac_tables(adapter);
 
@@ -733,8 +1019,8 @@ static void zx_ppe_stop(struct zx_eth_adapter *adapter)
 	rhashtable_init(&adapter->ppe_flows, &zx_ppe_ht_params);
 	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX, ZX_PPE_V4_INDEX, NULL, 0);
 	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE, ZX_PPE_V4_RULE, NULL, 0);
-	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX, ZX_PPE_V6_INDEX, NULL, 0);
-	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE, ZX_PPE_V6_RULE, NULL, 0);
+	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX, zx_ppe_v6_ext_idx, NULL, 0);
+	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE, zx_ppe_v6_rule_idx, NULL, 0);
 	for (i = 0; i < ARRAY_SIZE(zx_ppe_regs); i++)
 		writel(adapter->ppe_saved[i], base + zx_ppe_regs[i]);
 	dev_info(adapter->dev, "hardware flow offload disabled\n");

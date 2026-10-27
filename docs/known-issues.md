@@ -75,115 +75,85 @@ points at something in the repository or at a measurement.
   status: mitigated
   surface: ethernet + ipv6
   symptom: LAN client -> router over IPv6 TCP connects in ~1 ms and then no payload ever arrives (0 bytes, times out); IPv4 over the same port and ICMPv6 are fine, so it reads as a random hang. Also stalls IPv6 TCP through the router to the internet.
-  verified: yes - 2026-10-27 on a freshly flashed image: flow_offloading=1 + flow_offloading_hw=1 -> connect ok, 0 bytes in 6 s; hw=0 -> HTTP/1.0 200 OK in 1 ms; 0/0 -> same. Reproduced on ports 80/22/53 with both a ULA and a fe80 destination (fw4 stop/start flipped it every time)
+  verified: yes - 2026-10-27 (the stall, then the IPv4-only workaround), 2026-10-28 (trap cause, extract index, and the hash-entry experiments below, all on this board)
   cause: |
-    flow_offloading_hw=1 makes fw4 bind an nft flowtable, and zx_eth_setup_tc()/FLOW_BLOCK_BIND calls
-    zx_ppe_start() unconditionally - that programs the classifier with the IPv4-ONLY index/rule tables
-    (zx_ppe_v4_index/zx_ppe_v4_rule; zx_ppe_flow_add() rejects anything that is not
-    FLOW_DISSECTOR_KEY_IPV4_ADDRS/ETH_P_IP), then sets ppe_active=1, which moves our MACs from the
-    trap-DMAC table into the ONU "routed" table and clears the trap-DMAC entries. The IPv6 ethertype
-    trap is already off whenever sw_members != 0 (three LAN ports in br-lan => always), so with
-    ppe_active=1 an IPv6 frame addressed to the router has NO path left to the CPU: the SYN gets
-    through by another trap, the payload and the replies do not. hw=0 restores the MACs to the
-    trap-DMAC table and everything works, which is why the switch is what flips it
-    (vendor comparison, 2026-10-27: the stock firmware has an IPv6-capable classifier - per-class NPU
-    caps npu_ipv6_l3tcp{up,down}_cap, IPv6 SNAT/DNAT RAM, NPTv6, plus a local-IPv6-address register
-    file at ONU reg 19 (0xe3028, 4x32 bit) and ONU S/D IPv6 at reg 23 (0xe303f, 8x32 bit) - and it
-    never uses mainline nf_flow_table/TC_SETUP_FT at all: those strings appear 0 times in the stock
-    vmlinux. The bug is ours, not inherited)
+    Three findings, in the order they were proven, and the third one says the entry
+    cannot be closed as "fixed":
+
+    1. A trapped ethertype never reaches the classifier.  zx_update_traps() kept the
+       IPv6 ethertype trap on in every state (that is the v1.4 fix for the stall
+       above), and a trapped frame goes to the CPU instead of being classified first.
+       Measured 2026-10-28 by trapping IPv4 the same way: the same forwarded IPv4
+       flow that involves the CPU in 18 packets with its trap off sent all 167,000
+       packets of the test through the CPU with the trap on.
+    2. The IPv6 extract index is the stock firmware's 10, and it is the only one that
+       works.  The earlier sweep was read backwards: it asked "did the CPU stop seeing
+       the packets", so index 10 looked dead because *every* packet went through the
+       CPU there, while 0/1/2/3/8/9/11..15 "passed" because the frames were being
+       dropped without ever being looked at.  With a far end that counts what arrives
+       (see the note at the end) the picture is unambiguous: index 10 forwards 2,800
+       of 2,800 packets of a forwarded IPv6 UDP burst, index 11 forwards 0 of 2,800
+       and the CPU sees 20 packets.  So the driver writes 10 now, and a v6_ext other
+       than 10 makes IPv6 traffic to our MACs disappear.
+    3. The IPv6 hash entry is never matched by the hardware.  With the trap lifted and
+       index 10 in place, the classifier recognises IPv6 and hands every packet to the
+       CPU, the flowtable creates the flow, the driver writes the hash entry ("offloaded
+       an IPv6 flow into hash N" with debug=1) -- and the hit bit never sets, so no
+       packet ever takes the fast path.  Six kinds of experiment, all on the same
+       forwarded flow, all negative:
+         * the computed slot, then the entry written into all 384 slots at once
+           (module param v6_shotgun, added for this) -- if the key string were right
+           and only the software's slot formula wrong, one of them would hit;
+         * the extract index byte inside the entry: rule id 0x99, 10, 11, and 0x98;
+         * the window offset type, 0..7 (2 = IPv4, 3 = IPv6 per the v4 entry);
+         * the key length, 7 to 19 halfwords (param v6_hwn), same rule hash length;
+         * the trap itself: trap on and the same five-tuple re-sent after writing
+           trap_override=0, i.e. the flow exists before the frames stop being trapped.
+       Conclusion: the hardware's IPv6 key is not the 19-homogeneous-window string the
+       driver builds.  Where the real one comes from is now known, see "next".
   workaround: |
-    fixed in the driver on 2026-10-27 (option (a) below, then tested on hardware): zx_update_traps()
-    now never lifts the IPv6 ethertype trap, so IPv6 always keeps the CPU path while IPv4 keeps the
-    PPE. With that in place the image default went back to flow_offloading=1 + flow_offloading_hw=1
-    (etc/uci-defaults/99_e2631_flowoffload) - wired IPv4 acceleration is on out of the box again and
-    IPv6 no longer stalls. Verified on a freshly flashed slot 1 (serial 13, kernel 6.18.55): with
-    1 / 1 the ULA/LL TCP reachability that used to hang now behaves, IPv4 SSH/ICMP unaffected, and
-    ppe_active=1 with ppe_flows tracking the IPv4 flowtable. IPv6 is NOT hardware-accelerated: it is
-    switched in hardware but its L3 forwarding stays on the CPU
+    IPv6 *works* in the configuration that ships: ipv6=0 keeps the IPv6 trap on, so
+    IPv6 takes the CPU software path exactly as it did before any of this, and that
+    path is proven end to end (2,800 of 2,800 packets of a forwarded IPv6 UDP burst
+    arrive at the far end; IPv6 traffic to the router itself reaches the stack -
+    ICMPv6 4/4, TCP 22/80/53 connect, HTTP 200).
+    ipv6=1 is now also safe but still does not make anything faster: it programs the
+    v6 tables, lifts the trap and offloads v6 flows into the hash, and the datapath
+    stays on the CPU because of finding 3.  Both settings forward 1,800 of 1,800
+    packets (2026-10-28, measured after the index went back to 10), so ipv6=1 is a
+    "correct but no faster" switch, not a trap.
+    zx_update_traps() only lifts the IPv6 trap when the module reports its v6 tables
+    are in the hardware (zx_ppe_set_v6_offload()), so a module that fails to program
+    them leaves the box on the old, safe path.
   next: |
-    the classifier's IPv6 half is written and in the tree but disabled (module parameter ipv6=1,
-    off by default): IPv6 extract index 10, rule 0x99 (19 windows, hash_len 19), 15-word hash
-    entries, and zx_ppe_flow_add() accepting FLOW_DISSECTOR_KEY_IPV6_ADDRS. Do not just flip it on:
-    on 2026-10-27 a build that programmed those tables hung the box - SSH worked for ~30 s after
-    fw4 bound the flowtable (ppe_flows=0, no IPv6 flow installed), then the first IPv6 frame from a
-    LAN host wedged the switch: IPv4 and IPv6 both dead, ARP/NDP unanswered, link still up, no
-    self-recovery in 8 minutes, fixed only by a power cycle (the second hang of the day; the config
-    had persisted flow_offloading=1, so it also failed at boot until the VM's IPv6 traffic was
-    stopped). What the vendor firmware does have, recovered 2026-10-27 by emulating tm.ko:
-      * rule table: IPv4 fast-path templates at rule 144 (0x90) and 145 (0x91) - upstream/downstream
-        differ only in word 14 bit 25 (0x00700000 vs 0x02700000); IPv6 templates at rule 2/3 with
-        the same contract and hash_len 19 (0x01300000);
-      * extract index table: aclRamInit fills index 1..8 with field ids 16..143, index 9 with
-        144..159 and index 10 with 0..15 (byte 18 = 0x19 for 1..8, 0x15 for 9/10);
-      * tm_acl_fast_init only *enables* them: index 9 |= 1 (v4 fast) and index 10 |= 4 (v6 fast).
-        aclGetExtIdxRuleRamAddrByPort() returns 9 or 10 from two globals that
-        tm_acl_fast_add_v4v6() sets from the session's L3 type;
-      * tm_acl_fast_add_v4v6() builds the 45-byte hash key (__memzero 45) from the 60-byte entry
-        that tm_acl_get_fastHashRule() fills, packing each masked window into the key as
-        (hw & 0x7f) << 1 | (hw >> 15) - i.e. MSB-first within the window, which does NOT match what
-        our driver does (LSB-first put_bits) although our IPv4 code is proven on hardware, so those
-        templates are probably not the path the stock firmware runs in practice;
-      * the vendor's own IPv6 template is inconsistent (window 5 reads offset 0, the last two
-        windows both read offset 40, window 0 masks 0xaf00, window 11 has type 0), which is the
-        other reason not to trust it.
-    The driver's IPv6 constants were replaced on 2026-10-28 with the values above instead of the
-    extrapolated ones: index 10 = extract ids 0..15, word 4 = 0x00150154 (the proven v4 entry
-    0x00150151 with its own enable bit 0 swapped for the v6 bit 2, hash-bank bit 8 and byte 18 = 0x15
-    kept), and the rule words taken verbatim from rule 2. Five words changed: 0xe1828406 ->
-    0x01828406, 0x94264889 -> 0x14264889, 0xfff0000a -> 0xfaf0000a, 0xdb6db6db -> 0x1b6db6db, plus
-    the whole index entry (0xa3a2a1a0.. with ids 160..175 -> 0x03020100.. with ids 0..15). What makes
-    that extraction trustworthy despite the caveats above is the cross-check: the very same function
-    programs rule 144/145 for IPv4 and those entries are byte-identical to zx_ppe_v4_rule, which runs
-    on hardware. It is still unproven on hardware - ipv6=1 has never been booted with these values,
-    and each wrong step costs a power cycle. The image that carries them was flashed to slot 1 on
-    2026-10-28 03:16 through the vendor web upgrade page (real 8B8.000 header template, package
-    sha256 c413e123...): both gates passed, the box came up in 21 s, the first 0xE60000 bytes of
-    slot 1 match the package body per-MiB, and with ipv6=0 the defaults behave exactly as before
-    (dmesg "hardware flow offload enabled", IPv6 ping6 and TCP 22/80 all fine). What remains
-    unverified is only the ipv6=1 path itself.
-    Step 1 of that bisect was then run on the same boot (03:24): `echo 1 >
-    /sys/module/zx279128s_eth/parameters/ipv6` followed by `/etc/init.d/firewall restart` to
-    rebind the flowtable. (The path is `/sys/module/zx279128s_ppe/parameters/ipv6` since
-    v1.5, when the engine became package kmod-e2631-ppe; the old zx279128s_eth path no
-    longer exists.) zx_ppe_start() programmed both v6 tables and still reached its
-    "hardware flow offload enabled" line, which only prints when those writes returned 0;
-    uptime stayed continuous (292 -> 324 s, no reboot) and dmesg showed no fault. From the LAN
-    side, IPv6 ping6 was 4/4, TCP 22 and 80 connected, and HTTP over IPv6 returned 200 - so
-    these tables do not wedge the switch the way the extrapolated ones did on 2026-10-27, where
-    the first IPv6 frame killed the whole box. The parameter was then set back to 0 (it is a
-    module parameter, nothing persisted) and IPv6 still answered. Still unproven: an IPv6
-    *forwarded* flow - an uplink is needed, since lan1..lan3 and wan are in the flowtable but wan
-    had no link.
-    Step 2 was run on 2026-10-28 03:5x with a second host on lan1, which was turned into a real
-    WAN interface (192.168.9.1/24 + fd99::1/64, odhcpd RA on it), so the LAN host's iperf3 client
-    reached the WAN host through the router: a genuine IPv6 forwarded TCP flow. Result: **it is
-    NOT offloaded**. Three configurations gave the same throughput and the same CPU load within
-    noise (`iperf3 -t 8/10`, one TCP stream, WAN host fd99::7592:7724:8ae4:3d61):
-      A ipv6=1 hw=1: 361 Mbit/s, softirq 38.1%
-      B ipv6=1 hw=0: 359 Mbit/s, softirq 37.3%
-      C ipv6=0 hw=1: 356 Mbit/s, softirq 36.7%
-    A ~= B ~= C with softirq pinned around 37% means every packet is still being forwarded by the
-    CPU, so the classifier never claims this flow. The box also stays healthy, i.e. writing the
-    vendor's rule 2 no longer breaks anything - it simply never matches.
-    Most likely reason (to be confirmed, not proven): the hardware extracts fields and hashes them
-    according to rule 2's own window layout, while the driver builds the hash key from a *clean*
-    19-window layout (next header at offset 6 mask 0xff00, then 0xffff at 8..42). Rule 2 decoded
-    from tm.ko is not clean - window 4 reads offset 0, windows 17 and 18 both read offset 40, and
-    window 10 has type 0 - so the key the driver writes cannot equal the key the hardware derives,
-    and the lookup misses. That also explains 2026-10-27: the *clean* tables used then changed
-    what the hardware extracts (and probably the key length), which is what wedged the switch,
-    instead of merely missing.
-    Next step, in order: (1) recover the exact extraction/type semantics of rule 2 from tm.ko's
-    aclBuildHashAndAclRule / tm_acl_fast_add_v4v6 so the driver can build the key the hardware
-    expects; (2) or construct our own rule whose layout equals the driver's key layout and verify
-    the hash_len/key-length encoding first, since that is the part that killed the box before.
-    Either way the A/B/C measurement above is the acceptance test: the A column has to separate
-    from B and C, and softirq has to drop.
-    To finish this properly, either dump the vendor's live tables from a running stock firmware, or
-    build the IPv6 key/window layout from scratch and bisect it one table at a time on hardware
-    (program only the extract index first, then the rule, then a flow) - each wrong step costs a
-    power cycle.
-  docs: 01-文档/BUILD-NOTES.md 2026-10-27 (both entries); 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md
+    * Find the hardware's IPv6 key layout.  The vendor does not use a homogeneous
+      window list: tm.ko's tm_acl_fast_add_v4v6() packs the 45-byte key out of a hash
+      rule computed in software by tm_acl_get_fastHashRule() (a 60-byte struct whose
+      halfword windows live at offsets 16..46), and switch.ko carries per-family flow
+      capability descriptors that differ between the families -
+      npu_ipv4_l3tcpup_cap and npu_ipv6_l3tcpup_cap are the same size (44 B) but not
+      the same field map, so the vendor's NPU really does have an IPv6 flow concept.
+      Reading the real tables off a running vendor system is *not* available (see
+      VENDOR-RUNTIME-TABLES below: a patched vendor rootfs booted and ran nothing of
+      ours, there is no shell and no serial), so the only route left is to port those
+      two functions into the existing armemu harness (experiments/ppe-v6/armemu.py) and
+      reproduce the key for a synthetic v6 tuple, then diff it against
+      zx_ppe_slots()/zx_ppe_hash_entry().
+    * Once the key is right: measure a *TCP* IPv6 flow end to end (the bench's only
+      peer filters inbound IPv6, hence UDP above), then decide whether ipv6=1 becomes
+      the default.
+    * The local IPv6 address register file (ONU reg 19, 0xe3028) and the ONU S/D IPv6
+      file (reg 23, 0xe303f) are still not programmed.  Nothing in the forwarding path
+      above consults them, but they are the vendor's answer to "which IPv6 addresses
+      are ours".
+    Measurement note, because it cost a wrong conclusion once: tx_submitted in
+    /sys/kernel/debug/92000000.ethernet/dma_state proves that the CPU did *not* touch
+    a packet, which is not the same as proving the hardware forwarded it - a dropped
+    frame also keeps the CPU out.  The far end here is fd88::2, an address the router
+    routes back out the same LAN port, so the sending host counts the frames arriving
+    on its own NIC (non-zero means forwarded, 0 means dropped).  Both tricks are in
+    BUILD.md "Measuring the packet processor".
+  docs: 01-文档/BUILD-NOTES.md 2026-10-27; 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md; 06-分析与对比/拿原厂运行时表内容-方案-2026-10-27.md
 - id: USERDATA-EXTROOT
   severity: minor
   status: mitigated
