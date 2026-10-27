@@ -1,0 +1,9 @@
+#!/bin/sh
+# udhcpc 的"空脚本"：e2631-wanport 只想知道这个口有没有 DHCP 应答，不想让
+# udhcpc 去改地址、路由或 resolv.conf（那些是 netifd 的事）。
+#
+# 唯一做的事：把事件写进探测标记文件。e2631-wanport 用文件里有没有 "bound"
+# 判断探测成败，这样判决不依赖 udhcpc 自己的退出码和内部超时（busybox 的
+# 超时/重试参数语义在版本之间变过，靠不住）。
+[ -n "${E2631_PROBE_FLAG:-}" ] && echo "$1" >>"$E2631_PROBE_FLAG" 2>/dev/null
+exit 0

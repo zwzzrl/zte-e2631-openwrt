@@ -1,0 +1,388 @@
+#!/bin/sh
+# WAN/LAN 口自适应：把「任意有线口当 WAN」这件事做成可管理的动作。
+#
+# 背景（完整逆向见 docs/wanlan-adaptive-逆向记录-2026-10-27.md）：原厂在 cspd 的
+# NetAdapt 模块里做同一件事——探测哪个口有上行（NetAdaptStartEthProbe /
+# NetAdaptUpLinkProbeOK），再用 ioctl 把这个口设成 WAN 角色（SetWanLanMode），
+# 最后调整 br0 的允许端口。原厂的端口角色是交换芯片端口属性，所以必须 ioctl。
+#
+# 这块板子不需要那套：gmac 驱动按 DTS label 把 4 个物理口各建成了一个 netdev
+# （lan1 lan2 lan3 wan，见 dts 里 gmac_port0..3），谁当 WAN 只取决于 wan 接口绑在
+# 哪个 netdev、以及哪个 netdev 在 br-lan 里。于是这里全是用户态动作：
+#
+#   探测  = 候选口临时离开网桥 → 用它发一次 DHCP DISCOVER → 有应答就是上行口
+#   落地  = 上行口从 br-lan 摘掉、wan(wan6) 改绑到它、其余口回 br-lan
+#
+# 两条从坑里换来的规矩：
+#
+# 1. 探测前必须让口离开网桥。不摘下来，本机 dnsmasq 就在 br-lan 上应答这次
+#    DISCOVER，任何一个 LAN 口都会被判成上行口（原厂探测时同样先让口离开二层域）。
+#    摘下来的口无论是否被选中，探测结束都要放回原来的 master。
+#
+# 2. 绝不用 DHCP 去探测「正在当 WAN 的那个口」。那个口上 netifd 自己的 udhcpc
+#    正在跑，再来一个同 MAC 的客户端会互相抢租约、还可能搅乱上游的绑定。
+#    现用 WAN 口的死活改问 netifd（ubus network.interface.wan status）：
+#    它 up 就说明上行还在原地，直接返回、一个字节都不动。
+#
+# 用法：
+#   e2631-wanport auto            按配置跑一次（auto 模式 = 探测后落地）
+#   e2631-wanport autostart       开机用：等 lan/wan 起来再跑 auto
+#   e2631-wanport detect          只探测不改配置，打印选中的口（空 = 没探到）
+#   e2631-wanport apply <port>    直接把 WAN 绑到指定口
+#   e2631-wanport status          当前模式/绑定/网桥/各口链路
+#   e2631-wanport selftest        不碰网络的自检（配置与命名解析）
+#   DRY_RUN=1 e2631-wanport apply <port>   只打印要执行的 uci 命令
+#
+# 约定：日志都进 syslog（logger -t e2631-wanport），标准错误另打一份，便于 ssh 里看。
+set -u
+
+PROG=e2631-wanport
+CFG=e2631_ports
+# 三个路径留了环境变量口子，只为一件事：在 PC 上跑 selftest / 逻辑自检
+# （见 scripts/selftest-wanport.sh），设备上不设这些变量就是默认值。
+SYSFS=${E2631_SYSFS:-/sys}
+LOCKDIR=${E2631_LOCKDIR:-/var/lock/$PROG.lock}
+NOPSCRIPT=${E2631_NOPSCRIPT:-/usr/share/$PROG/nop.script}
+
+log() {
+	logger -t "$PROG" "$*" 2>/dev/null
+	echo "$PROG: $*" >&2
+}
+
+cfg() { uci -q get "$CFG.global.$1" 2>/dev/null; }
+
+# ---- 事实查询 -------------------------------------------------------------
+
+# 参与自适应的物理口列表
+candidates() {
+	local c
+	c=$(uci -q get "$CFG.global.candidates" 2>/dev/null)
+	[ -n "$c" ] || c="lan1 lan2 lan3 wan"
+	echo "$c"
+}
+
+# wan 接口现在绑在哪个 netdev 上
+cur_wan_dev() {
+	local d
+	d=$(uci -q get network.wan.device 2>/dev/null)
+	[ -n "$d" ] || d="wan"
+	echo "$d"
+}
+
+# br-lan 在 uci 里的段路径（network.@device[N]）；找不到就返回空
+bridge_section() {
+	local n=0 name
+	while :; do
+		name=$(uci -q get "network.@device[$n].name" 2>/dev/null) || break
+		[ -n "$name" ] || break
+		if [ "$name" = "br-lan" ]; then
+			echo "network.@device[$n]"
+			return 0
+		fi
+		n=$((n + 1))
+	done
+	echo ""
+}
+
+carrier() { cat "$SYSFS/class/net/$1/carrier" 2>/dev/null || echo 0; }
+
+# 这个口现在挂在哪个网桥上（没有就空）
+master_of() {
+	readlink -f "$SYSFS/class/net/$1/master" 2>/dev/null | sed 's|.*/||'
+}
+
+# netifd 眼里 WAN 是否已经起来（拿到地址/拨号成功）。用来代替"用 DHCP 探测现用
+# WAN 口"，理由见文件头第 2 条。
+wan_up() {
+	ubus call network.interface.wan status 2>/dev/null | grep -q '"up"[[:space:]]*:[[:space:]]*true'
+}
+
+# WAN 侧用的 MAC。DTS 给 wan 口分的是 tag+0x1f（LAN 口都是 tag+0x1e），保持
+# 这个地址不随物理口变化：上游的 DHCP 租约、MAC 过滤、IPv6 DUID 都依赖它。
+wan_mac() {
+	local m
+	m=$(cfg wan_mac)
+	[ -n "$m" ] || m=$(cat "$SYSFS/class/net/wan/address" 2>/dev/null)
+	echo "$m"
+}
+
+# ---- 探测 -----------------------------------------------------------------
+
+# probe_port <port> [timeout] —— 该口能拿到 DHCP 租约就回 0。
+# 期间临时离开网桥、临时换成 WAN 的 MAC，结束后两者都恢复。
+# 超时用自己数秒，不用 udhcpc 的 -t/-T/-A：busybox 这几个参数各版本语义不一，
+# 而且 -A 默认 20 s，能把启动过程直接拖死。
+probe_port() {
+	local port=$1 t=${2:-3} found=1 pid i
+	local oldmac nmac oldmaster flag
+	[ -d "$SYSFS/class/net/$port" ] || return 1
+	[ -f "$NOPSCRIPT" ] || { log "缺少 $NOPSCRIPT，无法探测"; return 1; }
+
+	oldmac=$(cat "$SYSFS/class/net/$port/address" 2>/dev/null)
+	oldmaster=$(master_of "$port")
+	nmac=$(wan_mac)
+	flag="/tmp/$PROG.probe.$$.$port"
+	rm -f "$flag"
+
+	ip link set dev "$port" nomaster 2>/dev/null
+	ip link set dev "$port" up 2>/dev/null
+	[ -n "$nmac" ] && ip link set dev "$port" address "$nmac" 2>/dev/null
+
+	E2631_PROBE_FLAG="$flag" udhcpc -f -n -t 1 -T "$t" -A 1 \
+		-i "$port" -s "$NOPSCRIPT" -p "/tmp/$PROG.$port.pid" >/dev/null 2>&1 &
+	pid=$!
+
+	i=0
+	while [ "$i" -lt $((t + 2)) ]; do
+		if grep -q '^bound$' "$flag" 2>/dev/null; then
+			found=0
+			break
+		fi
+		if ! kill -0 "$pid" 2>/dev/null; then
+			grep -q '^bound$' "$flag" 2>/dev/null && found=0
+			break
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+	kill "$pid" 2>/dev/null
+	wait "$pid" 2>/dev/null
+
+	[ -n "$oldmac" ] && ip link set dev "$port" address "$oldmac" 2>/dev/null
+	# 探测完必须把它放回原来的网桥，否则没被选中的口就永远掉出 br-lan 了
+	[ -n "$oldmaster" ] && ip link set dev "$port" master "$oldmaster" 2>/dev/null
+	rm -f "$flag" "/tmp/$PROG.$port.pid"
+	return $found
+}
+
+# 探测并打印选中的口；没探到打印空串
+detect() {
+	local cur t ports p first_up n
+	cur=$(cur_wan_dev)
+	t=$(cfg probe_timeout)
+	[ -n "$t" ] || t=3
+	ports=$(candidates)
+	first_up=""
+
+	# 1) 现用 WAN 口在 netifd 眼里还是好的：上行就在原地，什么都不动
+	if wan_up; then
+		echo "$cur"
+		return 0
+	fi
+
+	# 2) WAN 没起来：只探测「其他」口（现用口交给 netifd 自己重试，不再插一脚）
+	for p in $ports; do
+		[ "$p" = "$cur" ] && continue
+		[ "$(carrier "$p")" = "1" ] || continue
+		[ -n "$first_up" ] || first_up=$p
+		if probe_port "$p" "$t"; then
+			echo "$p"
+			return 0
+		fi
+	done
+
+	# 3) 兜底：PPPoE / 静态上行不会应答 DHCP。开了 assume_single_link 时，
+	#    若「只有一根线插着」且现用 WAN 口没插线，就把它当上行（盲插）。
+	if [ "$(cfg assume_single_link)" = "1" ] && [ -n "$first_up" ] \
+		&& [ "$(carrier "$cur")" != "1" ]; then
+		n=0
+		for p in $ports; do
+			[ "$(carrier "$p")" = "1" ] && n=$((n + 1))
+		done
+		if [ "$n" = "1" ]; then
+			echo "$first_up"
+			return 0
+		fi
+	fi
+
+	echo ""
+}
+
+# ---- 落地 -----------------------------------------------------------------
+
+apply_port() {
+	local port=$1 cur bp p mac
+	[ -n "$port" ] || return 1
+	[ -d "$SYSFS/class/net/$port" ] || { log "没有 $port 这个口"; return 1; }
+	cur=$(cur_wan_dev)
+	bp=$(bridge_section)
+	[ -n "$bp" ] || { log "uci 里找不到 br-lan 的 device 段，放弃"; return 1; }
+	mac=$(wan_mac)
+
+	if [ "${DRY_RUN:-0}" = "1" ]; then
+		echo "uci set network.wan.device=$port"
+		[ -n "$mac" ] && echo "uci set network.wan.macaddr=$mac"
+		echo "uci -q delete $bp.ports"
+		for p in $(candidates); do
+			[ "$p" = "$port" ] || echo "uci add_list $bp.ports=$p"
+		done
+		echo "uci commit network"
+		return 0
+	fi
+
+	uci set network.wan.device="$port"
+	[ -n "$mac" ] && uci set network.wan.macaddr="$mac"
+	# wan6 若显式绑了设备，跟着走（绑 @wan 的不用管）
+	if [ -n "$(uci -q get network.wan6.device 2>/dev/null)" ]; then
+		uci set network.wan6.device="$port"
+	fi
+	# MAC 只在第一次算出来时固化，之后一直用它
+	[ -n "$mac" ] && [ -z "$(cfg wan_mac)" ] && uci set "$CFG.global.wan_mac"="$mac"
+
+	uci -q delete "$bp.ports"
+	for p in $(candidates); do
+		[ "$p" = "$port" ] || uci add_list "$bp.ports=$p"
+	done
+	uci commit network
+	uci commit "$CFG" 2>/dev/null
+
+	log "WAN 口 -> $port（原来 $cur）"
+	[ -x /etc/init.d/network ] && /etc/init.d/network reload >/dev/null 2>&1
+	return 0
+}
+
+# ---- 主流程 ---------------------------------------------------------------
+
+lock() {
+	mkdir -p "$(dirname "$LOCKDIR")" 2>/dev/null
+	if mkdir "$LOCKDIR" 2>/dev/null; then
+		date +%s >"$LOCKDIR/ts" 2>/dev/null
+		return 0
+	fi
+	# 陈旧锁（上一轮被 kill -9 之类）超过 5 分钟直接接管
+	local ts now
+	ts=$(cat "$LOCKDIR/ts" 2>/dev/null || echo 0)
+	now=$(date +%s 2>/dev/null || echo 0)
+	if [ "$now" -gt 0 ] && [ $((now - ts)) -gt 300 ]; then
+		rm -rf "$LOCKDIR"
+		mkdir "$LOCKDIR" 2>/dev/null && return 0
+	fi
+	return 1
+}
+unlock() { rm -rf "$LOCKDIR" 2>/dev/null; }
+
+do_auto() {
+	local mode port chosen m
+	if [ "$(cfg enabled)" = "0" ]; then
+		log "已在 $CFG 里禁用"
+		return 0
+	fi
+	mode=$(cfg mode)
+	[ -n "$mode" ] || mode=auto
+
+	if [ "$mode" = "manual" ]; then
+		port=$(cfg manual_port)
+		[ -n "$port" ] || port=wan
+		chosen=$port
+	else
+		if ! lock; then
+			log "另一个实例正在跑，跳过"
+			return 0
+		fi
+		trap 'unlock' EXIT INT TERM
+		chosen=$(detect)
+		if [ -z "$chosen" ]; then
+			log "没探测到上行口，保持 $(cur_wan_dev) 不动"
+			return 0
+		fi
+	fi
+
+	if [ "$chosen" = "$(cur_wan_dev)" ]; then
+		# 保持在同一个口时仍然把 MAC 固化下来，方便以后换口
+		if [ -z "$(cfg wan_mac)" ]; then
+			m=$(wan_mac)
+			[ -n "$m" ] && { uci set "$CFG.global.wan_mac"="$m"; uci commit "$CFG"; }
+		fi
+		log "上行口仍是 $chosen，不动作"
+		return 0
+	fi
+
+	apply_port "$chosen"
+}
+
+do_autostart() {
+	local i=0
+	# 等 netifd 把 lan / wan 建起来（ubus 对象出现为准），最多 40 s
+	while [ "$i" -lt 40 ]; do
+		if ubus call network.interface.lan status >/dev/null 2>&1 \
+			&& ubus call network.interface.wan status >/dev/null 2>&1; then
+			break
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+	do_auto
+}
+
+do_status() {
+	local ports p bp
+	ports=$(candidates)
+	bp=$(bridge_section)
+	echo "mode            : $(cfg mode)  (enabled=$(cfg enabled))"
+	echo "wan device      : $(cur_wan_dev)"
+	if wan_up; then echo "wan up (netifd) : yes"; else echo "wan up (netifd) : no"; fi
+	echo "manual_port     : $(cfg manual_port)"
+	echo "probe_timeout   : $(cfg probe_timeout)"
+	echo "assume_single   : $(cfg assume_single_link)"
+	echo "wan mac         : $(wan_mac)  (固化值: $(cfg wan_mac))"
+	echo "br-lan section  : ${bp:-<找不到>}"
+	[ -n "$bp" ] && echo "br-lan ports    : $(uci -q get "$bp.ports" 2>/dev/null)"
+	echo "ports:"
+	for p in $ports; do
+		printf '  %-5s state=%-7s carrier=%s speed=%-5s master=%-7s mac=%s\n' \
+			"$p" \
+			"$(cat "$SYSFS/class/net/$p/operstate" 2>/dev/null || echo -)" \
+			"$(carrier "$p")" \
+			"$(cat "$SYSFS/class/net/$p/speed" 2>/dev/null || echo -)" \
+			"$(master_of "$p")" \
+			"$(cat "$SYSFS/class/net/$p/address" 2>/dev/null || echo -)"
+	done
+}
+
+# 不碰网络的自检：只验证配置解析与命名，不探测、不改配置
+do_selftest() {
+	local ports p bp ok=0
+	ports=$(candidates)
+	bp=$(bridge_section)
+	echo "candidates : $ports"
+	echo "bridge     : ${bp:-<none>}"
+	echo "cur wan    : $(cur_wan_dev)"
+	echo "wan mac    : $(wan_mac)"
+	for p in $ports; do
+		if [ -d "$SYSFS/class/net/$p" ]; then
+			echo "  $p ok"
+		else
+			echo "  $p MISSING"
+			ok=1
+		fi
+	done
+	[ -n "$bp" ] || { echo "br-lan 段缺失"; ok=1; }
+	[ -f "$NOPSCRIPT" ] || { echo "$NOPSCRIPT 缺失"; ok=1; }
+	command -v udhcpc >/dev/null 2>&1 || { echo "udhcpc 缺失"; ok=1; }
+	command -v ubus >/dev/null 2>&1 || { echo "ubus 缺失"; ok=1; }
+	[ "$ok" = "0" ] && echo "selftest OK"
+	return $ok
+}
+
+main() {
+	local action=${1:-}
+	case "$action" in
+	auto) do_auto ;;
+	autostart) do_autostart ;;
+	detect)
+		lock && { trap 'unlock' EXIT INT TERM; detect; } || log "另一个实例正在跑"
+		;;
+	apply)
+		shift
+		apply_port "${1:-}"
+		;;
+	status) do_status ;;
+	selftest) do_selftest ;;
+	*)
+		sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+		exit 2
+		;;
+	esac
+}
+
+main "$@"

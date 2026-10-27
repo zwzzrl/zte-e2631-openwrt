@@ -1,0 +1,22 @@
+#!/bin/sh
+# lan/wan 接口起来或更新时重跑一次"上行口判定"，覆盖换线、拔插的场景。
+#
+# 去抖是必须的：e2631-wanport 自己改完配置会 reload network，reload 又会产生
+# ifup/ifupdate 事件，不设窗口就成了自激循环。窗口 20 s 内的重复事件直接丢掉。
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifupdate" ] || exit 0
+case "$INTERFACE" in
+lan | wan) ;;
+*) exit 0 ;;
+esac
+
+[ "$(uci -q get e2631_ports.global.enabled)" = "0" ] && exit 0
+
+STAMP=/var/run/e2631-wanport.stamp
+now=$(date +%s 2>/dev/null || echo 0)
+last=$(cat "$STAMP" 2>/dev/null || echo 0)
+if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 20 ]; then
+	exit 0
+fi
+echo "$now" >"$STAMP" 2>/dev/null
+
+( /sbin/e2631-wanport auto >/dev/null 2>&1 ) &
