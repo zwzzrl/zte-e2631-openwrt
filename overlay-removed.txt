@@ -10,3 +10,6 @@
 target/linux/sanechips/base-files/etc/init.d/e2631-wanport
 target/linux/sanechips/base-files/etc/hotplug.d/iface/21-e2631-wanport
 target/linux/sanechips/base-files/usr/share/e2631-wanport/nop.script
+# v1.5：PPE 引擎从内核树搬到 package/kernel/kmod-e2631-ppe/src，
+# 老树里那份会被内核构建继续带进去，所以要删掉。
+target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128s-ppe.c

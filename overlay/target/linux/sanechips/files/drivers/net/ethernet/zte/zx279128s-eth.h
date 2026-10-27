@@ -336,10 +336,15 @@ struct zx_eth_adapter {
 	struct mutex		mib_lock;
 	struct delayed_work	mib_work;
 
+	/* Where zx_eth_for_each_adapter() finds this adapter, for the packet
+	 * processor module: it is loaded long after probe, and has to program
+	 * the tables of adapters it did not get a probe callback for.
+	 */
+	struct list_head	list;
+
 	/* Hardware flow offload (packet processor NAT) */
 	struct mutex		ppe_lock;
 	bool			ppe_active;
-	int			ppe_users;	/* bound flowtables */
 	struct rhashtable	ppe_flows;
 	DECLARE_BITMAP(ppe_hash_used, ZX_PPE_HASH_SIZE);
 	DECLARE_BITMAP(ppe_flow_used, ZX_PPE_FLOWS);
@@ -373,16 +378,31 @@ struct zx_eth_adapter {
 	struct notifier_block	sw_switchdev_blocking_nb;
 };
 
+/* MAC in the layout of the switch's MAC registers: bytes 2-5, then 0-1 */
+static inline void zx_mac_words(const u8 *mac, u32 *w)
+{
+	w[0] = mac[2] << 24 | mac[3] << 16 | mac[4] << 8 | mac[5];
+	w[1] = mac[0] << 8 | mac[1];
+}
+
 /* zx279128s-main.c */
 bool zx_eth_is_port(const struct net_device *dev);
 void zx_set_trap_dmac(struct zx_eth_adapter *adapter, int idx, const u8 *mac);
-
-/* zx279128s-ppe.c */
-extern const struct rhashtable_params zx_ppe_ht_params;
 void zx_update_traps(struct zx_eth_adapter *adapter);
 void zx_update_mac_tables(struct zx_eth_adapter *adapter);
-int zx_eth_setup_tc(struct net_device *dev, enum tc_setup_type type,
-		    void *type_data);
+bool zx_ppe_has_bound_blocks(struct zx_eth_adapter *adapter);
+/* Visit every probed adapter.  For the packet processor module, which is
+ * loaded after the platform devices have probed.  The callback runs without
+ * the adapter list lock and may sleep; it must not probe or remove a device.
+ */
+void zx_eth_for_each_adapter(void (*fn)(struct zx_eth_adapter *adapter,
+				       void *data), void *data);
+
+/* The packet processor engine (zx279128s-ppe.h): the switch driver is built
+ * in, the engine is the kmod.  Everything that crosses that boundary - the
+ * hooks table, the flow table parameters and the entry type - is declared
+ * there.
+ */
 
 /* zx279128s-switch.c */
 void zx_sw_init(struct zx_eth_adapter *adapter);

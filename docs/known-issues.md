@@ -143,7 +143,9 @@ points at something in the repository or at a measurement.
     unverified is only the ipv6=1 path itself.
     Step 1 of that bisect was then run on the same boot (03:24): `echo 1 >
     /sys/module/zx279128s_eth/parameters/ipv6` followed by `/etc/init.d/firewall restart` to
-    rebind the flowtable. zx_ppe_start() programmed both v6 tables and still reached its
+    rebind the flowtable. (The path is `/sys/module/zx279128s_ppe/parameters/ipv6` since
+    v1.5, when the engine became package kmod-e2631-ppe; the old zx279128s_eth path no
+    longer exists.) zx_ppe_start() programmed both v6 tables and still reached its
     "hardware flow offload enabled" line, which only prints when those writes returned 0;
     uptime stayed continuous (292 -> 324 s, no reboot) and dmesg showed no fault. From the LAN
     side, IPv6 ping6 was 4/4, TCP 22 and 80 connected, and HTTP over IPv6 returned 200 - so

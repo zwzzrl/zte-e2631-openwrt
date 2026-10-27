@@ -103,6 +103,34 @@ area rather than OOB (on-die ECC regenerates page ECC on every program, so a pag
 twice reads back uncorrectable - patches 029/030), and USB left disabled (probing an
 unpopulated controller reboots this SoC).
 
+## The Ethernet driver, and the one part of it that is a module
+
+`zx279128s-main.c` (DMA engine, the five netdevices, phylink, the traps) and
+`zx279128s-switch.c` (hardware forwarding between the ports of one Linux bridge) are
+built into the kernel. The packet processor - the classifier index/rule tables, the two
+classifier hash banks, the rewrite tables and the IPv6 tables - is package
+`kmod-e2631-ppe`, because that is the part that keeps being worked on: linked into the
+built-in driver, every edit under `target/linux/sanechips/files/...` invalidates the
+kernel's prepared stamp and rebuilds ~1900 objects (45 minutes on this machine); as a
+package it is one `.ko`.
+
+What crosses the boundary, and what deliberately does not:
+
+* The **hooks table** (`zx279128s-ppe.h`) is stored in the built-in driver, not in the
+  module. Every call snapshots it and takes a module reference, so an unload cannot pull
+  code out from under a call in progress; with no engine registered the call reports
+  `-EOPNOTSUPP`, which is exactly "this flow stays on the software path".
+* The **flow table** (`adapter->ppe_flows`) and its `rhashtable_params` belong to the
+  core, because the table is initialised at probe - long before kmodloader runs.
+* **`ndo_setup_tc` and the `flow_block` callbacks stay in the core.** They hand the TC
+  core a function pointer that must outlive an unload: the callbacks are the trampolines,
+  the classifier work behind them is the module's. An unload therefore leaves TC with
+  valid callbacks that refuse, not with dangling ones.
+* The module is **autoloaded from `/etc/init.d/boot`**, before `/etc/rc.d/S19firewall`
+  binds the nft flowtable through `ndo_setup_tc`; a bind that arrives with no engine
+  registered is refused and never retried. Reloading the module at runtime (which is the
+  point of the split) therefore ends with `/etc/init.d/firewall restart` to bind again.
+
 ## Wi-Fi, and why it is off by default
 
 The MT7916 is a PCIe card at `0000:01:00.0` (`14c3:7906`) whose second function

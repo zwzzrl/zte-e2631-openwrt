@@ -15,7 +15,7 @@
 #include <linux/slab.h>
 #include <net/flow_offload.h>
 
-#include "zx279128s-eth.h"
+#include "zx279128s-ppe.h"
 
 /* ---- Hardware flow offload ------------------------------------------ */
 
@@ -35,27 +35,19 @@
  * trusted yet -- with the IPv6 tables in place, a single IPv6 frame could
  * wedge the switch and take IPv4 down with it, so they stay off and IPv6
  * keeps the CPU path.  Details in docs/known-issues.md (PPE-IPV6-TCP).
+ *
+ * This file is package kmod-e2631-ppe, not part of the kernel: the classifier,
+ * the hash banks and the rewrite tables are exactly the part that keeps being
+ * worked on, and a change here has to rebuild one .ko instead of the whole
+ * kernel.  The switch driver (zx279128s-main.c) stays built in and reaches this
+ * engine through the hooks table in zx279128s-ppe.h; what must not move across
+ * the boundary is anything the kernel keeps a pointer to (the flow_block
+ * callbacks), which is why ndo_setup_tc lives on that side.
  */
 
 static bool zx_ppe_ipv6;
 module_param_named(ipv6, zx_ppe_ipv6, bool, 0644);
 MODULE_PARM_DESC(ipv6, "program the IPv6 classifier tables (experimental, default off)");
-
-struct zx_ppe_entry {
-	struct rhash_head	node;
-	unsigned long		cookie;
-	u16			hash;	/* 0-255 bank 0, 256-383 bank 1 */
-	u16			flow;
-	u16			nh;
-	u8			subnet;
-};
-
-const struct rhashtable_params zx_ppe_ht_params = {
-	.head_offset		= offsetof(struct zx_ppe_entry, node),
-	.key_offset		= offsetof(struct zx_ppe_entry, cookie),
-	.key_len		= sizeof(unsigned long),
-	.automatic_shrinking	= true,
-};
 
 static u32 zx_pp_data_reg(u32 blk, int i)
 {
@@ -108,13 +100,6 @@ static int zx_pp_read_word0(struct zx_eth_adapter *adapter, u32 blk, u32 table,
 	if (!ret)
 		*val = readl(adapter->base + blk + ZX_PP_IND_DATA);
 	return ret;
-}
-
-/* MAC in the layout of the switch's MAC registers: bytes 2-5, then 0-1 */
-static void zx_mac_words(const u8 *mac, u32 *w)
-{
-	w[0] = mac[2] << 24 | mac[3] << 16 | mac[4] << 8 | mac[5];
-	w[1] = mac[0] << 8 | mac[1];
 }
 
 /* Set @width bits at bit @pos of a little-endian bit string */
@@ -673,81 +658,7 @@ static const u32 zx_ppe_sub[2] = { 0xfc000000, 0x00001fff };
 static const u32 zx_ppe_regs[4] = { 0x38c088, 0x38c094, 0x38c098, 0x39c034 };
 static const u32 zx_ppe_reg_vals[4] = { 0x7fff, 4, 0x7fff7fff, 0x3d };
 
-/*
- * Traps that send frames to the CPU before the flow lookup: the IPv4
- * ethertype trap, and the registered packet class for TCP segments without
- * payload (trap reason 0x2c), which would send every pure ACK of an
- * offloaded connection through the software path.  Both are off while
- * offload is active.  SYN, FIN and RST still reach the CPU, so conntrack
- * sees connections open and close.  Frames for the router, broadcast,
- * multicast and unknown unicast still reach the CPU through the other traps.
- *
- * The IPv6 ethertype trap stays on in every state: the classifier has no
- * IPv6 rule it can trust (see zx_ppe_ipv6), and once offload is active the
- * ports' MACs live in the ONU "routed" table instead of the trap table, so
- * an un-trapped IPv6 frame would have no way back to the stack -- that is
- * exactly how IPv6 TCP used to stall once the flowtable was handed to the
- * PPE.  IPv6 therefore keeps the CPU path (it is still switched in
- * hardware); only IPv4 is offloaded.
- */
-void zx_update_traps(struct zx_eth_adapter *adapter)
-{
-	void __iomem *base = adapter->base;
-	bool fwd;
-	u32 val;
 
-	spin_lock(&adapter->trap_lock);
-	fwd = READ_ONCE(adapter->ppe_active) || READ_ONCE(adapter->sw_members);
-	writel((fwd ? 0 : ETH_P_IP << 16) | ETH_P_IPV6,
-	       base + ZX_SPA_TRAP_ETH_TYPE);
-	val = readl(base + ZX_SPA_UP_REG_PKT_EN + 8);
-	if (fwd)
-		val &= ~ZX_SPA_REG_PKT_TCP_ACK;
-	else
-		val |= ZX_SPA_REG_PKT_TCP_ACK;
-	writel(val, base + ZX_SPA_UP_REG_PKT_EN + 8);
-	spin_unlock(&adapter->trap_lock);
-}
-
-/*
- * Frames to the ports' own addresses reach the CPU through the trap table,
- * or with flow offload active, through the ONU MAC table, which marks them
- * as routed so that the classifier sees them first.  Addresses beyond the
- * trap table still reach the CPU as unknown unicast.  Called with ppe_lock
- * held, after an address or the offload state changed.
- */
-void zx_update_mac_tables(struct zx_eth_adapter *adapter)
-{
-	static const u8 none[ETH_ALEN];
-	void __iomem *base = adapter->base;
-	const u8 *addrs[ZX_NUM_PORTS];
-	int i, j, n = 0;
-	u32 w[2];
-
-	lockdep_assert_held(&adapter->ppe_lock);
-
-	/* each distinct port address once */
-	for (i = 0; i < ZX_NUM_PORTS; i++) {
-		struct net_device *dev = adapter->ports[i];
-
-		if (!dev)
-			continue;
-		for (j = 0; j < n; j++)
-			if (ether_addr_equal(addrs[j], dev->dev_addr))
-				break;
-		if (j == n)
-			addrs[n++] = dev->dev_addr;
-	}
-
-	for (i = 0; i < ZX_SPA_ONU_MAC_NUM; i++) {
-		zx_mac_words(adapter->ppe_active && i < n ? addrs[i] : none, w);
-		writel(w[0], base + ZX_SPA_ONU_MAC + i * 8);
-		writel(w[1], base + ZX_SPA_ONU_MAC + i * 8 + 4);
-	}
-	for (i = 0; i < ZX_SPA_TRAP_DMAC_NUM; i++)
-		zx_set_trap_dmac(adapter, i,
-				 !adapter->ppe_active && i < n ? addrs[i] : none);
-}
 
 /*
  * Routed frames must reach the classifier: mark our MACs as routed (ONU
@@ -829,16 +740,15 @@ static void zx_ppe_stop(struct zx_eth_adapter *adapter)
 	dev_info(adapter->dev, "hardware flow offload disabled\n");
 }
 
-static int zx_ppe_block_cb(enum tc_setup_type type, void *type_data, void *cb_priv)
+/* FLOW_CLS_REPLACE / DESTROY / STATS for one flow.  The caller is the
+ * flow-block trampoline in the built-in driver, which holds adapter->ppe_lock
+ * and a reference on this module for the duration of the call.
+ */
+static int zx_ppe_flow_cb(struct zx_eth_adapter *adapter,
+			  struct flow_cls_offload *f)
 {
-	struct zx_eth_adapter *adapter = cb_priv;
-	struct flow_cls_offload *f = type_data;
 	int ret;
 
-	if (type != TC_SETUP_CLSFLOWER)
-		return -EOPNOTSUPP;
-
-	mutex_lock(&adapter->ppe_lock);
 	switch (f->command) {
 	case FLOW_CLS_REPLACE:
 		ret = zx_ppe_flow_add(adapter, f);
@@ -856,71 +766,74 @@ static int zx_ppe_block_cb(enum tc_setup_type type, void *type_data, void *cb_pr
 	default:
 		ret = -EOPNOTSUPP;
 	}
-	mutex_unlock(&adapter->ppe_lock);
 	return ret;
 }
 
-static LIST_HEAD(zx_ppe_block_cb_list);
+/* ---- module glue --------------------------------------------------- */
 
-/* One callback for the flowtable of all port netdevs, so each flow is
- * offered once.
+static const struct zx_ppe_hooks zx_ppe_kmod_hooks = {
+	.owner			= THIS_MODULE,
+	.flow_cb		= zx_ppe_flow_cb,
+	.start			= zx_ppe_start,
+	.stop			= zx_ppe_stop,
+};
+
+/*
+ * A load has to pick up the flowtable bindings that were made without it.  TC
+ * keeps its blocks across an unload (their callbacks live in the built-in
+ * driver), so a module that comes back finds a bound flowtable and torn-down
+ * tables; the core answers whether anything is still bound.
  */
-int zx_eth_setup_tc(struct net_device *dev, enum tc_setup_type type,
-		    void *type_data)
+static void zx_ppe_attach(struct zx_eth_adapter *adapter, void *data)
 {
-	struct zx_eth_priv *priv = netdev_priv(dev);
-	struct zx_eth_adapter *adapter = priv->adapter;
-	struct flow_block_offload *f = type_data;
-	struct flow_block_cb *block_cb;
-	int ret = 0;
-
-	if (type != TC_SETUP_FT)
-		return -EOPNOTSUPP;
-	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
-		return -EOPNOTSUPP;
-
-	f->driver_block_list = &zx_ppe_block_cb_list;
-	block_cb = flow_block_cb_lookup(f->block, zx_ppe_block_cb, adapter);
-
-	switch (f->command) {
-	case FLOW_BLOCK_BIND:
-		if (block_cb) {
-			flow_block_cb_incref(block_cb);
-			return 0;
-		}
-		block_cb = flow_block_cb_alloc(zx_ppe_block_cb, adapter, adapter, NULL);
-		if (IS_ERR(block_cb))
-			return PTR_ERR(block_cb);
-		/* A ruleset reload binds the new flowtable before it unbinds the
-		 * old one, so keep the hardware on while any flowtable is bound.
-		 */
-		mutex_lock(&adapter->ppe_lock);
-		if (!adapter->ppe_users)
-			ret = zx_ppe_start(adapter);
-		if (!ret)
-			adapter->ppe_users++;
-		mutex_unlock(&adapter->ppe_lock);
-		if (ret) {
-			flow_block_cb_free(block_cb);
-			return ret;
-		}
-		flow_block_cb_incref(block_cb);
-		flow_block_cb_add(block_cb, f);
-		list_add_tail(&block_cb->driver_list, &zx_ppe_block_cb_list);
-		return 0;
-	case FLOW_BLOCK_UNBIND:
-		if (!block_cb)
-			return -ENOENT;
-		if (!flow_block_cb_decref(block_cb)) {
-			flow_block_cb_remove(block_cb, f);
-			list_del(&block_cb->driver_list);
-			mutex_lock(&adapter->ppe_lock);
-			if (!--adapter->ppe_users)
-				zx_ppe_stop(adapter);
-			mutex_unlock(&adapter->ppe_lock);
-		}
-		return 0;
-	default:
-		return -EOPNOTSUPP;
+	mutex_lock(&adapter->ppe_lock);
+	if (!adapter->ppe_active && zx_ppe_has_bound_blocks(adapter)) {
+		if (zx_ppe_start(adapter))
+			dev_warn(adapter->dev, "hardware flow offload could not be re-enabled\n");
 	}
+	mutex_unlock(&adapter->ppe_lock);
 }
+
+/*
+ * An unload deliberately leaves the flowtable bindings alone - their callbacks
+ * live in the built-in driver, so they outlive this module.  Only the hardware
+ * state goes away with the code; the next load picks the bindings back up
+ * (zx_ppe_attach), and so does a later bind after a ruleset reload.
+ */
+static void zx_ppe_detach(struct zx_eth_adapter *adapter, void *data)
+{
+	mutex_lock(&adapter->ppe_lock);
+	if (adapter->ppe_active)
+		zx_ppe_stop(adapter);
+	mutex_unlock(&adapter->ppe_lock);
+}
+
+static int __init zx_ppe_init(void)
+{
+	int ret;
+
+	ret = zx_ppe_hooks_register(&zx_ppe_kmod_hooks);
+	if (ret) {
+		pr_err("zx279128s-ppe: the switch driver refused the hooks (%d); another engine is registered\n",
+		       ret);
+		return ret;
+	}
+
+	zx_eth_for_each_adapter(zx_ppe_attach, NULL);
+	pr_info("zx279128s-ppe: engine loaded, IPv6 classifier %s\n",
+		zx_ppe_ipv6 ? "on (experimental)" : "off");
+	return 0;
+}
+
+static void __exit zx_ppe_exit(void)
+{
+	zx_ppe_hooks_unregister(&zx_ppe_kmod_hooks);
+	zx_eth_for_each_adapter(zx_ppe_detach, NULL);
+}
+
+module_init(zx_ppe_init);
+module_exit(zx_ppe_exit);
+
+MODULE_AUTHOR("Navid Ghahremani <ghahramani.navid@gmail.com>");
+MODULE_DESCRIPTION("ZTE zx279128s Ethernet switch: hardware flow offload engine");
+MODULE_LICENSE("GPL");

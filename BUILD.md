@@ -236,3 +236,43 @@ Four rules that exist because breaking them cost hours:
 
 `docs/architecture.md` maps the pieces and `docs/known-issues.md` is the machine-readable
 honest list, including what is still broken on real hardware.
+
+## 9. The fast loop, for the one part of the driver that is a module
+
+Everything under `overlay/target/linux/sanechips/files/` is copied into the kernel tree
+*before* the patches, so any edit there invalidates the kernel's prepared stamp and
+rebuilds the whole kernel - ~1900 objects, 45 minutes on the machine this was written on.
+That is the wrong loop for the packet processor (the classifier tables, the two hash
+banks, the rewrite tables, the IPv6 tables), which is exactly the part that keeps being
+worked on. It is therefore package `overlay/package/kernel/kmod-e2631-ppe` instead of the
+third object of the built-in driver, and a change there is:
+
+    make package/kernel/kmod-e2631-ppe/compile     # seconds, not minutes
+    scp build_dir/*/linux-*/kmod-e2631-ppe/zx279128s-ppe.ko root@192.168.1.1:/tmp/
+    ssh root@192.168.1.1 'modprobe -r zx279128s_ppe; \
+        insmod /tmp/zx279128s-ppe.ko; /etc/init.d/firewall restart'
+
+The `firewall restart` is not cosmetic: binding the nft flowtable happens through
+`ndo_setup_tc` at firewall start, and a bind that arrives with no engine registered is
+refused and never retried. `docs/architecture.md` describes what may and may not cross the
+boundary, and why the `flow_block` callbacks have to stay on the built-in side.
+
+Two things that will otherwise cost you a wasted build:
+
+* The shared headers (`zx279128s-eth.h`, `zx279128s-ppe.h`) still live in the kernel tree,
+  because the built-in driver includes them; `src/Makefile` adds
+  `-I$(srctree)/drivers/net/ethernet/zte` instead of keeping a second copy. Editing a
+  *header* is still a full kernel rebuild - only `.c` files in the package are cheap.
+* The link set is changed by `patches-6.18/033`, not by a `Makefile` in `files/`: a file
+  that patch 021 creates as a new file cannot also be shipped by the overlay, since the
+  overlay is copied first and 021 would then fail with "already exists".
+
+**`DEVICE_PACKAGES` in `image/Makefile.e2631` does not reach `.config` on its own.** It is
+expanded into `tmp/.targetinfo`, which is only regenerated when something named `Makefile`
+or `*.mk` under `target/linux` changes (`include/scan.mk`, `SCAN_DEPS=... image/Makefile
+image/*.mk`); `image/Makefile.e2631` is neither, so adding a package there leaves
+`make defconfig` reporting success with the package still "not set". Select it in
+`seed/e2631.config` as well - that is what the seed is for (the same trap is why
+`kmod-mt7916-firmware` has an explicit line there). Confirm with `grep
+CONFIG_PACKAGE_kmod-e2631-ppe .config`, never with the image Makefile.
+

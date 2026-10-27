@@ -1,0 +1,26 @@
+From: E2631 port
+Subject: [PATCH] net: ethernet: zte: build the PPE engine as a module
+
+zx279128s-ppe.c is the part of this driver that keeps changing: the
+classifier tables, the two hash banks, the rewrite tables and the IPv6
+tables.  Linked into the built-in driver it drags the whole kernel through a
+rebuild on every edit (the target's files/ overlay invalidates the prepared
+stamp: ~1900 objects, 45 minutes here).  Package kmod-e2631-ppe compiles the
+same source out of tree instead, and the .ko can be replaced on a running
+board.
+
+The source and the headers the engine needs are unchanged in location: the
+package borrows them (src/Makefile adds -I$(srctree)/drivers/net/ethernet/zte)
+rather than keeping a second copy.  So only the link set changes here.
+
+The boundary itself (what may cross between the built-in driver and the
+module, and why the flow_block callbacks must not) is documented in
+zx279128s-ppe.h, which the target ships next to the driver sources.
+
+--- a/drivers/net/ethernet/zte/Makefile
++++ b/drivers/net/ethernet/zte/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ obj-$(CONFIG_ZX279128S_ETH) += zx279128s-eth.o
+-zx279128s-eth-y := zx279128s-main.o zx279128s-ppe.o zx279128s-switch.o
++zx279128s-eth-y := zx279128s-main.o zx279128s-switch.o
