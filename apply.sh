@@ -34,7 +34,13 @@ cp -r "$HERE/overlay/." "$TREE/"
 # before, so it still gets built into the image - that is how the removed
 # e2631-wanport init script, hotplug hook and udhcpc nop script survived a
 # re-apply in v1.4. overlay-removed.txt is the list apply.sh must delete.
-if [ -f "$HERE/overlay-removed.txt" ]; then
+if [ -f "$HERE/overlay-removed.txt" ] && [ ! -r "$HERE/overlay-removed.txt" ]; then
+	# Loud on purpose: an unreadable list silently leaves the stale files in the
+	# tree, and the only symptom is "I deleted it, why is it still in the image".
+	echo "apply.sh: cannot read $HERE/overlay-removed.txt (mode $(ls -l "$HERE/overlay-removed.txt" | cut -c1-10)); stale files stay in the tree" >&2
+	exit 1
+fi
+if [ -r "$HERE/overlay-removed.txt" ]; then
 	gone=0
 	while IFS= read -r f; do
 		case "$f" in ''|\#*) continue ;; esac

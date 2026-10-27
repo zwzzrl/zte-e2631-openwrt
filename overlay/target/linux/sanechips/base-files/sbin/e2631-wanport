@@ -61,7 +61,12 @@ master_of() {
 }
 
 # 口的出厂（DTS 分配）地址。sysfs 里没有 permaddr，只有 ip 通过 netlink 拿得到。
-# 这个值不受 ip link set 影响，所以是「这块板子给 wan 口的固定地址」的正确来源。
+# 这个值不受 ip link set 影响，所以是"这块板子给 wan 口的固定地址"的正确来源。
+#
+# 注意 ip 的脾气（2026-10-27 在真机上核对过）：**只有当前地址和出厂地址不同时**，
+# `ip -o link show` 才会打出 permaddr 字段；两者相等时那一行里根本没有它。所以调用
+# 方必须接受"取不到"这个结果——取不到恰恰说明活动地址就等于出厂地址，回退到活动
+# 地址拿到的还是同一个值，两种情况下答案都正确。
 perm_addr() {
 	ip -o link show dev "$1" 2>/dev/null \
 		| sed -n 's/.*permaddr \([0-9a-fA-F:]\{17\}\).*/\1/p' | head -n 1

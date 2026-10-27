@@ -69,16 +69,22 @@ cat >"$BIN/ip" <<'EOF'
 S=${E2631_SYSFS:-$TMP/sys}
 echo "ip $*" >>"$TMP/ip.log"
 # 只模拟两种：
-# 1) `ip -o link show dev X`：真机会带 permaddr（出厂地址，ip link set 改不掉），
-#    脚本用它当 WAN MAC 的来源，所以假 ip 也得能吐出来；
+# 1) `ip -o link show dev X`：真机的脾气是在这里**只在当前地址与出厂地址不同时**
+#    才打出 permaddr（相等时那一行里根本没有这个字段，2026-10-27 在 E2631 上
+#    逐条核对过）。脚本拿它当 WAN MAC 的首选来源，所以假 ip 必须照这个规则来，
+#    否则测不出"取不到就回退到活动地址"那条路。
 # 2) `ip link set dev X address Y`：netifd 改的是 netdev 地址，脚本里也靠它还原，
 #    所以 sysfs 里的 address 得跟着动。
 if [ "${1:-}" = "-o" ] && [ "${2:-}" = "link" ] && [ "${3:-}" = "show" ]; then
 	dev=${5:-}
+	addr="$S/class/net/$dev/address"
 	perm="$S/class/net/$dev/permaddr"
-	if [ -n "$dev" ] && [ -f "$perm" ]; then
-		printf '5: %s: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN\n' "$dev" \
-			| sed "s|\$|    link/ether $(cat "$S/class/net/$dev/address" 2>/dev/null) brd ff:ff:ff:ff:ff:ff permaddr $(cat "$perm")|"
+	if [ -n "$dev" ] && [ -f "$addr" ]; then
+		line="link/ether $(cat "$addr") brd ff:ff:ff:ff:ff:ff"
+		if [ -f "$perm" ] && [ "$(cat "$perm")" != "$(cat "$addr")" ]; then
+			line="$line permaddr $(cat "$perm")"
+		fi
+		printf '5: %s: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN group default qlen 1000\\    %s\n' "$dev" "$line"
 	fi
 	exit 0
 fi
@@ -346,6 +352,10 @@ echo "== 14. WAN MAC 取 wan 口的出厂地址，不取它当前的活动地址
 reset
 PWM=$(cat "$SYS/wan/permaddr")
 LANM=$(cat "$SYS/br-lan/address")
+# A. 出厂状态：活动地址 == 出厂地址，真机的 ip 这时**不打** permaddr 字段，脚本
+#    回退到活动地址，拿到的还是同一个值。
+out=$(run status)
+echo "$out" | grep -q "wan mac         : $PWM" || fail "出厂状态下 wan mac 不对：$(echo "$out" | grep 'wan mac')"
 run apply lan2 >/dev/null
 [ "$(getdb e2631_ports.global.wan_mac)" = "$PWM" ] || fail "固化值应取出厂地址 $PWM，实际 $(getdb e2631_ports.global.wan_mac)"
 [ "$(cat "$SYS/wan/address")" = "$LANM" ] || fail "wan 口回到网桥后没恢复 LAN 基址：$(cat "$SYS/wan/address")"
