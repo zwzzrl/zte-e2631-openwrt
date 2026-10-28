@@ -152,6 +152,43 @@ points at something in the repository or at a measurement.
     are in the hardware (zx_ppe_set_v6_offload()), so a module that fails to program
     them leaves the box on the old, safe path.
   next: |
+    * The v6 lookup does engage - and still matches nothing (2026-10-28, second round).
+      Feeding the emulator the values the hardware really holds changed what its stubs
+      return, and that in turn produced the first hardware observation that moves:
+        - The polynomial config is not a raw register copy.  cla_get_hash_poly_config
+          splits ONU register 12 into eight 2-bit fields (register bits 0/2/4/6 into
+          out[0..3], 16/18/22 into out[4..7]); the real register is 0x00e400e4, so the
+          fields are 0,1,0,3,0,1,0,3.  Feeding it the raw value makes the vendor code
+          reject its own arguments ("[cla_acl_hash_addr_gen]input invalid parameter"),
+          which is what "porting the vendor path" looks like when a stub lies.
+        - With real values, the vendor's CLA init is: tm_acl_fast_init writes rule 144
+          and 145 (IPv4 up/down) and rule 2 and 3 (IPv6 up/down, byte-identical to
+          zx_ppe_v6_rule) plus index[9] word4 = 1 and index[10] word4 = 4; and
+          tm_pon_pp_cla_initial writes ONU register 3 (CLA+0x80) = 0x00000e00, register
+          13 (CLA+0x94, outer hash space) = 8 i.e. outer_hash_num=2, registers 6/14/16
+          (CLA+0x88/0x98) = 0x3fff and 0x3fff3fff, register 21 (CLA+0xcc) = 0.  The
+          bootloader leaves 0x80 = 0x0000301a, and this driver writes 0x94 = 4 itself.
+        - cla_set_hash_table() splits 520 slots over FIVE table ids, not two: 0..255 ->
+          table 2, 256..383 -> table 3, 384..447 -> table 4, 448..511 -> table 5,
+          512..519 -> table 6.  The driver only ever allocated from the first two
+          banks.  The v6 shotgun and the dump now reach all 520 (v6_shot_ext=1), and
+          filling all 520 with the same entry still yields no hit.
+        - v6_idxw4 = 0x00000004 - exactly what the vendor's init writes into index[10] -
+          changes the hardware's behaviour for the first time: with the trap off, 56,800
+          IPv6 frames cost the CPU 18 tx_submitted and 0 arrive at the far end, i.e. the
+          v6 fast lookup is now taken and the miss is a drop.  With the driver's
+          0x00150154 the same frames all cross the CPU and are forwarded by software.
+          So the v6 engine is switched on by that word and by nothing else checked so
+          far, and the reason nothing matches is downstream of "is it on".
+        - Excluded by measurement on the same bench: all 520 hash slots holding the
+          entry (shotgun, extended banks), the vendor's rule index 2/3 instead of 153,
+          the vendor's config words 0x80=0x00000e00 / 0x94=8 / 0x88=0x3fff /
+          0x98=0x3fff3fff, and the ONU-side IPv6 prefix files (onu6s/onu6d/local6) being
+          programmed with the real /64s - every combination still drops the frames.
+        - A real v6 entry read back from slot 144 decodes to exactly the intended key:
+          window 0 = 0x1100 (UDP<<8), source fd99::2, destination fd88::2, ports
+          0xbc53/0x270f, the same encoding the working IPv4 entry at slot 29 uses.
+          So the entry content is not where the mismatch lives either.
     * What is now measured instead of assumed (2026-10-28, with the `dump` module
       parameter, which reads the classifier back through the same indirect command
       register the writes use - the first two-way link to these tables on this board):

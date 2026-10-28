@@ -195,6 +195,10 @@ MODULE_PARM_DESC(v6_hwn,
  * the range to find out which slot the hardware actually looks in.
  */
 static bool zx_ppe_v6_shotgun;
+static bool zx_ppe_v6_shot_ext;
+module_param_named(v6_shot_ext, zx_ppe_v6_shot_ext, bool, 0644);
+MODULE_PARM_DESC(v6_shot_ext,
+		 "extend the IPv6 shotgun to the vendor's other three hash banks (slots 384..519, tables 4/5/6)");
 module_param_named(v6_shotgun, zx_ppe_v6_shotgun, bool, 0644);
 MODULE_PARM_DESC(v6_shotgun,
 	"diagnostic: write an IPv6 flow into v6_shot_lo..v6_shot_hi instead of one slot");
@@ -514,6 +518,35 @@ static void zx_ppe_slots(const struct zx_ppe_tuple *t, u16 slot[2])
 	slot[0] = zx_ppe_crc(0x04c11db7, key, sizeof(key)) & 0xff;
 	slot[1] = ZX_PPE_HASH0_SIZE + (zx_ppe_crc(0x1edc6f41, key, sizeof(key)) & 0x7f);
 }
+
+/*
+ * The vendor's cla_set_hash_table(slot, ...) splits 520 slots over five table
+ * ids, not two: 0..255 -> table 2, 256..383 -> table 3, 384..447 -> table 4,
+ * 448..511 -> table 5, 512..519 -> table 6.  The driver only ever allocates
+ * from the first two banks, but the lookup hardware is free to use the rest,
+ * so the shotgun and the dump have to be able to reach them.
+ */
+static void zx_ppe_hash_loc(u32 slot, u32 *table, u32 *index)
+{
+	if (slot < ZX_PPE_HASH0_SIZE) {
+		*table = ZX_CLA_HASH0;
+		*index = slot;
+	} else if (slot < 256 + 128) {
+		*table = ZX_CLA_HASH1;
+		*index = slot - 256;
+	} else if (slot < 448) {
+		*table = 4;
+		*index = slot - 384;
+	} else if (slot < 512) {
+		*table = 5;
+		*index = slot - 448;
+	} else {
+		*table = 6;
+		*index = slot - 512;
+	}
+}
+
+#define ZX_PPE_HASH_SLOTS_EXT 520
 
 /*
  * Classifier entry: rewrite index, egress port and forward flag, then the
@@ -851,17 +884,18 @@ static int zx_ppe_flow_add(struct zx_eth_adapter *adapter,
 		goto err_nh;
 
 	if (t.v6 && zx_ppe_v6_shotgun) {
+		int top = zx_ppe_v6_shot_ext ? ZX_PPE_HASH_SLOTS_EXT : ZX_PPE_HASH_SIZE;
 		int lo = zx_ppe_v6_shot_lo < 0 ? 0 : zx_ppe_v6_shot_lo;
-		int hi = zx_ppe_v6_shot_hi < 0 ? ZX_PPE_HASH_SIZE - 1
-					      : zx_ppe_v6_shot_hi;
+		int hi = zx_ppe_v6_shot_hi < 0 ? top - 1 : zx_ppe_v6_shot_hi;
 		int s;
 
-		for (s = lo; s <= hi && s < ZX_PPE_HASH_SIZE; s++) {
+		for (s = lo; s <= hi && s < top; s++) {
+			u32 table, index;
+
 			if (s == slot[1])
 				continue;
-			zx_pp_write(adapter, ZX_CLA_BASE,
-				    s < ZX_PPE_HASH0_SIZE ? ZX_CLA_HASH0 : ZX_CLA_HASH1,
-				    s % ZX_PPE_HASH0_SIZE, w, words);
+			zx_ppe_hash_loc(s, &table, &index);
+			zx_pp_write(adapter, ZX_CLA_BASE, table, index, w, words);
 		}
 		dev_info(adapter->dev, "IPv6 shotgun: hash %d..%d hold the same entry\n",
 			 lo, hi);
@@ -1136,9 +1170,10 @@ static void zx_ppe_dump_hash(struct zx_eth_adapter *adapter)
 	u32 w[17], ag;
 	int s, shown = 0, empty = 0;
 
-	for (s = 0; s < ZX_PPE_HASH_SIZE; s++) {
-		u32 table = s < ZX_PPE_HASH0_SIZE ? ZX_CLA_HASH0 : ZX_CLA_HASH1;
-		u32 index = s % ZX_PPE_HASH0_SIZE;
+	for (s = 0; s < ZX_PPE_HASH_SLOTS_EXT; s++) {
+		u32 table, index;
+
+		zx_ppe_hash_loc(s, &table, &index);
 
 		if (zx_pp_read_entry(adapter, ZX_CLA_BASE, table, index, w, 15)) {
 			dev_warn(adapter->dev, "dump: hash read failed at slot %d\n", s);
@@ -1156,7 +1191,7 @@ static void zx_ppe_dump_hash(struct zx_eth_adapter *adapter)
 		shown++;
 	}
 	dev_info(adapter->dev, "cla-hash: %d of %d slots occupied, %d empty\n",
-		 shown, ZX_PPE_HASH_SIZE, empty);
+		 shown, ZX_PPE_HASH_SLOTS_EXT, empty);
 }
 
 static void zx_ppe_dump_regs(struct zx_eth_adapter *adapter)
@@ -1175,6 +1210,111 @@ static void zx_ppe_dump_regs(struct zx_eth_adapter *adapter)
 	}
 }
 
+/* Which table ids the indirect command register actually answers.  The vendor's
+ * IPv6 add path also writes an "external" hash table at (0x3c40000 + 0x800 +
+ * idx) << 6; if the hardware reads IPv6 entries from there rather than from the
+ * two internal banks, that would explain a v6 lookup that is clearly active
+ * (frames are dropped instead of being sent to the CPU) and never matches.
+ * Asking for that memory directly may fault, ids are free to try.
+ */
+static void zx_ppe_dump_tablescan(struct zx_eth_adapter *adapter)
+{
+	char buf[192];
+	u32 w[8];
+	int t, i;
+
+	for (t = 0; t < 16; t++) {
+		u32 seen = 0;
+
+		for (i = 0; i < 8; i++) {
+			if (zx_pp_read_entry(adapter, ZX_CLA_BASE, t, i, w, 5))
+				break;
+			if (!w[0] && !w[1] && !w[2] && !w[3] && !w[4])
+				continue;
+			zx_ppe_fmt_words(buf, sizeof(buf), w, 5);
+			dev_info(adapter->dev, "cla-tbl%02d[%2d]%s\n", t, i, buf);
+			seen++;
+		}
+		if (!seen)
+			dev_info(adapter->dev, "cla-tbl%02d: index 0..7 empty or unreadable\n", t);
+	}
+}
+
+/*
+ * "echo 80=00000e00,94=8 > .../parameters/cla_write" writes the CLA register
+ * window directly ("offset in hex = value in hex", comma separated), then reads
+ * every word back.  This exists because the emulated vendor CLA init
+ * (tm_pon_pp_cla_initial) programmes registers that this driver never touches:
+ * ONU register 3 (CLA+0x80, the config word, 0x00000e00 in the vendor image
+ * against 0x0000301a from our bootloader), register 6/14/16 (CLA+0x88/0x98,
+ * 0x3fff and 0x3fff3fff), register 13 (CLA+0x94, the outer hash space: the
+ * vendor asks for outer_hash_num=2, the driver writes 1) and register 12
+ * (CLA+0x90, the hash polynomial config, already 0x00e400e4 at boot).  Which of
+ * those the IPv6 lookup actually needs is a question for the hardware, not for
+ * a disassembly, and a reboot restores the bootloader values.
+ */
+#define ZX_PPE_CLA_WR_MAX 8
+
+struct zx_ppe_cla_wr {
+	u32 off[ZX_PPE_CLA_WR_MAX];
+	u32 val[ZX_PPE_CLA_WR_MAX];
+	int n;
+};
+
+static void zx_ppe_cla_write_adapter(struct zx_eth_adapter *adapter, void *data)
+{
+	struct zx_ppe_cla_wr *wr = data;
+	int i;
+
+	mutex_lock(&adapter->ppe_lock);
+	for (i = 0; i < wr->n; i++) {
+		writel(wr->val[i], adapter->base + ZX_CLA_BASE + wr->off[i]);
+		dev_info(adapter->dev, "cla_write %03x <- %08x (reads back %08x)\n",
+			 wr->off[i], wr->val[i],
+			 readl(adapter->base + ZX_CLA_BASE + wr->off[i]));
+	}
+	mutex_unlock(&adapter->ppe_lock);
+}
+
+static int zx_ppe_cla_write_storage;
+
+static int zx_ppe_cla_write_set(const char *val, const struct kernel_param *kp)
+{
+	struct zx_ppe_cla_wr wr = {};
+	char buf[192], *cur, *sep = NULL;
+	int ret;
+
+	if (!val)
+		return -EINVAL;
+	if (strscpy(buf, val, sizeof(buf)) < 0)
+		return -EINVAL;
+	for (cur = buf; cur && *cur && wr.n < ZX_PPE_CLA_WR_MAX; cur = sep) {
+		unsigned int off, v;
+
+		sep = strchr(cur, ',');
+		if (sep)
+			*sep++ = '\0';
+		ret = sscanf(cur, "%x=%x", &off, &v);
+		if (ret != 2 || off > 0x1ff)
+			return -EINVAL;
+		wr.off[wr.n] = off;
+		wr.val[wr.n] = v;
+		wr.n++;
+	}
+	if (!wr.n)
+		return -EINVAL;
+	zx_eth_for_each_adapter(zx_ppe_cla_write_adapter, &wr);
+	return 0;
+}
+
+static const struct kernel_param_ops zx_ppe_cla_write_ops = {
+	.set = zx_ppe_cla_write_set,
+	.get = param_get_int,
+};
+module_param_cb(cla_write, &zx_ppe_cla_write_ops, &zx_ppe_cla_write_storage, 0644);
+MODULE_PARM_DESC(cla_write,
+		 "write CLA registers: \"offset=value,offset=value\" (hex), reads each back");
+
 static void zx_ppe_dump_adapter(struct zx_eth_adapter *adapter, void *data)
 {
 	mutex_lock(&adapter->ppe_lock);
@@ -1186,6 +1326,8 @@ static void zx_ppe_dump_adapter(struct zx_eth_adapter *adapter, void *data)
 		zx_ppe_dump_hash(adapter);
 	if (zx_ppe_dump & 4)
 		zx_ppe_dump_regs(adapter);
+	if (zx_ppe_dump & 8)
+		zx_ppe_dump_tablescan(adapter);
 	mutex_unlock(&adapter->ppe_lock);
 }
 
@@ -1206,7 +1348,7 @@ static const struct kernel_param_ops zx_ppe_dump_ops = {
 };
 module_param_cb(dump, &zx_ppe_dump_ops, &zx_ppe_dump, 0644);
 MODULE_PARM_DESC(dump,
-		 "read the classifier back to dmesg: 1 = index/rule tables, 2 = hash banks + aging, 4 = CLA registers");
+		 "read the classifier back to dmesg: 1 = index/rule tables, 2 = hash banks + aging, 4 = CLA registers, 8 = table-id scan");
 
 /*
  * "echo 1 > .../parameters/ipv6" programmes the v6 tables and lifts the v6
