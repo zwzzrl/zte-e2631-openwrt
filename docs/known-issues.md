@@ -294,6 +294,35 @@ points at something in the repository or at a measurement.
       entry's word 4 - sweeping all sixteen values 0x00150050..15f with the entry
       written into all 384 slots forwarded every packet through the CPU and hit nothing;
       (b) the slot maths, because of that same all-slots run.
+    * 2026-10-29 third round (tools/vendor-emu `t_v6path.py`, `t_v6win.py`,
+      `t_v6tbl.py`; README "第三轮"): the 13-vs-19 window question is answered, and
+      neither of the two earlier candidates was right.
+      - `t_v6path.py` breaks on every acl/fast function entry: types 3/5/6 all run
+        tm_acl_fast_add -> tm_acl_fast_add_v4v6 -> aclGetExtIdxRuleRamAddrByPort ->
+        tm_acl_get_fastHashRule; addAclRule and aclBuildHashAndAclRule never run, and
+        the fast flag does not change the path.
+      - `t_v6win.py` block-marks the descriptor and reports every output buffer: type 3
+        and type 5 put the *same* bytes in the same places - entry e19 from desc +0x62,
+        e21..e24 from +0x64..+0x67, e25..e28 from +0x6c..+0x6f, e29..e32 from +0x74..
+        +0x77, and nothing else in desc +0x00..+0x124 reaches the entry, the 45-byte key
+        or the 60-byte hash rule. So that builder physically cannot produce a 19-halfword
+        IPv6 key: its v6 branch only changes the extract index byte and the direction bit.
+      - The vendor's IPv6 forwarding entry is a different table in the same module:
+        tm_ipv6table_add_set -> sbrg_add_ipv6table (tm.ko 0xf004), whose entry is
+        **48 bytes** read-modify-written as 4 rounds x 3 words through ONU registers
+        78/77/76 (module descriptor bases 0x000e2007/0x000e2008/0x000e2009, mask
+        0xffffffff) after sbrg_*_indreg_wr_cfg(i), with a status bit at register 25
+        (base 0x000e2060, mask 1, shift 2). It is exposed to userland as dev_attr_v6Table
+        and carries its own globals (g_ipv6FastEn, g_fast_entry_v6, g_v6_total_entry,
+        g_IPv6_Snat_Ram_Length, g_IPv6_Dnat_Ram_Length, g_nptv6_sipv6/dipv6).
+      What this changes: every CLA-hash sweep for v6 (v6_key, v6_hwn 7..19, v6_type 0..7,
+      v6_idxw4, shotgun over all 384 slots) was aimed at an engine the vendor does not
+      use for IPv6 forwarding - which is exactly why all of them measured 0 hits while
+      the far end counted every forwarded frame. The next target is the 48-byte switch
+      IPv6 table, and three things are still open before code: the table id / index
+      coding in sbrg_set_indreg_cmd and sbrg_hash, the 48-byte entry layout, and the
+      physical address behind ONU 0x000e2007 (the CLA window we do control is at
+      0x9238c000, so the conversion rule is one register description away).
     * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
       bench's only peer filters inbound IPv6, hence UDP above), then decide whether
       ipv6=1 becomes the default.

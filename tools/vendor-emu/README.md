@@ -31,6 +31,9 @@ The image is `python:3.12-slim` plus `unicorn` and `pyelftools`.
 | `t_real3.py` | the flow-add path with the tables and the polynomial config filled with the values the hardware really holds (read back with the driver's `dump` parameter), so the vendor's read-modify-write of an index entry produces its real final value |
 | `t_gfhr.py` | calls `tm_acl_get_fastHashRule()` on its own with a descriptor we control and prints, for every descriptor byte, which byte of the 60-byte hash rule it lands in (`map 3 5` sweeps IPv4 and IPv6) |
 | `t_key.py` | the whole `tm_add_acl_flow_rule()` path with a hook on each key builder; `paths` shows which builder a type takes, `map` tags descriptor bytes, `key` prints the 45-byte key handed to `aclGetAvailableHashAddr()` |
+| `t_v6win.py` | block-sweeps the descriptor and reports, for every buffer the run produces (entry, 45-byte key, 60-byte hash rule, external hash), which descriptor offset landed in which output byte |
+| `t_v6path.py` | pokes every acl/fast function entry and prints the order they actually run, per rule type and fast flag |
+| `t_v6tbl.py` | decodes the ONU register descriptors out of the ELF (`regs`) and emulates `sbrg_add_ipv6table()` (`call`) |
 | `t_poly.py` | the flow-add path with `cla_get_hash_poly_config` answered as the hardware answers it (ONU register 12 = 0x00e400e4 -> 0,1,0,3,0,1,0,3). Without this the vendor code takes its "invalid parameter" fallback and every type comes out looking like IPv4 |
 
 `flowadd.py` grew two hooks for that: `handlers=` replaces any intercepted call (the
@@ -98,3 +101,87 @@ table ids (2..6), not the 384 over two that the driver assumed.
 「软件侧窗口布局与协议族无关、由 extract index 决定」是代码本身的性质。
 
 
+
+## 2026-10-29 第三轮：13 vs 19 窗口的矛盾解开了——是两条不同的 IPv6 通路
+
+第二轮留下的矛盾是：喂了真实多项式配置之后，type 5（IPv6 上行）的 60 字节哈希表项
+仍然只写 v4 那 13 字节窗口，而驱动写 19 窗口 38 字节。这一轮把它查成了**结论**。
+
+三个新探针（都在本目录）：
+
+| 探针 | 做了什么 |
+|---|---|
+| `t_v6win.py` | 描述符按 4 字节块打不同标记（0xd1..0xd4），跑 `tm_add_acl_flow_rule`，报**每一个输出缓冲区**（60 字节表项、45 字节 key、60 字节 hash rule、external hash）里每个字节来自描述符哪个偏移 |
+| `t_v6path.py` | 在每个 acl/fast 函数入口下断点，打印真实执行顺序（类型 × fast 标志） |
+| `t_v6tbl.py` | 从 ELF 重定位解出 `tmOnuRegWrite` 用的寄存器描述符表，并可仿真 `sbrg_add_ipv6table()` |
+
+### 结论 1：`tm_acl_fast_add_v4v6` 就是 IPv6 也走的唯一构建器，但它没有 v6 窗口
+
+`t_v6path.py trace`（类型 3/5/6，fast=1 和 fast=0 各跑一遍）：
+
+```
+type 3 fast 1 idx 9  -> order tm_acl_fast_add > tm_acl_fast_add_v4v6 > aclGetExtIdxRuleRamAddrByPort > tm_acl_get_fastHashRule
+type 5 fast 1 idx 10 -> order tm_acl_fast_add > tm_acl_fast_add_v4v6 > aclGetExtIdxRuleRamAddrByPort > tm_acl_get_fastHashRule
+type 6 fast 1 idx 10 -> order tm_acl_fast_add > tm_acl_fast_add_v4v6 > aclGetExtIdxRuleRamAddrByPort > tm_acl_get_fastHashRule
+```
+
+`addAclRule` / `aclBuildHashAndAclRule` **一次都没进**，`fast` 全局标志也换不了路径。
+`t_v6win.py 3` 与 `t_v6win.py 5` 的块扫描给出**逐字节相同**的映射（只有表项的 e16 与方向位
+不同）：
+
+| 描述符偏移 | type 3 落点 | type 5 落点 |
+|---|---|---|
+| `+0x62` | 表项 e19 | 表项 e19 |
+| `+0x64..+0x67` | e22 e21 e24 e23 | **同上** |
+| `+0x6c..+0x6f` | e26 e25 e28 e27 | **同上** |
+| `+0x74..+0x77` | e29 e30 e31 e32 | **同上** |
+| `+0x00..0x124` 其余 | 不进任何输出 | 不进任何输出 |
+
+也就是说：这条路径给 IPv6 的表项里**只有 13 字节窗口**，v6 地址的其余部分它根本不读
+（描述符里没有它读的地方）。所以第二轮的两个候选里，**(a)「原厂 v6 快表项只用前缀+端口做
+key、地址靠规则掩码比」不是原厂的设计**——它是这条 ACL/哈希路径的固有形状，而不是 v6 加速。
+
+### 结论 2：原厂的 IPv6 加速是另一张表，tm.ko 里叫 ipv6table
+
+`tm.ko` 里有一套跟 ACL 哈希完全无关的 IPv6 机制，之前没被列进候选：
+
+| 符号 | 含义 |
+|---|---|
+| `tm_ipv6table_add_set` / `_delete_set` / `_lookup_get` / `_print_get` | 对外 API（`__ksymtab` 导出） |
+| `dev_attr_v6Table` | 用户态入口（vendor userland 往里写条目） |
+| `sbrg_add_ipv6table` (`tm.ko` `0xf004`) / `sbrg_delete_ipv6table` / `sbrg_lookup_ipv6table` | 交换芯片侧实现 |
+| `g_ipv6FastEn` / `g_fast_entry_v6` / `g_v6_total_entry` / `g_IPv6_Snat_Ram_Length` / `g_IPv6_Dnat_Ram_Length` / `g_nptv6_sipv6` / `g_nptv6_dipv6` | 这套机制的全局状态 |
+
+`sbrg_add_ipv6table` 的写入协议（静态反汇编 + 描述符解码，`0xf004..0xf8d0`）：
+
+* 4 轮「间接读-改-写」：每轮 `sbrg_get/set_indreg_wr_cfg(i, ...)` 之后对 **ONU 寄存器 78/77/76**
+  各读或写一个字 —— 4 × 3 × 4 B = **表项 48 字节**，不是我们的 60 字节哈希表项。
+* 这三个寄存器在 `tm.ko` 的寄存器描述符表里是连续字节地址：
+
+  | 寄存器 | 描述符 base | mask | shift | 备注 |
+  |---|---|---|---|---|
+  | 76 | `0x000e2007` | `0xffffffff` | 0 | 数据字 |
+  | 77 | `0x000e2008` | `0xffffffff` | 0 | 数据字 |
+  | 78 | `0x000e2009` | `0xffffffff` | 0 | 数据字 |
+  | 25 | `0x000e2060` | `0x00000001` | 2 | 访问前读的状态位 |
+
+  （描述符 28 字节一条，`tmOnuGlbRegValidation` 按 `table + 28*reg` 索引、entry[0] 自校验
+  寄存器号；表在 `.data` 里，由 `0xf3f4` 处的 `R_ARM_MOVW_ABS_NC` 重定位指向。）
+
+* 入口 `tm_ipv6table_add_set`（`0x3bfcc`）在 `0x3c078` 调 `sbrg_add_ipv6table`，之前校验
+  `[rec+0xc] < 0x1000`、`[rec+0x20] <= 0xff`，并对记录里 0/1/2/4/8/12/16/20/24/28/32/36/40
+  这些偏移取字段。
+
+### 这对我们的驱动意味着什么
+
+第二次那种「在 CLA 哈希表里换 `v6_key` / `v6_hwn` / `v6_type` / `v6_idxw4` / shotgun」的扫法
+**结构上不可能命中**：原厂给 IPv6 转发用的根本不是那张表。真机上所有组合 0 命中、而
+`tx_submitted`/远端的计数证明帧确实被转发了 —— 与这个结论一致。
+
+下一步（都还不需要真机）：
+
+1. 解 `sbrg_set_indreg_cmd` / `sbrg_hash`，拿到这张表的 table id、索引位宽和 start/end 序列；
+2. 给 `sbrg_add_ipv6table` 补上 `sbrg_get_table_sel` / `sbrg_hash` 的真实语义后完整仿真，
+   让它自己吐出一条 48 字节表项，再和 `g_IPv6_*_Ram_Length` 之类的边界校验对上；
+3. 把 ONU 地址 `0xe2007..0xe2009` 换算成物理地址（我们已知 CLA 窗口在 `0x9238c000`，
+   转换规则还差一步），确认这张表在主线 Linux 里可读写。
