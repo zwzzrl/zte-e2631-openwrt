@@ -671,3 +671,70 @@ UpTime 单调增长（没有重启循环），WebUI 响应正常（也没有 res
   不会崩也不会挂。
 - 新增的 sysfs 路径：`/sys/module/zx279128s_ppe/parameters/ipv6`（旧的
   `zx279128s_eth` 那个随内建驱动一起没了）。
+
+## PPE-MODULE-NEEDS-ETH-HOOKS - 模块能不能加载取决于镜像里的以太网驱动（2026-10-29）
+
+`zx279128s-ppe.ko` 不是独立驱动：它靠内建以太网驱动导出的九个符号跟引擎对接
+（`zx_ppe_hooks_register` / `zx_ppe_hooks_unregister` / `zx_ppe_has_bound_blocks` /
+`zx_ppe_set_v6_offload` / `zx_ppe_ht_params` / `zx_eth_for_each_adapter` /
+`zx_eth_is_port` / `zx_update_traps` / `zx_update_mac_tables`）。这些导出来自
+`overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128s-main.c`，
+是**模块化改造（v1.5，2026-10-28）之后**才加进内核源文件的。
+
+实测（2026-10-29，slot 1 serial 41 跑 `e2631-openwrt-factory-v8.bin`，构建时间 10-28 00:00）：
+
+```
+insmod /tmp/t7.ko dump=1
+zx279128s_ppe: Unknown symbol zx_update_traps (err -2)
+zx279128s_ppe: Unknown symbol zx_eth_for_each_adapter (err -2)
+... 九个全部 Unknown symbol，insmod rc=255
+```
+
+也就是说 **v8 这个镜像比 hook 早，装在里面的以太网驱动没有那批导出**，换多少次
+`.ko` 都白费：`insmod` 在符号解析阶段就失败，`dmesg` 里只有 `Unknown symbol`，
+不会有任何 CLA 访问。判断方法：`ls /proc/kallsyms | grep zx_ppe_hooks` 为空就是
+这个原因，别去怀疑模块本身或参数。
+
+结论/前置条件：**做硬件侧 PPE 实验，镜像必须是 hook 落地之后全量构建的**
+（`04-构建环境与脚本/ppe-build-inner.sh`，因为以太网驱动是内建的，改它的源文件
+必然要重编内核，不是 11 秒快路能解决的）。快路 `ppe-kmod-inner.sh` 只重新编模块，
+对"镜像里有没有 hook"没有任何影响。
+
+## RECOVER-VENDOR-TO-OPENWRT - 从原厂刷回的实际步骤与两个坑（2026-10-29）
+
+这轮完整跑了一遍"原厂固件 → OpenWrt"，记录能省下下一次两小时的细节。
+
+1. **包头要自己改**。cspboot 只认 serial 高的槽，而出厂包 `H_SERIAL` 是 1；原厂
+   httpd 到底是"当前槽 +1"还是"照着包里的值写"没有实测过，而一旦照写就等于白刷
+   还先毁掉唯一的 OpenWrt 槽。所以上传前把包改成 `H_SLOT_START=0x2300000`、
+   `H_SERIAL=两槽最大值+1`、`H_NEW=1`，并把版本串（`+0x10`）抬高以免原厂 UI 判降级，
+   然后重算 `+0xa4`（覆盖 `[0:0xa4]`）与 `+0x1fc`（覆盖 `[0:0x1fc]`）——**标准
+   zlib.crc32，不是 JFFS2 那套取反约定**。实测：`serial 41` / `V1.0.0.8B8.9300` 的包
+   上传后盒子重启进 OpenWrt，`e2631-fwslot info` 读回 `serial=41 [running]`。
+2. **上传本身很朴素**：只发 `VersionUpload` 一个文件字段，21 MB，3.7 秒回
+   `{"IF_ERRORID":0}`，随后 `upgrade_firmware_query` 依次给 `needRefresh=true`、
+   `upgrDesc=处理中，请稍候……`、`willReboot=true`；再约 27 秒 192.168.1.1 的 80/22
+   就都通了。
+3. **回灌 overlay 不能用 `scp -r`**：`upper/etc/rc.d` 里有指向 overlay 之外目标的
+   相对符号链接（如 `S50cron -> ../init.d/cron` 在本地副本里不存在），`scp -r` 报
+   `No such file or directory` 并**中途退出**，只灌进去一部分。用 tar 管道：
+   `tar -cf - etc lib usr | ssh root@<ip> 'tar -C / -xf -'`。`lib` 必须带上——
+   无线 caldata `lib/firmware/mediatek/mt7916_eeprom.bin` 在里面。
+4. **回灌之后 dropbear 会楔死**：22 端口 TCP 能连、服务端 banner 之前就 RST
+   （客户端看到 `kex_exchange_identification: Connection reset by peer`），系统日志是
+   `dropbear[..]: Early exit: String too long`，连刚重启过的机器也一样，一直持续到
+   把 dropbear 重启一次。救法（uhttpd 一直活着，不需要物理接触）：
+
+   ```
+   ubus call session login {"username":"root","password":<ap.sh 里那个口令>}
+   ubus call rc init {"name":"dropbear","action":"restart"}     # 实测重启后 SSH 立即恢复
+   ```
+
+   这两条经 HTTP 的 `/ubus` JSON-RPC 就能发，封装好的客户端是
+   `工作文件/05-路由器操作脚本/ubus.py`（另有 `ubus.py sh '<命令>'` 与
+   `ubus.py cat <路径>`，权限受 luci-base ACL 限制——`file exec` 对该镜像放行，
+   `/sbin/reboot`、`/sbin/wifi`、`/bin/kill` 等都在允许列表里）。
+5. **无线要等约 3 分钟**：`e2631-wifi-load`（START=95，`DEFER=25`）+ 开机 pending
+   标记的重试，dmesg 打印 `e2631-wifi-boot: waiting 25s` 之后就安静了，成功标志是
+   `wifi-on: done: 7906=mt7915e 790a=` 和 `phy1-sta0: associated`；急着用可以手工
+   `/sbin/e2631-wifi-on` 立刻拉起（实测有效，且不会重复绑定 790a）。
