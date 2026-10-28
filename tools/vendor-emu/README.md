@@ -185,3 +185,66 @@ key、地址靠规则掩码比」不是原厂的设计**——它是这条 ACL/�
    让它自己吐出一条 48 字节表项，再和 `g_IPv6_*_Ram_Length` 之类的边界校验对上；
 3. 把 ONU 地址 `0xe2007..0xe2009` 换算成物理地址（我们已知 CLA 窗口在 `0x9238c000`，
    转换规则还差一步），确认这张表在主线 Linux 里可读写。
+
+### 结论 3：ONU 地址换算规则（`fpga_read_reg` 那条链）
+
+`tm.ko` 里的「寄存器号」最终变成什么地址，链条只有两段：
+
+1. `tmOnuRegWrite(reg, val, idx, table)` 先按 28 字节描述符算出 **描述符字偏移**
+   `off = base + stride * idx`（`0x360d0..0x360dc`：`ldr r2,[desc+0x14]; ldr r3,[desc+8];
+   mla r4, r2, r4, r3`，其中 r4 是第 3 个实参，不是寄存器号）；
+2. `zx_ponreg.ko` 的 `fpga_read_reg/fpga_write_reg`（`0x0`/`0x14`，各 20 字节）做的就是
+   `ldr/str [g + 4*off]`，而 `fpga_module_init` 往这个全局里存的是 **`0xF4000000`**
+   （`0x198: mov lr, #-201326592` → `0xF4000000`）。按厂商 iotable，virt `0xF4000000`
+   ← **phys `0x92000000`**（switch，4 MiB）。
+
+于是：
+
+```
+phys = 0x92000000 + 4 * (descriptor.base + descriptor.stride * idx)
+```
+
+**两个已经在我们驱动上真机验证过的锚点**（都读过回值）：
+
+| 描述符 | base / stride | 算出 phys | 对应 |
+|---|---|---|---|
+| `claRegTable` reg 12 | `0xe3024` / 0，mask `0x00ff00ff` | `0x9238c090` | CLA+0x90 多项式配置（我们读回 `0x00e400e4`） |
+| `claRegTable` reg 19 | `0xe3028` / 1 | `0x9238c0a0 + 4*idx` | CLA+0xa0 local6 四个字（我们写过并读回） |
+
+### 结论 4：原厂 IPv6 表的访问口就在我们已经映射的那块 switch 里
+
+同一个公式用在 `sbragRegTable`（`sbrag` = switch 寄存器组，88 条描述符）上：
+
+| 用途 | 描述符（reg） | base / stride / mask | **物理地址** |
+|---|---|---|---|
+| 间接命令寄存器 | 19 | `0xe2005` / 0，mask `0x8fc00fff` | **`0x92388014`** |
+| 表项数据字 0..2 | 22（索引式）/ 76 / 77 / 78 | `0xe2007` / 1，`0xe2007/8/9` / 0 | **`0x9238801c` / `0x92388020` / `0x92388024`** |
+| 状态位 0..5 | 23..28 | `0xe2060` / 0，mask 1，shift 0..5 | **`0x92388180`** |
+| 另两个位域 | 29 / 30 | `0xe2061` mask 3；`0xe2062` | `0x92388184` / `0x92388188` |
+| 表访问配置字段 | 1..21 | `0xe2001..0xe2006` | `0x92388004..0x92388018` |
+
+命令字编码由 `sbrg_set_indreg_cmd`（`tm.ko` `0xc694`）给出：
+
+```
+cmd = (rw << 31) | (start_stop << 27) | (table << 22) | (index & 0xfff)
+约束：table <= 4，index < 0x1000，rw/start_stop 只能是 0/1（越界直接返回错误）
+```
+
+跟我们驱动自己在 CLA 上用的 `index | table << 22` 是**同一套编码**，只是块不同
+（CLA 的命令口是 `0x38c014`，这张 v6 表是 `0x388014`）。
+
+**这意味着不需要新的 ioremap**：`0x92388014/0x9238801c..24/0x92388180` 都落在
+`0x92000000` 起 4 MiB 的 switch 窗口内，而驱动的 `adapter->base` 就是这块的映射，
+读一个表项就是 `writel(cmd, base + 0x388014)` + 轮询 `base + 0x388180` +
+`readl(base + 0x38801c/20/24)`。这条结论只在厂商代码层面成立，**板上是否真的实现这几个
+偏移还没测**（盒子等串口），所以先记成"可访问性待测"，不当成已验证。
+
+### 接下来（仍离线）
+
+1. 解 48 字节表项的字段布局：`sbrg_add_ipv6table` 先按 4 轮 × 3 字把表项读进栈上缓冲区、
+   改字段、再写回；把 `sbrg_get_table_sel` / `sbrg_hash` / `sbrg_*_indreg_*_cfg` 的真实语义
+   补成桩（`sbrg_hash` 要按 `sbrg_hash` 自己的算法返回槽号），就能让它自己吐出一条完整表项。
+2. 把 48 字节表项与 `g_IPv6_Snat_Ram_Length` / `g_IPv6_Dnat_Ram_Length` / `g_v6_total_entry`
+   的边界校验对上，确认 SNAT/DNAT 两个 RAM 的分区。
+3. 表项字段定了，再决定是「沿用 mainline `nf_flow_table` 控制面、把 v6 流写成这张表」
+   （与 v4 的 PPE 路径并列），还是另起一条。

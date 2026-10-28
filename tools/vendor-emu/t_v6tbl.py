@@ -53,13 +53,19 @@ def table():
     raise SystemExit('no relocation at %#x' % SITE)
 
 
+SWITCH_PHYS = 0x92000000     # what zx_ponreg.ko's init stores: virt 0xF4000000
+
+
 def regs():
     d = table()
+    print('phys = %#x + 4 * (descriptor base + stride * index)'
+          % SWITCH_PHYS)
     for reg in REGS:
         w = struct.unpack(DESC, d[28 * reg:28 * reg + 28])
         print('reg %-3d base %#010x mask %#010x shift %-2d stride %#x '
-              'kind %d  -> addr %#010x'
-              % (w[0], w[3], w[4], w[5], w[7], w[2], w[3] + w[7] * reg))
+              'kind %d  -> phys %#010x'
+              % (w[0], w[3], w[4], w[5], w[7], w[2],
+                 SWITCH_PHYS + 4 * (w[3] + w[7] * reg)))
 
 
 def emu(rec_hex=None, size=64, steps=2000000):

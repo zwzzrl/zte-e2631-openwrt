@@ -315,14 +315,38 @@ points at something in the repository or at a measurement.
         (base 0x000e2060, mask 1, shift 2). It is exposed to userland as dev_attr_v6Table
         and carries its own globals (g_ipv6FastEn, g_fast_entry_v6, g_v6_total_entry,
         g_IPv6_Snat_Ram_Length, g_IPv6_Dnat_Ram_Length, g_nptv6_sipv6/dipv6).
+      - The ONU-address to physical-address rule is now derived, not guessed:
+        fpga_read_reg/fpga_write_reg (zx_ponreg.ko 0x0/0x14) are readl/writel on
+        [g + 4*off] and fpga_module_init stores 0xF4000000 there (0x198: mov lr,
+        #-201326592), which the vendor iotable maps to phys 0x92000000 (the 4 MiB
+        switch window). tmOnuRegWrite computes off = descriptor base + stride * idx
+        (the 3rd argument, not the register number), so
+        **phys = 0x92000000 + 4 * (base + stride * idx)**. Two anchors our driver has
+        already verified on hardware confirm it: claRegTable reg 12 (base 0xe3024,
+        mask 0x00ff00ff) -> 0x9238c090, the polynomial config we read back as
+        0x00e400e4; and reg 19 (base 0xe3028, stride 1, idx 0..3) -> 0x9238c0a0+4*idx,
+        the local6 file we wrote and read back.
+      - Applied to the sbrag descriptor table, the vendor's IPv6 table port is inside
+        the block our driver already maps (adapter->base = 0x92000000, 4 MiB), so no
+        new ioremap would be needed: indirect command at 0x92388014 (mask 0x8fc00fff),
+        data words 0..2 at 0x9238801c / 0x92388020 / 0x92388024 (regs 22/76/77/78),
+        status bits 0..5 at 0x92388180 (regs 23..28), two more fields at 0x92388184 and
+        0x92388188, and the access config fields (regs 1..21) at 0x92388004..0x92388018.
+        The command word is built by sbrg_set_indreg_cmd (tm.ko 0xc694) as
+        (rw << 31) | (start_stop << 27) | (table << 22) | (index & 0xfff) with table <=
+        4 and index < 0x1000 enforced - the same encoding our driver already uses for
+        its CLA indirect accesses (index | table << 22 at 0x38c014), just on the
+        0x388000 bank instead. Whether this board decodes those offsets is UNMEASURED
+        (the box is waiting for its serial cable), so this is "reachable by the vendor's
+        own code, plausibility checked", not a hardware fact yet.
       What this changes: every CLA-hash sweep for v6 (v6_key, v6_hwn 7..19, v6_type 0..7,
       v6_idxw4, shotgun over all 384 slots) was aimed at an engine the vendor does not
       use for IPv6 forwarding - which is exactly why all of them measured 0 hits while
       the far end counted every forwarded frame. The next target is the 48-byte switch
-      IPv6 table, and three things are still open before code: the table id / index
-      coding in sbrg_set_indreg_cmd and sbrg_hash, the 48-byte entry layout, and the
-      physical address behind ONU 0x000e2007 (the CLA window we do control is at
-      0x9238c000, so the conversion rule is one register description away).
+      IPv6 table; what is still open is the entry layout (needs sbrg_get_table_sel /
+      sbrg_hash stubbed with their real semantics so sbrg_add_ipv6table can produce one)
+      and the SNAT/DNAT partition bounds (g_IPv6_Snat_Ram_Length / g_IPv6_Dnat_Ram_Length
+      / g_v6_total_entry).
     * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
       bench's only peer filters inbound IPv6, hence UDP above), then decide whether
       ipv6=1 becomes the default.
