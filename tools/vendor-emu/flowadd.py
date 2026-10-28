@@ -35,7 +35,8 @@ class Case:
     """rs: {offset: bytes} written into the flow descriptor before the run."""
 
     def __init__(self, typ=3, rs=None, fast=1, tail=None, quiet=True,
-                 entry='tm_add_acl_flow_rule', size=0x124, extidx=0):
+                 entry='tm_add_acl_flow_rule', size=0x124, extidx=0,
+                 handlers=None, pre_run=None):
         self.log = []
         self.got = []
         self.extidx = extidx
@@ -44,6 +45,10 @@ class Case:
         self.quiet = quiet
         for n in INTERCEPT:
             m.handlers[n] = self._h(n)
+        if handlers:
+            m.handlers.update(handlers)
+        if pre_run:
+            pre_run(self)
         flow = m.calloc(size)
         m.wr(flow, size, b'\x00' * size)
         m.wr(flow + 12, 4, typ)
