@@ -103,6 +103,16 @@ if [ -z "$secs" ]; then
 		# band at 20 dBm, which cost 3 dB on 5 GHz vs what the vendor ships
 		# (verified live: 20.00 -> 23.00 dBm on ch36 after the switch, 2026-10-24)
 		uci set "wireless.radio$n.country=CN"
+		# 频段档位：不写 htmode 时 netifd 会退回 HT20，2.4G 协商封顶约
+		# 287 Mbit/s PHY，永远到不了原厂 DBDC 档位的 574（"跑不满 500M"
+		# 就是这么来的）；5G 也会丢掉 80MHz 速率。phy0（ofs 0）= Band 1
+		# = 2.4G，phy1（+1）= Band 2 = 5G。HE40 + noscan 钉住原厂强制 40MHz
+		# 的行为；5G 用 HE80。2026-10-29 吸收自上游 v1.8.0（a6e75bf）。
+		case "$ofs" in
+		0)	uci set "wireless.radio$n.htmode=HE40"
+			uci set "wireless.radio$n.noscan=1" ;;
+		*)	uci set "wireless.radio$n.htmode=HE80" ;;
+		esac
 		uci set "wireless.radio$n.disabled=0"
 		uci -q delete "wireless.default_radio$n"
 		uci set "wireless.default_radio$n=wifi-iface"

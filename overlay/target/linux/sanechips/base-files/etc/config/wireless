@@ -24,7 +24,12 @@ config wifi-device 'radio0'
 	option path 'soc/f000000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0'
 	option band '2g'
 	option channel '1'
-	option htmode 'HE20'
+	# HE40 + noscan：原厂 DBDC 档位是 2x2 HE40（574 Mbit/s PHY）。不写 htmode
+	# 时 netifd 会退回 HT20，协商封顶约 287 Mbit/s，永远上不了 ~500（"跑不满
+	# 500M"就是这么来的）。noscan 钉住原厂那种强制 40MHz 的行为。
+	# 2026-10-29 吸收自上游 v1.8.0（a6e75bf）。
+	option htmode 'HE40'
+	option noscan '1'
 	option country 'CN'
 	option disabled '1'
 
