@@ -738,3 +738,32 @@ zx279128s_ppe: Unknown symbol zx_eth_for_each_adapter (err -2)
    标记的重试，dmesg 打印 `e2631-wifi-boot: waiting 25s` 之后就安静了，成功标志是
    `wifi-on: done: 7906=mt7915e 790a=` 和 `phy1-sta0: associated`；急着用可以手工
    `/sbin/e2631-wifi-on` 立刻拉起（实测有效，且不会重复绑定 790a）。
+
+## WANPORT-ANY-PORT - 手动切口的真机验收（2026-10-29）
+
+`e2631-wanport apply <port>` 的语义是"WAN netifd 接口绑到哪个 netdev、哪个 netdev
+留在 br-lan 里"，四步动作全部实测生效（slot 1 serial 41，V1.0.0.8B8.9300）：
+
+```
+e2631-wanport status                    # 切换前：wan device=wan, br-lan ports=lan1 lan2 lan3
+DRY_RUN=1 e2631-wanport apply lan3      # 预演：打印要跑的 uci 命令，不落地
+e2631-wanport apply lan3                # 实测输出：e2631-wanport: WAN 口 -> lan3（原来 wan）
+```
+
+切换后读回的现场（`e2631-wanport status` + `uci` + `ubus`）：
+
+| 观测点 | 切到 lan3 后 |
+|---|---|
+| `wan device` / `manual_port` | `lan3` / `lan3` |
+| `br-lan ports` | `lan1 lan2 wan`（lan3 被摘掉，原 `wan` 口进 br-lan） |
+| `ubus call network.interface.wan status` | `"device": "lan3"`, `"proto": "dhcp"` |
+| `uci get network.wan.device` / `network.wan6.device` | 都是 `lan3`（落盘，重启保持） |
+| 端口 MAC | lan3 拿到 WAN 的固化 MAC `e4:60:4d:00:00:01`，原 `wan` 口拿回 br-lan 的 MAC |
+| 管理面 | 管理侧所在 lan2 一直在 br-lan 里，SSH 全程没断 |
+
+再 `e2631-wanport apply wan` 回退，上面每一项都回到切换前的值。
+
+**没验的部分**（不要当成已验）：真正从"被移动的那个口"跑一条 ISP 上行。
+这需要一根独立的上行线 + 一台对端（DHCP/PPPoE），现场只有一个管理侧网线口，
+把管理侧所在口切走会把自己关在门外（`docs/02` 7.6 那次就是这样丢的访问）。
+所以这一轮只证明了动作链与配置持久化，业务面要到有独立上行线时再验。
