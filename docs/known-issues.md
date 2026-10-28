@@ -152,6 +152,43 @@ points at something in the repository or at a measurement.
     are in the hardware (zx_ppe_set_v6_offload()), so a module that fails to program
     them leaves the box on the old, safe path.
   next: |
+    * What is now measured instead of assumed (2026-10-28, with the `dump` module
+      parameter, which reads the classifier back through the same indirect command
+      register the writes use - the first two-way link to these tables on this board):
+        - Write path verified.  Read-back of the index table gives 93929190 97969594
+          9b9a9998 9f9e9d9c 00150151 for entry 9 and 03020100 07060504 0b0a0908
+          0f0e0d0c 00150154 for entry 10, of the rule table gives rule 152 and rule 153
+          word for word as zx_ppe_v4_rule / zx_ppe_v6_rule, and of the hash banks gives
+          15 words whose word 4 starts with 0x49 (IPv4) or 0x4a (IPv6).  Every table
+          the driver writes is therefore really in the hardware, all 17 words of it.
+        - The classifier matched an IPv4 entry and has never matched an IPv6 one.  The
+          aging word - which zx_ppe_flow_stats already used for IPv4 hits - is the
+          oracle: install the flow, send one 1.2 s UDP burst, read the banks back.
+            IPv4 192.168.1.250:41234 -> 10.88.0.1:9999: flows at slots 29/38, slot 29
+            aging bit 0 = 1 immediately after the burst, and a second 67,800-packet
+            burst costs the CPU 18 tx_submitted (hardware forwarding).
+            IPv6 fd99::2:48211 -> fd88::2:9999: flows at 144/180, aging bit 0 = 0
+            after both bursts, and the second 64,000-packet burst costs the CPU 63,991
+            tx_submitted (every frame still to the CPU, i.e. a classifier miss).
+          Same bench, same probe, same second burst: the difference is the protocol
+          family, not the measurement.
+        - Re-swept with that oracle, all misses: v6_rule=2 and v6_rule=152 (the
+          emulated vendor call is cla_set_extra_rule_table(2, ...), so the hardware may
+          want the extract rule somewhere other than 153), v6_ext=2/9/11 (these do not
+          even reach a flow add - ppe_flows stays 0), and v6_idxw4 =
+          0x00150153/55/57/5c/5d plus 0x00150054.  The earlier 16-value
+          0x00150050..15f sweep is thus confirmed with a sharper probe: the "IPv6
+          lookup on" bit is not in that word.
+        - Two registers the emulator needed are now known values instead of stubs:
+          CLA+0x90 (ONU register 12, mask 0x00ff00ff - the polynomial config that
+          cla_get_hash_poly_config reads) reads 0x00e400e4, i.e. 0xe4 in both halves;
+          CLA+0xa0 (the local IPv6 file) still holds the ULA prefix from an earlier
+          local6= run, and the ONU S/D IPv6 file at 0xfc..0x113 is all zero.  The whole
+          CLA window 0x00..0x7c is zero apart from the indirect registers themselves,
+          so there is no obvious unwritten enable bit in the low window.
+      What this settles: the tables are not the problem (they are provably in the
+      hardware) and neither is forwarding, next hop or egress - a v6 frame never
+      produces a key that matches the entry, so the gap is on the extract side.
     * Write the table the IPv6 path needs and the driver does not touch.  The emulated
       vendor code (see finding 4) makes cla_set_external_hash_table() part of the IPv6
       flow add and never part of the IPv4 one; its entries are 40 bytes taken from the

@@ -402,6 +402,31 @@ static int zx_pp_read_word0(struct zx_eth_adapter *adapter, u32 blk, u32 table,
 	return ret;
 }
 
+/* Read @n data words of an entry.  The command register is issued once and the
+ * hardware then presents the whole entry in the per-word data registers, which
+ * is how the stock driver dumps a rule (it reads them back to rebuild a hash
+ * key), so no per-word command is needed.
+ */
+static int zx_pp_read_entry(struct zx_eth_adapter *adapter, u32 blk, u32 table,
+			    u32 index, u32 *data, int n)
+{
+	int words = blk == ZX_CLA_BASE ? 17 : 8;
+	int i, ret;
+
+	ret = zx_pp_wait(adapter, blk);
+	if (ret)
+		return ret;
+	writel(index | table << 22 | ZX_PP_IND_READ, adapter->base + blk + ZX_PP_IND_CMD);
+	for (i = 0; i < 64 && (readl(adapter->base + blk + ZX_PP_IND_STATUS) & 1); i++)
+		;
+	ret = zx_pp_wait(adapter, blk);
+	if (ret)
+		return ret;
+	for (i = 0; i < n && i < words; i++)
+		data[i] = readl(adapter->base + blk + zx_pp_data_reg(blk, i));
+	return 0;
+}
+
 /* Set @width bits at bit @pos of a little-endian bit string */
 static void zx_ppe_put_bits(u8 *buf, int pos, int width, u32 val)
 {
@@ -1054,6 +1079,134 @@ static void zx_ppe_v6_toggle_adapter(struct zx_eth_adapter *adapter, void *data)
 	}
 	mutex_unlock(&adapter->ppe_lock);
 }
+
+/*
+ * Read-back dump of the classifier ("echo <mask> > .../parameters/dump").
+ *
+ * Writes only ever proved that a value *left* the CPU; this reads the tables
+ * back through the same indirect interface, so the IPv6 work can be checked
+ * against what the hardware really holds instead of against what was sent.
+ * Mask bits: 1 = extract index + rule tables, 2 = both hash banks (plus the
+ * aging word of every occupied slot), 4 = the CLA register window.
+ */
+static int zx_ppe_dump;
+
+static int zx_ppe_fmt_words(char *buf, size_t size, const u32 *w, int n)
+{
+	int i, len = 0;
+
+	for (i = 0; i < n; i++)
+		len += scnprintf(buf + len, size - len, " %08x", w[i]);
+	return len;
+}
+
+static void zx_ppe_dump_tables(struct zx_eth_adapter *adapter)
+{
+	static const int rules[] = {
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 17, 18, 19,
+		144, 145, 152, 153, 160, 161,
+	};
+	char buf[192];
+	u32 w[17];
+	int i;
+
+	for (i = 0; i < 16; i++) {
+		if (zx_pp_read_entry(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX, i, w, 5)) {
+			dev_warn(adapter->dev, "dump: index read failed at %d\n", i);
+			return;
+		}
+		zx_ppe_fmt_words(buf, sizeof(buf), w, 5);
+		dev_info(adapter->dev, "cla-index[%2d]%s\n", i, buf);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(rules); i++) {
+		if (zx_pp_read_entry(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE,
+				     rules[i], w, 17)) {
+			dev_warn(adapter->dev, "dump: rule read failed at %d\n", rules[i]);
+			return;
+		}
+		zx_ppe_fmt_words(buf, sizeof(buf), w, 17);
+		dev_info(adapter->dev, "cla-rule[%3d]%s\n", rules[i], buf);
+	}
+}
+
+static void zx_ppe_dump_hash(struct zx_eth_adapter *adapter)
+{
+	char buf[192];
+	u32 w[17], ag;
+	int s, shown = 0, empty = 0;
+
+	for (s = 0; s < ZX_PPE_HASH_SIZE; s++) {
+		u32 table = s < ZX_PPE_HASH0_SIZE ? ZX_CLA_HASH0 : ZX_CLA_HASH1;
+		u32 index = s % ZX_PPE_HASH0_SIZE;
+
+		if (zx_pp_read_entry(adapter, ZX_CLA_BASE, table, index, w, 15)) {
+			dev_warn(adapter->dev, "dump: hash read failed at slot %d\n", s);
+			return;
+		}
+		if (!w[0] && !w[1] && !w[2] && !w[3] && !w[4] && !w[5]) {
+			empty++;
+			continue;
+		}
+		if (zx_pp_read_word0(adapter, ZX_CLA_BASE, ZX_CLA_AGING, index, &ag))
+			ag = 0;
+		zx_ppe_fmt_words(buf, sizeof(buf), w, 15);
+		dev_info(adapter->dev, "cla-hash[%3d] (tbl %u idx %3u)%s ag %08x\n",
+			 s, table, index, buf, ag);
+		shown++;
+	}
+	dev_info(adapter->dev, "cla-hash: %d of %d slots occupied, %d empty\n",
+		 shown, ZX_PPE_HASH_SIZE, empty);
+}
+
+static void zx_ppe_dump_regs(struct zx_eth_adapter *adapter)
+{
+	int off, i;
+
+	for (off = 0; off <= 0x11c; off += 16) {
+		char buf[64];
+		u32 v[4];
+
+		for (i = 0; i < 4; i++)
+			v[i] = readl(adapter->base + ZX_CLA_BASE + off + 4 * i);
+		zx_ppe_fmt_words(buf, sizeof(buf), v, 4);
+		dev_info(adapter->dev, "cla-reg %03x:%s%s\n", off, buf,
+			 off == 0x90 ? "  <- hash poly (onu reg 12)" : "");
+	}
+}
+
+static void zx_ppe_dump_adapter(struct zx_eth_adapter *adapter, void *data)
+{
+	mutex_lock(&adapter->ppe_lock);
+	if (!adapter->ppe_active)
+		dev_info(adapter->dev, "dump: ppe inactive, reading the tables anyway\n");
+	if (zx_ppe_dump & 1)
+		zx_ppe_dump_tables(adapter);
+	if (zx_ppe_dump & 2)
+		zx_ppe_dump_hash(adapter);
+	if (zx_ppe_dump & 4)
+		zx_ppe_dump_regs(adapter);
+	mutex_unlock(&adapter->ppe_lock);
+}
+
+static int zx_ppe_dump_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (ret)
+		return ret;
+	if (zx_ppe_dump)
+		zx_eth_for_each_adapter(zx_ppe_dump_adapter, NULL);
+	return 0;
+}
+
+static const struct kernel_param_ops zx_ppe_dump_ops = {
+	.set = zx_ppe_dump_set,
+	.get = param_get_int,
+};
+module_param_cb(dump, &zx_ppe_dump_ops, &zx_ppe_dump, 0644);
+MODULE_PARM_DESC(dump,
+		 "read the classifier back to dmesg: 1 = index/rule tables, 2 = hash banks + aging, 4 = CLA registers");
 
 /*
  * "echo 1 > .../parameters/ipv6" programmes the v6 tables and lifts the v6
