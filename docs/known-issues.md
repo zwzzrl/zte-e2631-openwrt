@@ -347,6 +347,22 @@ points at something in the repository or at a measurement.
       sbrg_hash stubbed with their real semantics so sbrg_add_ipv6table can produce one)
       and the SNAT/DNAT partition bounds (g_IPv6_Snat_Ram_Length / g_IPv6_Dnat_Ram_Length
       / g_v6_total_entry).
+    * 2026-10-29 第四轮（纯离线，`tools/vendor-emu/t_v6entry.py`，映射表在那边的 README
+      「第四轮」）：48 字节表项的字段布局解出来了，且用随机记录复验过。输入记录 52 字节 =
+      valid/age/mode 三个 u32（各 ≤1）、vlan_id（<0x1000）、dip[16]、pt_mask（u32 ≤0xff）、
+      sip[16]；字段名不是猜的，是打开 `g_tm_debug_level=7` 之后厂商自己的 printk 打出来的
+      （`input:vlan_id / dip / sip / valid / mode / age / pt_mask`），偏移又和函数开头的
+      参数校验逐条对上。12 个输出字是一条 384 位小端位流：bit0..2 三个标志、bit3..14 vlan、
+      bit15..78 dip 的后 8 字节、bit96..103 pt_mask、bit104..167 dip 的前 8 字节、
+      bit192..255 sip 的后 8 字节、bit288..351 sip 的前 8 字节，**w8/w11 硬写 0**（反汇编
+      0xf20c 的 `mov r2,#0` + 两次 `str` 证实，且 readmap 实验里读回值对写出的 12 个字
+      毫无影响）。按这张表写的 20 行组装函数在 60 条随机记录上与仿真器逐字一致。
+      访问协议也定下来了：`sbrg_access_timeout` 轮询 ONU reg 20（`0x92388018`）**读到
+      非 0** 才放行（10 次都 0 就返回 -1），`sbrg_set_indreg_cmd` 把
+      `index|table<<22|start_stop<<27|rw<<31` 写进 reg 19（`0x92388014`），数据字写
+      78/77/76（`0x9238801c/20/24`），读阶段是 4 张 table × 4 个块（index 0x248..0x24b）
+      × 3 字、写阶段只写 table 0。仍未定：槽号从哪来、4 张 table 各管什么 —— 两者都卡在
+      reg 20 的真实语义上，只能上板读一次复位值再接下去。
     * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
       bench's only peer filters inbound IPv6, hence UDP above), then decide whether
       ipv6=1 becomes the default.
