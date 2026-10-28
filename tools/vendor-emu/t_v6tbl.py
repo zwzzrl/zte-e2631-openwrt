@@ -101,9 +101,34 @@ def emu(rec_hex=None, size=64, steps=2000000):
         print('   log %s' % l)
 
 
+def anchors():
+    """Cross-check the transform against the two registers we know on hardware."""
+    f = ELFFile(open(KO, 'rb'))
+    syms = list(f.get_section_by_name('.symtab').iter_symbols())
+    for name, regs_wanted in (('claRegTable', (12, 19)),
+                              ('sbragRegTable', (22, 76, 77, 78, 23))):
+        for s in syms:
+            if s.name != name or s['st_info']['type'] != 'STT_OBJECT':
+                continue
+            sec = f.get_section(s['st_shndx'])
+            d = sec.data()[s['st_value']:s['st_value'] + s['st_size']]
+            print('%s (%d entries)' % (name, len(d) // 28))
+            for reg in regs_wanted:
+                if 28 * reg + 28 > len(d):
+                    continue
+                w = struct.unpack(DESC, d[28 * reg:28 * reg + 28])
+                for idx in ((0, 2) if w[7] else (0,)):
+                    print('   reg %-3d idx %d base %#x stride %#x mask %#010x '
+                          '-> phys %#010x'
+                          % (reg, idx, w[3], w[7], w[4],
+                             SWITCH_PHYS + 4 * (w[3] + w[7] * idx)))
+
+
 if __name__ == '__main__':
     cmd = sys.argv[1] if len(sys.argv) > 1 else 'regs'
     if cmd == 'regs':
         regs()
+    elif cmd == 'anchors':
+        anchors()
     elif cmd == 'call':
         emu(sys.argv[2] if len(sys.argv) > 2 else None)
