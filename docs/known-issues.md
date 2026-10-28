@@ -813,3 +813,27 @@ entering boot mode***` 那一秒按 `1`、口令 `5cE080@fyBD` 进 U-Boot，然�
    推到 START=95/99 并加 pending 守卫。
 3. `e2631-fwslot flash --slot 1` 会连带擦掉 mtd7/mtd8（rootfs 与 overlay 都在槽内），
    所以刷 slot1 不只是换系统，还会清掉全部运行时配置——刷之前先假设配置会丢。
+
+## WANPORT-RELOAD-POLICY - 切 WAN 口默认不动运行态（2026-10-29）
+
+`e2631-wanport apply <port>` 现在有两道保护，都是吸收上游 v1.8.0 的做法：
+
+1. **目标口有链路就拒绝**（`--force` 绕过）。`port != 当前 WAN 口 && carrier == 1`
+   时直接报错退出，因为真机上最可能的情况就是这根网线正是你此刻的管理连接
+   （2026-10-27 那次就是把自己切到门外，WAN 区 input=REJECT，只剩 ping）。
+   LuCI 页面走的是 `apply <port> --force`：页面本身就是显式选择，而"把 ISP 网线
+   插到 lan3 再选 lan3"这个正常流程里目标口**必然**有链路，不加 --force 就永远
+   切不过去。
+2. **默认不 `network reload`**。配置写进 uci、端口 MAC 立刻落地，但运行态留给
+   reboot；要立刻生效才加 `--reload`。
+
+第 2 条的取舍来自两边互相矛盾的真机证据，如实记在这里：
+
+- 上游 v1.8.0 记录：这颗 SoC 的 gmac/bridge 扛不住 `network reload/restart`，
+  会半挂死（ICMP 部分应答、TCP 全死）。所以他们的 worker 不 reload。
+- 我们在 2026-10-29 自己的机上（slot1 serial 41）连续 `apply lan3` → `apply wan`
+  两次，每次都有 reload，SSH 与 ping 全程正常，`ubus call network.interface.wan
+  status` 立刻给出 `"device": "lan3"`。
+
+两条都真，说明风险与具体固件/流量状态有关。默认取保守（不 reload），把"立刻生效"
+做成显式开关，而不是删掉这个能力。

@@ -10,10 +10,17 @@
 # has); there is no auto-detection any more, so there is no redetect method and
 # nothing to configure but the port itself.
 #
-# set_port only *starts* the service, detached, and returns at once: applying a
-# port reloads network, which tears down and re-creates br-lan, so a
-# synchronous ubus call could be cut off half-way. The page polls status and
+# set_port only *starts* the service, detached, and returns at once, so a slow
+# or failing worker can never hold the ubus call open. The page polls status and
 # shows the result when it lands.
+#
+# It calls the worker with --force on purpose: the page is an explicit choice of
+# port, and the normal sequence is "plug the ISP cable into lan3, then select
+# lan3" - the target port HAS carrier at that moment, which is exactly what the
+# worker's management-link guard refuses without --force (2026-10-29, adopted
+# from upstream v1.8.0; the CLI keeps the guard). The worker does not reload
+# network by default (this board's gmac can half-hang), so the page's status is
+# read from uci and the switch really takes effect on the next reboot.
 #
 # busybox ash: no ${var:offset}, no local outside functions, no arrays.
 set -u
@@ -178,7 +185,7 @@ call)
 		esac
 		[ "$(cfg enabled)" = "0" ] && { err "e2631_ports is disabled"; exit 0; }
 		installed || { err "e2631-wanport is not installed"; exit 0; }
-		start_detached apply "$port"
+		start_detached apply "$port" --force
 		ok
 		;;
 	*)

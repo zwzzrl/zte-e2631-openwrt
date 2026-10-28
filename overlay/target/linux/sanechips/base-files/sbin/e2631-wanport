@@ -29,6 +29,15 @@
 #   e2631-wanport selftest        不碰网络的自检（配置与命名解析）
 #   DRY_RUN=1 e2631-wanport apply <port>   只打印要执行的 uci 命令
 #
+#   apply 的两个开关：
+#     --force   目标口当前有链路（多半就是你的管理网线）时也照切。默认拒绝：
+#               切过去 WAN 区 input=REJECT，SSH/HTTP 立刻断、只剩 ping
+#               （2026-10-27 真机踩过，见文档 7.6）。
+#     --reload  切完立刻 /etc/init.d/network reload。默认**不做**：这颗 SoC 的
+#               gmac 在 network reload/restart 之后会半挂死（ICMP 部分应答、
+#               TCP 全死），所以默认只写 uci + 立刻改端口 MAC，运行态留给
+#               reboot。急用再显式加 --reload。
+#
 # 约定：日志进 syslog（logger -t e2631-wanport），标准错误另打一份，便于 ssh 里看。
 set -u
 
@@ -121,8 +130,8 @@ bridge_section() {
 # apply_port <port>
 # 幂等：目标口已经是 WAN 时只把 MAC/网桥校正一遍，不做无意义的 reload。
 apply_port() {
-	local port=$1 cur bp p mac w6
-	[ -n "$port" ] || { log "用法：$PROG apply <lan1|lan2|lan3|wan>"; return 1; }
+	local port=$1 cur bp p mac w6 carrier
+	[ -n "$port" ] || { log "用法：$PROG apply <lan1|lan2|lan3|wan> [--force] [--reload]"; return 1; }
 	case " $PORTS " in
 	*" $port "*) ;;
 	*) log "没有 $port 这个口（可选：$PORTS）"; return 1 ;;
@@ -133,6 +142,17 @@ apply_port() {
 	bp=$(bridge_section)
 	[ -n "$bp" ] || { log "uci 里找不到 br-lan 的 device 段，放弃"; return 1; }
 	mac=$(wan_mac)
+	# 目标口有链路、又不是现在的 WAN 口时先拒绝：真机上最可能的情况就是这根
+	# 网线正是你此刻的管理连接，切过去既断自己，又因为 WAN 区 input=REJECT
+	# 而只剩 ping（2026-10-27 踩过）。--force 绕过。
+	if [ "$port" != "$cur" ] && [ "${FORCE:-0}" != "1" ]; then
+		carrier=$(cat "$SYSFS/class/net/$port/carrier" 2>/dev/null)
+		if [ "$carrier" = "1" ]; then
+			log "$port 现在有链路（多半是你的管理网线）：切过去会立刻失去管理通道"
+			log "确认要把管理口改成 WAN 时加：--force"
+			return 1
+		fi
+	fi
 	# wan6 只有在「显式绑了某个设备」时才需要跟着改。绑的是 @wan 别名时它自己
 	# 就跟着 wan 走，再写成设备名等于把别名换掉——下次谁改了 wan.device，
 	# wan6 就落到一个不存在的 netdev 上（IPv6 整个哑掉，而且不报错）。
@@ -170,9 +190,20 @@ apply_port() {
 	uci commit "$CFG" 2>/dev/null
 
 	log "WAN 口 -> $port（原来 $cur）"
-	[ -x /etc/init.d/network ] && /etc/init.d/network reload >/dev/null 2>&1
-	ensure_port_mac "$port"
-	[ "$cur" != "$port" ] && restore_port_mac "$cur"
+	# MAC 立刻落地（上联的租约/DUID 第一次就认这个地址），但网络拓扑默认**不
+	# reload**：这颗 SoC 的 gmac/bridge 扛不住 network reload/restart，会半挂死
+	# （ICMP 部分应答、TCP 全死，见 known-issues 的 gmac 条目）。配置已经写进
+	# uci，重启后生效；确实需要立刻生效才加 --reload（2026-10-29 起默认关闭）。
+	if [ "${RELOAD:-0}" = "1" ] && [ -x /etc/init.d/network ]; then
+		/etc/init.d/network reload >/dev/null 2>&1
+		ensure_port_mac "$port"
+		[ "$cur" != "$port" ] && restore_port_mac "$cur"
+		log "已按 --reload 立刻 reload network（本板有半挂死风险）"
+	else
+		ensure_port_mac "$port"
+		[ "$cur" != "$port" ] && restore_port_mac "$cur"
+		log "配置已写入；本板 network reload 会让 gmac 半挂死，所以不动运行态：reboot 之后 $port 才真正当 WAN"
+	fi
 	return 0
 }
 
@@ -263,12 +294,22 @@ main() {
 	case "$action" in
 	apply)
 		shift
-		apply_port "${1:-}"
+		# --force：允许把当前有链路的口（多半是管理口）改成 WAN
+		# --reload：切完立刻 reload network（默认不做，见 apply_port 里那段）
+		for a in "$@"; do
+			case "$a" in
+			--force) FORCE=1 ;;
+			--reload) RELOAD=1 ;;
+			-*) echo "$PROG: 不认识的选项 $a" >&2; exit 2 ;;
+			*) PORT=${PORT:-$a} ;;
+			esac
+		done
+		apply_port "${PORT:-}"
 		;;
 	status) do_status ;;
 	selftest) do_selftest ;;
 	*)
-		sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
 		exit 2
 		;;
 	esac
