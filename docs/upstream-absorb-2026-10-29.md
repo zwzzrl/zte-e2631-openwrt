@@ -9,6 +9,9 @@
 |---|---|---|
 | `a6e75bf` P2-1/WiFi | 频段档位：2.4G `HE40 + noscan`、5G `HE80`。不写 `htmode` 时 netifd 退回 HT20，2.4G 协商封顶 ~287 Mbit/s，永远上不了 ~500 | `base-files/etc/config/wireless`（radio0）+ `sbin/e2631-wifi-ap`（按 `$ofs` 分档） |
 | `f6effe3` P2-1/PPE 的 **接口部分** | `apply` 目标口有链路时拒绝（`--force` 绕过）；worker 默认不 `network reload`（gmac 半挂死风险），只写 uci + 立刻改端口 MAC | `sbin/e2631-wanport` 新增 `--force` / `--reload`；LuCI 后端改为 `apply <port> --force`；策略与两边证据记在 `docs/known-issues.md` 的 `WANPORT-RELOAD-POLICY` |
+| `d68e3b7` P0-2 | `CONFIG_DEVMEM` 被静默关掉的**根因**：`include/kernel-defaults.mk` 把顶层 `.config` 每条 `CONFIG_KERNEL_*` 去掉前缀追加进内核配置，kconfig merge last-wins，而 `config/Config-kernel.in` 给 `KERNEL_DEVMEM` 默认 `n` | `seed/e2631.config` 加 `CONFIG_KERNEL_DEVMEM=y`；`known-issues` 的 `DEVMEM-DROPPED`（open 一周、写着"机制不明"）与 `FWSTATE-NEEDS-DEVMEM` 一起改成 fixed |
+| `42daef9` userdata | 47 MiB 分区的三个 blocker：窗口常量写成 `66384896`（应为 `0x3f00000`=66060288）、UBIFS magic 用大端字节序算 md5、`USE_PROCD=0` 不是"关闭" | 前两个我们**都中招**：两处 `66060288`、md5 改 `570471ba…`；`e2631-userdata` 与 `e2631-netune` 去掉 `USE_PROCD=0`（后者意味着开机调优一直是空跑） |
+| `f41432e` P2-2/P2-3 | 无线：显式选 `wpad-mbedtls` + 打包 `wireless-regdb`。上游的说法是 basic 变体"没有 802.11r/k/v、mesh、WPA3-SAE" | 三行都进了 `seed/e2631.config`；`known-issues` 新增 `WPAD-VARIANT-AND-REGDB`。**但上游那句话在我们这棵树不成立**，实测对比：所有 mbedtls 变体都带 `CONFIG_SAE=y`+`CONFIG_OWE=y`（basic 也有），basic 的描述本身写着支持 802.11r/11w；basic 真正缺的是 `full` 才加的 `CONFIG_MESH`/`CONFIG_DPP`/`CONFIG_DPP2`/`CONFIG_EAP_PWD`/`CONFIG_SUITEB192`/`CONFIG_WPS_NFC`，两个二进制里 `dpp` 21 vs 1、`mesh_fwding` 2 vs 0、`EAP-pwd` 3 vs 0、`suiteb` 2 vs 0 正是这个差别 |
 
 ## 看了但**不改**的
 
@@ -53,3 +56,15 @@ USB-TTL 串口恢复，期间 WAN/无线都无法实测。下面这些**必须**
    拒绝并打印提示；加 `--force` 才切。
 5. **默认不 reload**：`apply` 之后 SSH 不断、`uci show network.wan.device` 已变，
    但 `ip -4 addr show` 里 WAN 地址还是旧的，reboot 后才是新的。
+6. **`/dev/mem` 真的在**：`ls -l /dev/mem`、然后 `/sbin/e2631-fwstate` 应能读到
+   MT7916 的 `MT_TOP_MISC` 而不是报 `no /dev/mem`。构建侧已确认内核配置里
+   `CONFIG_DEVMEM=y`（不是猜，见 `docs/known-issues.md` 的 `DEVMEM-DROPPED`），
+   设备节点要真机才算数。
+7. **userdata 三个 blocker 的善后**：`e2631-userdata-init --plan` 这次应当**通过**
+   前两步检查（旧版在任何机器上都会停在 `expected >= 0x3f00000`）；`--apply` 之后
+   376 块格式化、`--plan` 通过、下次开机 `79_e2631_userdata` 能 attach、
+   `/etc/init.d/e2631-userdata` 的日志出现在 `dmesg` 里、再下次开机 extroot 接管
+   `/overlay`。顺带确认 `e2631-netune` 真的执行了：`cat /sys/class/net/lan1/queues/rx-0/rps_cpus`
+   应该是 `2`。
+8. **wpad 全量变体**：`iw reg get` 应显示来自 regdb 的 CN 视图；802.11s/DPP 这类原来没有的能力现在应当出现（`iw list` 里的 mesh point、LuCI 的 mesh 页）。注意 802.11r/11w 在 basic 变体里本来就有（我们核对过这棵树的 hostapd
+   Makefile），别把"basic 没有 11r"当成结论。

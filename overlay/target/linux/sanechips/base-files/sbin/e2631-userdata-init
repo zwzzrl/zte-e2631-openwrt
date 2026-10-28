@@ -38,7 +38,10 @@ off=$(cat "$base/offset") || die_noformat "cannot read $base/offset"
 size=$(cat "$base/size") || die_noformat "cannot read $base/size"
 
 # 2. it must be the 47 MiB window behind both image slots (>= 0x3f00000)
-[ "$off" -ge 66384896 ] || die_noformat "mtd$idx starts at $off, expected >= 0x3f00000 - refusing to touch another layout"
+#    66060288 = 0x3f00000.  The old value here was 66384896 (0x3f4f400), so
+#    every unit refused before writing anything; upstream hit the same one
+#    (42daef9) and the fix is the same constant.
+[ "$off" -ge 66060288 ] || die_noformat "mtd$idx starts at $off, expected >= 0x3f00000 - refusing to touch another layout"
 
 # 3. not mounted, and no UBI currently attached to it
 grep -qs "^/dev/mtd$idx " /proc/mounts && die_noformat "mtd$idx is mounted"

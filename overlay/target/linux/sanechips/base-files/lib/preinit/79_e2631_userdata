@@ -34,7 +34,11 @@ e2631_userdata_preinit() {
 	# not sanction, and the safest answer is to not touch it
 	[ "$off" -ge 0 ] || return 0
 	[ "$((off + size))" -le "$total" ] || return 0
-	[ "$off" -ge 66384896 ] || return 0   # 0x3f00000: end of slot B
+	[ "$off" -ge 66060288 ] || return 0   # 66060288 = 0x3f00000, the end of slot B.
+	# This constant used to read 66384896 (0x3f4f400), 324608 past the real
+	# boundary, so a `userdata` partition at its declared 0x3f00000 never
+	# passed the gate and the UBI was never attached. Found by comparing the
+	# constant against the DTS reg, and confirmed upstream (42daef9).
 
 	if ! grep -qs "^$idx\$" /sys/class/ubi/ubi[0-9]*/mtd_num 2>/dev/null; then
 		ubiattach -d 0 /dev/ubi_ctrl -m "$idx" >/dev/null 2>&1 || return 0

@@ -14,8 +14,14 @@
 #   the boot after that mounts it as /overlay (extroot).
 #
 # One boot of latency, in exchange for "booting can never format anything".
+#
+# No USE_PROCD line on purpose.  rc.common decides by testing [ -n "$USE_PROCD" ],
+# so "USE_PROCD=0" is NOT "off" - it enters the procd branch, which replaces the
+# start() below with the procd registration path and leaves the gate doing
+# nothing at all.  That was the third blocker upstream found in this exact
+# family of scripts (42daef9); leaving the variable unset is what makes the
+# plain shell start() run.
 START=11
-USE_PROCD=0
 
 vol_device() {
 	idx=""
@@ -31,10 +37,14 @@ vol_device() {
 }
 
 ubifs_formatted() {
-	# UBIFS superblock node magic at LEB 0 offset 0 (bytes 06 10 18 31).
-	# md5sum, not od/hexdump: this image's busybox ships neither applet.
+	# UBIFS superblock node magic at LEB 0 offset 0.  The magic is 0x06101831
+	# stored as a little-endian u32, so the four bytes on flash are 31 18 10 06
+	# - NOT the big-endian display order.  md5sum, not od/hexdump: this image's
+	# busybox ships neither applet.  (The wrong order lived here until upstream
+	# tested the partition for real, 42daef9: the gate could never match, so an
+	# initialised volume was never activated.)
 	dev=$(vol_device) || return 1
-	[ "$(dd if="$dev" bs=4 count=1 2>/dev/null | md5sum | cut -c1-32)" = "2c877f7819b017ca63cb0a53e3b12ca3" ]
+	[ "$(dd if="$dev" bs=4 count=1 2>/dev/null | md5sum | cut -c1-32)" = "570471baa3a367a44fa9baef107a7216" ]
 }
 
 active() { grep -qs ' /overlay .*ubifs' /proc/mounts; }

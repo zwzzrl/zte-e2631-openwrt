@@ -21,7 +21,10 @@
 #  GRO on - the driver already feeds napi_gro_receive(); this only makes the
 #    intent explicit and survives any future default change.
 START=20
-USE_PROCD=0
+# No USE_PROCD line: rc.common tests [ -n "$USE_PROCD" ], so "USE_PROCD=0" is
+# not "off" - it takes the procd branch and the plain start() below then never
+# runs, which is how this tuning silently did nothing. Upstream found the same
+# in its userdata scripts (42daef9); the fix is to leave the variable unset.
 
 PORTS="lan1 lan2 lan3 wan"
 

@@ -43,18 +43,28 @@ points at something in the repository or at a measurement.
   workaround: the diagnostic beacon is opt-in since v1.3 - "touch /etc/e2631-hb-enable" restores it
 - id: FWSTATE-NEEDS-DEVMEM
   severity: minor
-  status: open
+  status: fixed
   surface: debugging
   symptom: /sbin/e2631-fwstate cannot work in the shipped image ("no /dev/mem")
   verified: yes, on the box
+  cause: the same dropped symbol as DEVMEM-DROPPED below - the tool is correct, the kernel had no /dev/mem
+  fix: seed/e2631.config carries CONFIG_KERNEL_DEVMEM=y; the build now does produce CONFIG_DEVMEM=y (2026-10-29, checked in the built kernel .config, not assumed). /sbin/e2631-fwstate still needs one on-box run before the issue is closed for real
   next: build/wsl/build-regprobe.sh produces the module that reads the same register
 - id: DEVMEM-DROPPED
   severity: major
-  status: open
+  status: fixed
   surface: kernel config
   symptom: CONFIG_DEVMEM=y is requested in both generic and the target fragment, and the built .config comes out "not set"
-  verified: yes (out/gen1/config-6.18:2314 vs generic/config-6.18:1494 and sanechips/config-6.18:147)
-  note: why the request is dropped is still unexplained - do not re-add a fragment edit on the assumption it will work
+  verified: yes (out/gen1/config-6.18:2314 vs generic/config-6.18:1494 and sanechips/config-6.18:147); mechanism confirmed upstream and the fix verified in a local build on 2026-10-29
+  cause: |
+    include/kernel-defaults.mk appends every CONFIG_KERNEL_* line of the top-level
+    .config to the merged kernel config with the CONFIG_KERNEL_ prefix stripped
+    (the package -> kernel passthrough), and the kconfig.pl merge is last-wins.
+    config/Config-kernel.in declares KERNEL_DEVMEM with default n, so the top-level
+    .config carried "# CONFIG_KERNEL_DEVMEM is not set" and the passthrough appended
+    "# CONFIG_DEVMEM is not set" after the fragments' =y. No fragment or patch ever
+    asked for n; the package-level option simply won.
+  fix: CONFIG_KERNEL_DEVMEM=y in seed/e2631.config - the upstream-sanctioned mechanism, explicitly not another fragment edit (that was the wrong layer all along). Found upstream (d68e3b7) after this file spent a week saying "mechanism unexplained".
 - id: WIFI-2G4-UNVERIFIED
   severity: minor
   status: fixed
@@ -370,6 +380,52 @@ points at something in the repository or at a measurement.
   verified: yes - the window is free in every vendor version checked (all four upgrade packages 4B4..8B8 declare identical slot tables ending at 0x3f00000; the stock kernel declares nothing beyond 0x2fc0000; the programmer dump shows 0x3cc0000..0x72c0000 erased); tigaotg ran a UBIFS extroot on it for weeks
   workaround: "v1.3 ships the partition plus a gated extroot: preinit attaches the UBI only, /etc/init.d/e2631-userdata enables the fstab mount only after reading a real UBIFS superblock (magic 0x06101831), and /sbin/e2631-userdata-init formats the volume only under an explicit E2631_CONFIRM"
   note: boot can never format the volume (a read-write mount of a blank volume would auto-format it; the gate keeps that out of the boot path). The JFFS2-to-UBIFS migration prototype from PR#1 is NOT shipped - whiteouts/xattrs/power-fail atomicity are unsolved there
+  blockers: |
+    Three defects kept this feature from ever working, all found by upstream actually
+    formatting the partition (42daef9) and two of them present in our tree until
+    2026-10-29 - they are recorded here because "the mechanism exists" was true for a
+    week while "the mechanism ran" was not:
+      * the window guard used 66384896 (0x3f4f400) where the boundary is 66060288
+        (0x3f00000). Both the preinit attach (lib/preinit/79_e2631_userdata) and the
+        formatter (/sbin/e2631-userdata-init) therefore refused on every unit, while the
+        DTS declares userdata at exactly 0x3f00000 - an offline arithmetic proof, no
+        hardware needed.
+      * USE_PROCD=0 in etc/init.d/e2631-userdata is not "off": rc.common tests
+        [ -n "$USE_PROCD" ], so the string 0 selected the procd branch. The block at
+        package/base-files/files/etc/rc.common:121 runs after `. "$initscript"` and
+        redefines start() as rc_procd start_service - both scripts define start() and
+        neither defines start_service, so the script's own start() was never called and
+        the gate became a no-op. Same line removed from etc/init.d/e2631-netune, which
+        means that boot-time tuning (RPS/XPS, IRQ affinity, PAUSE off, GRO) had been
+        doing nothing at all. The correct form is to leave the variable unset.
+      * the UBIFS magic was checked as md5 of the big-endian display order (06 10 18 31)
+        while the volume stores the little-endian u32 (31 18 10 06): 2c877f78... never
+        matched, 570471ba... is the real constant. An initialised volume would never
+        have been activated.
+    Fixed offline on 2026-10-29; the on-box acceptance (format -> 376 blocks -> mount ->
+    extroot on the next boot) still needs the serial console.
+- id: WPAD-VARIANT-AND-REGDB
+  severity: major
+  surface: wi-fi
+  status: fixed
+  symptom: no 802.11s mesh, no DPP/DPP2, no EAP-PWD and no Suite-B 192 whatever the configuration; and 5 GHz channel/power/DFS followed the driver's built-in regdomain instead of the CN view
+  verified: offline - the built manifest carries wpad-mbedtls + wireless-regdb and no wpad-basic, and the installed binary is the full one (1,696,459 B vs the basic variant's 979,231 B; `dpp` 21 hits vs 1, `mesh_fwding` 2 vs 0, `EAP-pwd` 3 vs 0, `suiteb` 2 vs 0 in the two binaries, 2026-10-29). On-air behaviour unverified: the box is awaiting its serial cable
+  cause: |
+    Nothing in this tree ever selected a wpad variant, so the target's DEFAULT picked
+    wpad-basic-mbedtls; CONFIG_PACKAGE_wireless-regdb=y sat commented out in the seed.
+    Upstream (f41432e) describes the basic variant as having no 802.11r/k/v, no mesh and
+    no WPA3-SAE - that is NOT what this tree's hostapd Makefile says, and it was worth
+    checking instead of copying: every mbedtls variant gets CONFIG_SAE=y and CONFIG_OWE=y
+    (basic included), and the basic description itself advertises 802.11r + 802.11w. What
+    basic genuinely lacks is the `full` variant's extra makeopts - CONFIG_MESH, CONFIG_DPP,
+    CONFIG_DPP2, CONFIG_EAP_PWD, CONFIG_SUITEB192, CONFIG_WPS_NFC - and that is exactly
+    the difference measured in the two binaries above.
+  fix: seed/e2631.config now selects CONFIG_PACKAGE_wpad-mbedtls=y and CONFIG_PACKAGE_wireless-regdb=y
+  next: |
+    * On the box: `iw reg get` should show the regdb CN view, and 802.11s/DPP should now be
+      offered where they were absent before (e.g. `iw list` mesh point interface modes,
+      LuCI's mesh page). 802.11r/11w were already there in basic; 11k/11v was never
+      verified either way on this board.
 - id: PACK-NEEDS-VENDOR-TEMPLATE
   severity: major
   status: fixed
@@ -525,15 +581,20 @@ attached, and a failed experiment then costs a reboot rather than the box.
 `CONFIG_DEVMEM` is asked for twice - in `target/linux/generic/config-6.18` and in the
 target fragment - and the built config says it is not set. Nothing in the tree asks for
 `n`, and `drivers/char/Kconfig` has it as a plain `bool` defaulting to on. The mechanism
-that drops it is still unidentified, which is why this is listed as an open issue rather
-than a solved one: the honest state is "we do not know, and a fragment edit written on the
-assumption that it will work is a waste of a build".
+that drops it is now known, and the lever was never a fragment: `include/kernel-defaults.mk`
+appends every `CONFIG_KERNEL_*` line of the top-level `.config` to the merged kernel config
+with the prefix stripped, and the `kconfig.pl` merge is last-wins; `config/Config-kernel.in`
+declares `KERNEL_DEVMEM` with default `n`, so the passthrough carried
+`# CONFIG_DEVMEM is not set` *after* the fragments' `=y` and won. Fixed on 2026-10-29 with
+`CONFIG_KERNEL_DEVMEM=y` in `seed/e2631.config` - one line at the layer that decides it -
+after upstream published the same root cause (`d68e3b7`). This file said "mechanism
+unexplained, do not re-add a fragment edit" for a week, and that warning was correct.
 
-The consequence is that `/sbin/e2631-fwstate`, which reads the MT7916's `MT_TOP_MISC`
-register to answer "what is the firmware doing right now", cannot run in the shipped
-image - it fails with `no /dev/mem`. `wsl/build-regprobe.sh` builds a module against
-exactly the kernel this kit ships, and that module is the replacement: it reads the same
-register from inside the kernel, where the address space is available.
+The consequence *was* that `/sbin/e2631-fwstate`, which reads the MT7916's `MT_TOP_MISC`
+register to answer "what is the firmware doing right now", could not run in the shipped
+image - it failed with `no /dev/mem`. With the symbol in place that tool has its device;
+`wsl/build-regprobe.sh` (a module that reads the same register from inside the kernel)
+stays as the fallback for a kernel built without `/dev/mem`.
 
 ## PACK-NEEDS-VENDOR-TEMPLATE
 
