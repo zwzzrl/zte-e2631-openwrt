@@ -91,3 +91,10 @@ table ids (2..6), not the 384 over two that the driver assumed.
 侧比对；(b) `tm_acl_fast_add_v4v6()` 不是原厂 IPv6 快路径真正走的那条，地址是在
 `switch.ko` 里装进另一个结构的。真机一回来就能用现有 `dump`/`v6_key` 两个参数分辨。
 
+静态反汇编也核对过一遍，排除「这是仿真器的假象」这个可能：`tm_acl_fast_add_v4v6`
+（`tm.ko` `.text` `0x4d2b4`，长 `0x7a4`）里 `0x4d380..0x4d600` 是一整块展开的打包
+代码，写完整个表项，其中没有任何按协议族选择窗口数的分支 —— 唯一按族判断的是
+`0x4d328`/`0x4d32c` 的 `subne #3` / `subeq #4`，它只决定方向（上行/下行）。所以
+「软件侧窗口布局与协议族无关、由 extract index 决定」是代码本身的性质。
+
+
