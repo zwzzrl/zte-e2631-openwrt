@@ -38,3 +38,9 @@ payload/
 # on this machine and the vendor template package. Never commit it - .env.example
 # is the checked-in version.
 /.env
+
+# In-repo scratch: vendor harvests, jffs2 rebuild trees, disassembly dumps.
+# Nothing here is an input; whatever turns out to be a finding is written up
+# under docs/ instead, so this directory never needs to be committed.
+/.scratch/
+__pycache__/

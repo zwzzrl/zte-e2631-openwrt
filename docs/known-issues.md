@@ -297,6 +297,20 @@ points at something in the repository or at a measurement.
       ULA there changed nothing observable, because a frame for our own address is
       already handled by the classifier's "other L3 -> CPU" default action.  Their
       real job is probably on the vendor's ACL/DPI path, not on ours.
+    * 2026-10-29 晚补的三个仿真器探针（`tools/vendor-emu` 的 `t_gfhr.py` /
+      `t_key.py` / `t_poly.py`，细节和映射表在那个目录的 README「第二轮」小节）：
+        - 表项里的 extract index 字节我们是对的：原厂 IPv6 就是 `0x40|10 = 0x4a`，
+          和 `zx_ppe_hash_entry()` 写的一致。
+        - 45 字节 key 里的规则号不一样：原厂 IPv6 上行写 `0xa0 = 10<<4`，我们写
+          `0x99 = v6_rule`。同一条差异在 v4 上也存在（原厂 `0x90`、我们 `0x98`）却
+          没有挡住 v4 命中，所以它只是候选。真机上把 `v6_key=0xa0` 一设、看同一股
+          v6 流的 aging bit 0 就知道了。
+        - 还有一个**没解的矛盾**，别再按旧假设推：喂了真实多项式配置之后，原厂
+          type-5 的 hash 表项仍然只写 v4 那 13 字节窗口（`e19..e32`，来自描述符
+          `+0x62/+0x64..+0x67/+0x6c..+0x6f/+0x74..+0x77`），描述符 `+0x00..+0x124`
+          里没有任何 IPv6 地址被读进窗口；而驱动写的是 19 窗口 38 字节。要么原厂
+          v6 快表项只用前缀+端口做 key、地址靠规则掩码在硬件侧比，要么
+          `tm_acl_fast_add_v4v6()` 不是原厂 IPv6 快路径走的那条。
     Measurement note, because it cost a wrong conclusion once: tx_submitted in
     /sys/kernel/debug/92000000.ethernet/dma_state proves that the CPU did *not* touch
     a packet, which is not the same as proving the hardware forwarded it - a dropped
