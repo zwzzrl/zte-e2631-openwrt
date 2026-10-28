@@ -1,0 +1,56 @@
+#!/bin/sh
+# Load the zx279128s packet-processor engine, guarded so a bad module can never
+# lock the box out (see /etc/init.d/e2631-ppe for the why; 2026-10-29 incident).
+#
+# Markers live in the overlay, so they survive a reboot:
+#   /etc/e2631-ppe-pending  written BEFORE insmod, removed only after the box has
+#                           demonstrably stayed alive with the module loaded.  A
+#                           boot that finds it means the previous attempt either
+#                           hung the kernel or died before confirming - so this
+#                           boot does NOT load the engine and the box comes up.
+#   /etc/e2631-ppe-failed   left behind by that skip, with the reason; delete both
+#                           files to arm another attempt.
+#
+# Usage: e2631-ppe-boot [defer-seconds]
+set -u
+
+MARK_PENDING=/etc/e2631-ppe-pending
+MARK_FAILED=/etc/e2631-ppe-failed
+DEFER=${1:-20}
+CONFIRM=${CONFIRM:-60}
+
+log() { logger -t e2631-ppe "$*" 2>/dev/null; echo "e2631-ppe: $*" >&2; }
+
+if [ -e "$MARK_PENDING" ]; then
+	log "上次加载没有确认（内核可能卡死过），本次跳过引擎；确认无误后删掉 $MARK_PENDING 与 $MARK_FAILED 再试"
+	{
+		echo "skipped at $(date 2>/dev/null || echo '?')"
+		echo "reason: $MARK_PENDING still present at boot"
+	} > "$MARK_FAILED"
+	# 不删 pending：下次开机继续跳过，直到人确认
+	exit 0
+fi
+
+# 等网络/防火墙都起来再动 CLA，失败也不影响已经可用的系统
+sleep "$DEFER"
+
+: > "$MARK_PENDING" || log "警告：写不了 $MARK_PENDING，本次加载没有守卫"
+
+if ! modprobe zx279128s_ppe 2>/dev/null; then
+	log "modprobe 失败（模块不存在或不接受当前内核），引擎不可用，其余功能照常"
+	rm -f "$MARK_PENDING"
+	exit 1
+fi
+
+log "引擎已加载；$CONFIRM 秒后若这台机器还活得下来就撤掉 pending 标记"
+
+# 确认窗口：卡死时这个子进程根本不会跑完，标记就留在 overlay 里
+(
+	sleep "$CONFIRM"
+	if rm -f "$MARK_PENDING" 2>/dev/null; then
+		logger -t e2631-ppe "engine confirmed alive after ${CONFIRM}s" 2>/dev/null
+		rm -f "$MARK_FAILED"
+	fi
+) </dev/null >/dev/null 2>&1 &
+
+exit 0
