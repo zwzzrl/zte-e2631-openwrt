@@ -1315,6 +1315,115 @@ module_param_cb(cla_write, &zx_ppe_cla_write_ops, &zx_ppe_cla_write_storage, 064
 MODULE_PARM_DESC(cla_write,
 		 "write CLA registers: \"offset=value,offset=value\" (hex), reads each back");
 
+/*
+ * "echo 0x20000 > .../parameters/xprobe" reads a physical window that the
+ * vendor's cla_set_external_hash_table() writes its hash entries to.
+ *
+ * That function forms the address arithmetically out of thin air:
+ *
+ *	addr = (0x3c40800 + idx) << 6 = 0xF1020000 + 64 * idx
+ *
+ * 0xF1020000 is a *virtual* address, not a physical one, and the vendor
+ * kernel's private map_desc table says exactly what it is.  The table sits at
+ * ~0xc060e350 in vendor-vmlinux.bin as 16 {virtual, pfn, length, type}
+ * entries, and its last entry is
+ *
+ *	[15] virt 0xF1000000  phys 0x00000000  len 0x00520000  type 0 (MT_DEVICE)
+ *
+ * so the window is 0xF1000000 + 0x20000, i.e. physical 0x00020000, one entry
+ * per 64 bytes - a 5 MiB device region at the bottom of the physical map
+ * (the other entries in that table map the switch at 0xF4000000 <- 0x92000000
+ * and 0xF0E00000 <- 0x92000000, plus the register blocks at 0x94/0x93/0x91...).
+ * Nothing in this kernel claims or maps physical 0x20000, hence the probe: a
+ * read of an unbacked address raises an external abort, so set
+ * /proc/sys/kernel/panic_on_oops=0 first - then the oops kills the faulting
+ * task and "Unhandled fault: external abort" lands in dmesg instead of a
+ * reboot.  A bus hang (no abort, no data) is the only unrecoverable outcome.
+ *
+ * syntax:	"0x20000"  - read 16 words at that physical address
+ *		"w0x20000" - then write four words and read them back
+ * Every run reads the CLA window at 0x9238c000 first as a control, so a
+ * failure cannot be blamed on a broken ioremap path.
+ */
+#define ZX_PPE_XPROBE_STRIDE	64
+#define ZX_PPE_XPROBE_WORDS	16
+
+static int zx_ppe_xprobe_storage;
+
+static void zx_ppe_xprobe_one(unsigned long addr, bool do_write)
+{
+	void __iomem *p;
+	u8 __iomem *q;
+	u32 w[ZX_PPE_XPROBE_WORDS];
+	int i;
+
+	pr_info("zx279128s-ppe: xprobe: mapping phys 0x%08lx, reading next\n",
+		addr);
+	p = ioremap(addr, ZX_PPE_XPROBE_STRIDE);
+	if (!p) {
+		pr_err("zx279128s-ppe: xprobe: ioremap 0x%08lx failed\n", addr);
+		return;
+	}
+	q = p;
+	pr_info("zx279128s-ppe: xprobe: mapped, reading %d words\n",
+		ZX_PPE_XPROBE_WORDS);
+	for (i = 0; i < ZX_PPE_XPROBE_WORDS; i++)
+		w[i] = readl(q + i * 4);
+	pr_info("zx279128s-ppe: xprobe: %08x %08x %08x %08x | %08x %08x %08x %08x\n",
+		w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+	pr_info("zx279128s-ppe: xprobe: %08x %08x %08x %08x | %08x %08x %08x %08x\n",
+		w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+
+	if (do_write) {
+		for (i = 0; i < 4; i++)
+			writel(0xe2631000 | i, q + i * 4);
+		for (i = 0; i < 4; i++)
+			w[i] = readl(q + i * 4);
+		pr_info("zx279128s-ppe: xprobe: wrote e263100[0-3], reads back %08x %08x %08x %08x\n",
+			w[0], w[1], w[2], w[3]);
+	}
+	iounmap(p);
+}
+
+static int zx_ppe_xprobe_set(const char *val, const struct kernel_param *kp)
+{
+	void __iomem *ctl;
+	unsigned long addr;
+	bool do_write = false;
+	int ret;
+
+	if (!val)
+		return -EINVAL;
+	if (*val == 'w' || *val == 'W') {
+		do_write = true;
+		val++;
+	}
+	ret = kstrtoul(val, 0, &addr);
+	if (ret || addr < 0x1000 || addr > 0xffffffffUL - ZX_PPE_XPROBE_STRIDE)
+		return -EINVAL;
+
+	/* control: the classifier window, certainly backed */
+	ctl = ioremap(0x9238c000, 4);
+	if (ctl) {
+		pr_info("zx279128s-ppe: xprobe: control 0x9238c000 reads %08x\n",
+			readl(ctl));
+		iounmap(ctl);
+	} else {
+		pr_warn("zx279128s-ppe: xprobe: control ioremap failed\n");
+	}
+
+	zx_ppe_xprobe_one(addr, do_write);
+	return 0;
+}
+
+static const struct kernel_param_ops zx_ppe_xprobe_ops = {
+	.set = zx_ppe_xprobe_set,
+	.get = param_get_int,
+};
+module_param_cb(xprobe, &zx_ppe_xprobe_ops, &zx_ppe_xprobe_storage, 0644);
+MODULE_PARM_DESC(xprobe,
+		 "probe a physical window: \"0x20000\" reads 16 words, \"w0x20000\" also writes and reads back");
+
 static void zx_ppe_dump_adapter(struct zx_eth_adapter *adapter, void *data)
 {
 	mutex_lock(&adapter->ppe_lock);

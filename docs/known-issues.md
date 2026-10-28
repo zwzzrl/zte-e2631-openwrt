@@ -75,7 +75,7 @@ points at something in the repository or at a measurement.
   status: mitigated
   surface: ethernet + ipv6
   symptom: LAN client -> router over IPv6 TCP connects in ~1 ms and then no payload ever arrives (0 bytes, times out); IPv4 over the same port and ICMPv6 are fine, so it reads as a random hang. Also stalls IPv6 TCP through the router to the internet.
-  verified: yes - 2026-10-27 (the stall, then the IPv4-only workaround), 2026-10-28 (trap cause, extract index, and the hash-entry experiments below, all on this board)
+  verified: yes - 2026-10-27 (the stall, then the IPv4-only workaround), 2026-10-28 (trap cause, extract index, and the hash-entry experiments below, all on this board), 2026-10-29 (the vendor's external hash window decoded and probed: it is boot code, finding 5)
   cause: |
     Three findings, in the order they were proven, and the third one says the entry
     cannot be closed as "fixed":
@@ -137,6 +137,43 @@ points at something in the repository or at a measurement.
        entry written into all 384 slots, still sent every one of ~28,000 packets of a
        forwarded burst through the CPU (far end counted them all, so nothing was
        dropped).
+    5. The external table of finding 4 is *not* table memory on this board, measured
+       on 2026-10-29.  cla_set_external_hash_table() builds its destination by
+       arithmetic on a constant - "(0x3c40800 + idx) << 6", i.e. 0xF1020000 + 64*idx,
+       one entry per 64 bytes - and 0xF1020000 is a *virtual* address.  The vendor
+       kernel says what is behind it: vendor-vmlinux.bin carries the board's private
+       iotable_init map_desc array (16 {virtual, pfn, length, type} entries at file
+       offset 0x606350, ~0xc060e350 once loaded at 0xc0008000), and its entries
+       decode to virt 0xF4000000 <- phys 0x92000000 (the switch, 4 MiB), virt
+       0xF0E00000 <- phys 0x92000000, the register blocks at phys 0x910/0x930/0x940/
+       0x94400000 - and, as the last one,
+         [15] virt 0xF1000000  phys 0x00000000  len 0x00520000  type 0 (MT_DEVICE)
+       so the window is physical 0x00020000 + 64*idx, a 5 MiB device mapping at the
+       bottom of the physical map.  Reading it (module param xprobe, added for this:
+       "echo 0x20000 > .../parameters/xprobe" does ioremap+readl on any physical
+       address, after first reading the CLA window at 0x9238c000 as a control) gives
+       boot code, not a hash table:
+         * phys 0x001000, 0x008000, 0x020000, 0x028000, 0x040000 and 0x100000 all
+           return the same 16 words - e59ff120 eafffffe x7 | e10f0000 e38000c0
+           e121f000 ee100f10 - an ARM exception vector table (ldr pc,[pc,#0x120],
+           every unused vector a "b .") followed by a startup stub (mrs/msr cpsr,
+           mrc p15 reading the control register).  Six addresses 64 KiB apart
+           returning word-for-word the same data means the low window is aliased
+           ROM/SRAM, not addressed storage;
+         * phys 0x400000 reads 16 zero words;
+         * phys 0x51ff00 raises an imprecise external abort ("Unhandled fault:
+           imprecise external abort (0x406)"), and 0x20840 did the same to the
+           writing shell.  Both survived only because /proc/sys/kernel/panic_on_oops
+           was set to 0 for the probe; with the shipped setting that is a reboot.
+       Conclusion: on this board the vendor's external-table window is the boot code
+       area, and writing 24-byte hash entries at 0x20000+ would overwrite the vector
+       table, so the v6 "missing write" of finding 4 is not a write into physical
+       0x20000.  What cla_set_external_hash_table() does for a v6 flow in the
+       emulator is therefore either dead code carried over from another SoC or a
+       fallback that this board never reaches - but it is no longer a candidate for
+       why the v6 entry never matches.  What that leaves is the key string itself
+       (finding 3) and the EN_V6FAST_EXTIDXTBL read-modify-write of the index
+       entry's word 4, which is a write to the *internal* index table we do control.
   workaround: |
     IPv6 *works* in the configuration that ships: ipv6=0 keeps the IPv6 trap on, so
     IPv6 takes the CPU software path exactly as it did before any of this, and that
