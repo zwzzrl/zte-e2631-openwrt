@@ -1,189 +1,162 @@
-# 原厂 IPv6 卸载的写入序列（ACL L3 hardfast / sbrg IPv6 表）—— 离线反汇编
+# 原厂 IPv6 卸载的硬件访问序列（离线反汇编，2026-10-30 第二版）
 
-> 对象：`switch.ko`（224808 B）与 `tm.ko`（1270520 B），
-> 取自 `03-固件备份/vendor-rootfs-decrypted/kmodule-unsquashfs/`（原厂 kmodule.img 解开）。
-> 方法：`arm-openwrt-linux-objdump -dr`，靠重定位拿到调用符号名。
-> 本文除显式标「推断」的段落外，都是指令级证据。
-> 反汇编全文留在 `/tmp/sbrg_add.txt`（685 行，可复查）。
+> 对象：`switch.ko`（224808 B）、`tm.ko`（1270520 B），取自
+> `03-固件备份/vendor-rootfs-decrypted/kmodule-unsquashfs/`。
+> 方法：`arm-openwrt-linux-objdump -dr`，靠重定位拿符号名。除标「推断」外都是指令级证据。
+> 中间产物：`/tmp/sbrg_add.txt`（`sbrg_add_ipv6table` 全文）、`/tmp/sbrg_lookup.txt`。
+
+## ⚠ 勘误：第一版把两条不同的路径混成了一条
+
+第一版文档写的是
+`zte_api_fast_l3_session_add → sbrg_add_ipv6table`。
+**这是错的。** 反汇编 `zte_api_fast_l3_session_add`（0x5ce74，0x1590 B）的全部调用：
+
+```
+37 printk   4 __memzero   3 _raw_spin_unlock_bh   3 cla_list_hash_addr_gen
+1 tm_findFastIdxByTuple   1 tm_add_acl_flow_rule   1 _raw_spin_lock_bh
+1 kmem_cache_alloc        1 get_flowidx
+```
+
+它**根本不碰 `sbrg_*`**，走的是 **CLA**（`cla_list_hash_addr_gen`）+ ACL 规则队列
+（`tm_add_acl_flow_rule`）。
 
 ---
 
-## 0. 一句话结论
+## 1. 原厂至少有三套互相独立的表（这一条是本轮最大的修正）
 
-原厂给 IPv6 写硬件表，是**四步**：算哈希 → 选槽 → 探空 → 写 12 个字；
-落到寄存器上只有四个：**19（间接命令）、20（忙）、76/77/78（三个数据字）、29（表选择）**。
-我们驱动里这四步**已经全部对上了**（含 CRC 与槽位公式），
-**唯一对不上的是那 12 个字的打包方式**——我们用的是从组播/MLD 代码反推的布局。
+| 表族 | 访问窗口 | 用途 | 对应我们驱动里的 |
+|---|---|---|---|
+| **CLA**（classifier）哈希表 | ONU 寄存器 **1（命令/状态）、2（数据）** | 分类器哈希查找；`cla_set_hash_table` / `cla_get_hash_table` / `cla_acl_hash_addr_gen` / `cla_list_hash_addr_gen` | `zx_ppe_sbrg_*` 的兄弟：`ZX_CLA_*` 那一套（第七～九轮在打的） |
+| **sbrg** IPv6 表 | ONU 寄存器 **19（命令）、20（忙）、76/77/78（数据）、29（table_sel）** | 字符串里明写 `ipv6 multicast address table`，即**组播/MLD 表**（12 字 = 48 B 表项） | `zx_ppe_sbrg_*`（第八轮移植的，格式是对的） |
+| **fast_l3_session / PP-RAM** | `addFlowOperInfo` → `pp_pm_set_*_ram_info` | 隧道/封装会话加速（`pp_pm_set_b4_ipv6_ram_info`、`aftr_ipv6`、`pon_pp_set_dslite_*`、`pon_pp_set_6rd_sip`） | 我们完全没有 |
 
----
+所以「原厂的 IPv6 加速走 ACL L3 hardfast 而不走 CLA」这个说法要收窄：
+`sw_acl_l3_hardfast_session_add` 这个名字里的 "acl" 指的是它下发的规则形态，
+而它最终落的表是 **CLA 哈希 + 封装 RAM 信息**，不是独立的一张 ACL IPv6 表。
 
-## 1. 调用链（指令级）
+## 2. 调用链（改正后）
 
 ```
 netfilter flowtable 卸载
-  └─ switch.ko  sw_acl_l3_hardfast_session_add(desc)     0x28e0, 0x684 B
-       ├─ TO_WAN(desc->dev @+24)                          → 方向位
-       ├─ sw_acl_setMtchInfo(desc, stack_desc)            0x1e24
-       ├─ get_sw_port_from_devname()                      端口号
-       └─ zte_api_fast_l3_session_add(...)          ← 真正的表操作在 tm.ko
-            └─ tm.ko  sbrg_add_ipv6table(t)        0xf004, 0x8cc B
-                 ├─ sbrg_get_table_sel(&sel)       读 ONU 寄存器 29
-                 ├─ sbrg_get_multi_vlan_mode(&m)   读（mode==0 时用 vlan）
-                 ├─ sbrg_hash(key, unused, 0x10c)  10 位哈希
-                 ├─ sbrg_get_indreg_wr_cfg(sel, addr)   探空（读 76/77/78）
-                 ├─ sbrg_set_indreg_wr_cfg(sel, addr)   写前设地址
-                 └─ tmOnuRegWrite(78→77→76)            每块 3 字，共 4 块
+  └─ switch.ko  sw_acl_l3_hardfast_session_add(desc)    0x28e0, 0x684 B
+       ├─ TO_WAN(desc+24)                    定方向
+       ├─ sw_acl_setMtchInfo(desc, stack)    0x1e24, 填匹配域
+       ├─ get_sw_port_from_devname()         端口号
+       └─ tm.ko zte_api_fast_l3_session_add()  0x5ce74, 0x1590 B
+            ├─ tm_findFastIdxByTuple()        0x57c50  ← 按 5 元组在硬件里找现成表项
+            ├─ cla_list_hash_addr_gen()  ×3   0x71a0   ← 算 3 个列表地址
+            └─ tm_add_acl_flow_rule()         0x51a30
+                 └─ addFlowOperInfo()         0x4fe70, 0xcb4 B
+                      └─ pp_pm_set_modify_ram_info()
+                         pp_pm_set_{pppoe_session_id,b4_ipv6,aftr_ipv6}_ram_info()
+                         pon_pp_set_{dslite_traffclass_hoplimit,dslite_flow_lable,6rd_sip}()
 ```
 
-`hf_set_l3_entry`（0x2f64）本身是薄壳：调 `sw_acl_l3_hardfast_session_add`，
-返回 0 就返回 1，否则按 `g_switch_debug_level` 打日志。
-`hf_del_l3_entry`（0x3040）同理调 `sw_acl_l3_hardfast_session_del`。
 `sw_acl_l3_hardfast_session_add` 的 22 个调用里 **14 个是 printk**，
-真正的硬件动作只有 1 个：`zte_api_fast_l3_session_add`。
+真正的硬件动作只有 1 个（`zte_api_fast_l3_session_add`）。
+`hf_set_l3_entry`（0x2f64）/ `hf_del_l3_entry`（0x3040）都是薄壳，
+只做「调 session_add/del → 返回 0 则返回 1 → 否则按 `g_switch_debug_level` 打日志」。
 
-## 2. 寄存器协议（完整位域）
-
-### 2.1 寄存器 19 = 间接访问命令（`sbrg_set_indreg_cmd`, 0xc694）
-
-```
-r5 = addr + (sel << 22) + (rw << 27) + (start << 31)
-tmOnuRegWrite(19, r5)
-```
-
-* `addr`：**必须 < 0x1000**（`cmp r5, #4096`，否则返回错误 1）
-* `sel`：`< 4`（`cmp r8, #4`）
-* `rw`：`0 = 写`、`1 = 读`（`cmp r7, #1`）
-* `start`：两个调用点都传 0，恒为 0
-
-调用点：
-* `sbrg_set_indreg_wr_cfg(sel, addr)` → `set_indreg_cmd(0, 0, sel, addr)` → **rw=0 写**
-* `sbrg_get_indreg_wr_cfg(sel, addr)` → `set_indreg_cmd(0, 1, sel, addr)` → **rw=1 读**
-
-### 2.2 寄存器 20 = 忙标志（`sbrg_access_timeout`, 0xc600）
+## 3. CLA 的间接访问协议（`cla_set_indirect_rw_cmd`, 0x44c）
 
 ```
-for (i = 0; i < 9; i++) {         ← 注意：只有 9 次，不是 64
-        read reg 20
-        if (value == 0) break;
+value = addr + (sel << 22) + (rw << 27)
+tmOnuRegWrite(1, value)
+```
+
+* 写数据：`cla_set_indirect_rw_data` → `tmOnuRegWrite(2, ...)`
+* 读状态：`cla_get_indirect_rw_status` → `tmOnuRegRead(1, ...)`
+* 读数据：`cla_get_indirect_rw_data`（0x668）
+
+**打包格式与 sbrg 完全相同**（`addr | sel<<22 | rw<<27`），只是基址寄存器不同：
+CLA 是 **1/2**，sbrg 是 **19/20 + 76/77/78**。
+
+## 4. CLA 的哈希配置：8 个 dword 整块写 ONU 寄存器 12
+
+`cla_set_hash_poly_config(cfg)`（0x103c，0x170 B）把 `cfg[0..7]`（8 个 dword = 32 B）
+一次性写进 ONU 寄存器 **12**；`cla_get_hash_poly_config`（0x11ac）读回。
+即 **CLA 哈希的多项式/种子是可配置的 8 字块**。
+
+> 这条很关键：如果硬件用的是 A 配置、我们软件算槽号时用的是 B 算法，
+> 表项就会写进「硬件永远不会查的那个槽」——症状正好是"写进去了、读回来了、就是不命中"。
+> **下一步就该查这 8 个字实际是什么值**（谁在开机时写它）。
+
+## 5. 两个哈希函数（都拿到了）
+
+### 5.1 `cla_list_hash_addr_gen(key, len)`（0x71a0，60 B，全文）
+
+```
+if (len == 0) return 0;
+crc = 0;
+for (i = 0; i < len; i++) {
+        u8 b = key[i];
+        crc = tab[(b ^ (crc >> 24)) & 0xff] ^ (crc << 8);   // 表在 .LANCHOR0+0xa7c
 }
-i > 9 → 超时，返回 -1
-```
-即 **读到 0 才算空闲**。
-
-### 2.3 寄存器 76/77/78 = 三个数据字（一条 12 字节表项 = 3 字）
-
-* **写序：78 → 77 → 76**（先写高字，最后写低字）
-* 读序：76、77、78，三个值 **OR 起来为 0** 才判"空槽"
-
-### 2.4 寄存器 29 = table_sel（`sbrg_set_table_sel`, 0xacb0）
-
-* 取值 **0..3**，超范围打日志并返回 1
-* `sbrg_add_ipv6table` 里**只接受 1 或 2**：
-  `cmp r2,#0; cmpne r2,#3` → 命中就报错返回 −1。
-  即 IPv6 表的 `table_sel` 是 1 或 2，0 和 3 会被原厂自己拒掉。
-
-## 3. 槽位与哈希
-
-### 3.1 槽位公式（`sbrg_add_ipv6table` @0xf184）
-
-```
-sel == 1 :  addr_base = ((hash & 0x7f) << 2) | 0x200
-sel != 1 :  addr_base = ((hash << 2) & 0xff) | 0x300
-block b (0..3):  addr = addr_base | b
+return crc;          // 完整 32 位，不截断、不收尾异或
 ```
 
-### 3.2 哈希（`sbrg_hash`, 0xc4b8；type=0x10c 分支 @0xc554）
+即 **32 位 MSB 先行 CRC（CRC-32/MPEG-2 风格，init = 0，无 final xor）**。
+`zte_api_fast_l3_session_add` 调它 **3 次**（三个列表/三级地址）。
 
-* 签名 `sbrg_hash(key, unused, type)`；`type` 是**类型选择**，不是多项式：
-  0x4c / 0x10c / 0x3c 各一条路径（IPv6 单播走 0x10c）
-* 做法：把 key 的**前 34 字节按字节倒序**拷进栈缓冲，再跑表驱动 CRC-16/CCITT
-  （初值 0，`crc = tab[(b ^ (crc>>8)) & 0xff] ^ (crc<<8)`）
-* 结果 **取低 10 位**（`ubfx r0, r0, #0, #10`）
-* 34 字节 = sip(16) + dip(16) + vlan(2)，与 `key` 的布局一致
+### 5.2 `sbrg_hash(key, unused, type)`（0xc4b8；IPv6 用 type=0x10c 那条）
 
-> 我们的 `zx_ppe_sbrg_hash()` 与此**逐位一致**（含倒序、初值、0x1021 表、低 10 位）。
+* `type` 是**类型选择**（0x4c / 0x10c / 0x3c 各一条路径），不是多项式
+* key 的前 **34 字节按字节倒序**后跑表驱动 CRC-16/CCITT（init 0、poly 0x1021）
+* 结果取 **低 10 位**
+* 34 B = sip(16) + dip(16) + vlan(2)
 
-## 4. 表项的 12 个字怎么来
+> 我们的 `zx_ppe_sbrg_hash()` 与此**逐位一致**。
 
-`sw_acl_l3_hardfast_session_add` 先在栈上清零 168 字节（`__memzero(sp+0x30, 0xa8)`），
-把描述符填进去交给 tm.ko；`sbrg_add_ipv6table` 再从入参 `fp`（描述符）取字段，
-在栈 `sp+0x68 .. sp+0x94` 拼出 12 个字，然后以 `sp+0x70` 为起点、**stride 12 字节**写 4 块。
+## 6. sbrg 表项的字段（由 `sbrg_lookup_ipv6table` 的取值反推）
 
-打包代码（0xf1b0–0xf258）用到的描述符字段与位宽：
+`lookup` 把三个字读回来后这样取字段（指令级）：
 
-| 描述符字段 | 用法 |
+| 打印串 | 取值 |
 |---|---|
-| `fp[0]` | 取 **1 bit**（`and r1, r1, #1`）→ 进第 0 块 |
-| `fp[4]` | 取 **1 bit**（`lsl #1; and #2`） |
-| `fp[8]` | 取 **1 bit**（`lsl #2; and #4`） |
-| `fp[12]` | 低 12 位（`ubfx #0,#12`）→ mult-vlan-mode==0 时当 vlan |
-| `fp[16..28]` | 4 个字 = 一个 16 字节 IPv6 地址 |
-| `fp[32]` | 与 `r6` 拼（`orr r0, ip, r6, lsl #8`） |
-| `fp[36]` | 进入 `r9`（后面当写表的 `sel` 用，实际被置 0，见 §5） |
-| `fp[40]`, `fp[44]`, `fp[48]` | 参与寻址/2 号地址 |
-| `fp[85]`(0x55), `fp[81]`(0x51), `fp[88]`(0x58), `fp[92]`(0x5c) | switch.ko 侧填的端口/标志 |
+| `output:valid = %d` | 查找结果位（不是表项里的位） |
+| `output:mode = %d` | `ubfx w0, #2, #1`（0xeec c） |
+| `output:age = %d` | `ubfx w0, #1, #1`（0xeec8） |
+| `output:pt_mask = 0x%x` | `uxtb`（一个字节） |
+| 另有 | `ubfx w0, #3, #12` = **vlan 12 位**；`lsr w0, #15` 起是**地址位** |
 
-第 0 块的低字里有 `valid/age/mode` 之类的位（`sp+0x68` 的构造：
-`(fp[0]&1) | (r4<<15) | ((fp[4]&2) | (fp[8]&4))`），
-与我们按 MLD 代码推出的 "bits 0..2 = valid/age/mode" 精神一致，但**字段位置不同**。
+**这与我们驱动里那份"bits 3..14 vlan、15.. 地址"的布局是一致的。**
+也就是说第一版说"表项布局对不上"**证据不足**——至少 sbrg 这张表没有对不上，
+而且它本来就是组播表，不是单播快转的落点。
 
-## 5. 已排除的假设：不是"写错存储体"
+## 7. sbrg 表项的 4 块写（保留，格式已核实）
 
-读代码第一遍容易得出"原厂把表项写进 4 个存储体（sel 0..3），我们只写 table 0，
-所以查不到"——**这个结论是错的**，别再去追：
+表项 = **4 块 × 3 字 = 12 字（48 B）**，块地址 = 槽基址 | 块号：
 
-* `sp[16]` 在 0xf244 被初始化成 **4**（`mov r3,#4; str r3,[sp,#16]`）；
-* 写循环前（0xf3a4）`sp[16] = (sp[16] == 4) ? r9 : sp[16]`，而 `r9` 在 0xf234 被
-  `mov r9, r2` 置为 **0**；
-* 写循环（0xf3d8）把 `sp[16]`（= 0）当 `sel`，`r5`（0..3）当块号。
+* 探测：`sbrg_get_indreg_wr_cfg(sel, addr)` 后读 76/77/78，**三字 OR 为 0 才判空槽**
+* 写入：`sbrg_set_indreg_wr_cfg(sel, addr)` 后 `tmOnuRegWrite(78→77→76)`
+* 三字在栈上的位置 `sp+0x68/0x6c/0x70`（块0）、`+0x74/0x78/0x7c`（块1）…
+* **写入时 sel 恒为 0**（第一版猜"要写进四个存储体"，已排除）
 
-所以原厂**写入时 sel 就是 0**，探测时（0xf27c `mov r0, r9`，r9=0）也是 0。
-我们驱动"表项写 table 0、探测读四个表"与原厂一致。
+槽基址：`sel==1` → `((hash & 0x7f) << 2) | 0x200`；否则 `((hash << 2) & 0xff) | 0x300`。
+`table_sel`（reg 29）必须是 **1 或 2**，0/3 原厂自己会拒写。
 
-## 6. 我们驱动现有实现 vs 原厂（逐项）
+## 8. 下一步（按性价比）
 
-| 环节 | 原厂 | 我们的 `zx_ppe_sbrg_*` | 判定 |
-|---|---|---|---|
-| 间接命令打包 | `addr \| sel<<22 \| rw<<27 \| start<<31`，reg 19 | `index \| table<<22 \| ZX_SBRG_START` | **一致** |
-| 忙等待 | reg 20 读到 0，最多 9 次 | `zx_pp_wait()` / `readl(...IND_STATUS) & 1`，最多 64 次 | 一致（次数不同，无关） |
-| 数据字 | 76/77/78，写序 78→77→76 | `ZX_SBRG_WORDS=3`，写时 `for (i=n-1;i>=0;i--)` | **一致** |
-| 表项块数 | 4 块 × 3 字 = 12 字 = 48 B | `ZX_SBRG_ENTRY_WORDS=12`，`index+b`，`&words[3*b]` | **一致** |
-| 写入的 sel | 0 | 0 | **一致** |
-| 探空 | 读 76/77/78，OR==0 为可写 | 读四个表（值不用） | 行为不完全一致，但不影响命中 |
-| 哈希 | 34 B 倒序 + CRC-16/CCITT + 低 10 位 | 同 | **一致** |
-| 槽位 | `sel==1` 用 `0x200`，否则 `0x300` | `zx_ppe_sbrg_slot()` 同款 | **一致** |
-| table_sel 前置条件 | reg 29 必须是 1 或 2，否则拒写 | 未检查 | 缺（应补） |
-| **12 字的字段布局** | 由描述符 `fp[0..48]` 打包（单播专用） | 从 **MLD/组播**路径反推（"bits 0..2 valid/age/mode，3..14 vlan，15..78 dip…"） | **不一致 ← 最可疑** |
+1. **查 CLA 哈希那 8 个字（ONU reg 12）实际值**，以及开机时谁写它。
+   这是现在最可疑的一处：硬件查表用的哈希若与我们算槽号的算法不一致，
+   表现就是"表项写对了但不命中"。
+2. `cla_acl_hash_addr_gen`（0x6cec，0x4b4 B）是**纯计算函数**（只调 printk/memset），
+   里面就是 ACL 哈希的实现。把它读出来，与 1 的结果对照。
+3. `cla_set_hash_table`（0x5a24，0x50c B）是我们 CLA 写表逻辑的**原厂对照物**：
+   逐条比对它的间接写序列（reg 1/2 的顺序、数据字数、写完是否回读校验）。
+4. 别忘了 `tm_findFastIdxByTuple`（0x57c50）：原厂自己有一套"按 5 元组在硬件里
+   找现成表项"的例程，正是我们验证命中与否时缺的那个**读侧证伪工具**。
 
-## 7. 由此得到的下一步（按性价比排序）
-
-1. **把单播表项的布局按 §4 重推一遍**，而不是沿用 MLD 的。
-   具体做法：在 `tools/vendor-emu/` 里按 `fp` 字段造记录，
-   用 §4 的位运算生成 12 个字，与 `sbrg_add_ipv6table` 的
-   实际输出逐字对比（`t_v6entry.py` 已有骨架，需要换成本文这套字段）。
-2. **补 `table_sel` 检查**：写 IPv6 表前先读 reg 29，若不是 1/2 就拒绝并记日志。
-   这条能防止"表写进去但引擎按另一张表查"的整类故障，也是最便宜的证伪手段。
-3. 若 1 做完仍不命中，下一个怀疑对象是**转发引擎侧的 IPv6 查表使能位**
-   （`switch.ko` 的 `sw_set_default_protocol_rule`，0x3e24，0x2c0 B），
-   以及 `npu_cap` 里那张 (入端口组, 出端口组) 白名单——我们还没读过这两处的实现。
-
-## 8. 附：怎么复查
+## 9. 复查命令
 
 ```sh
 OD=工作文件/08-源码与构建树/openwrt/staging_dir/toolchain-arm_cortex-a9_gcc-14.4.0_musl_eabi/bin/arm-openwrt-linux-objdump
 K=03-固件备份/vendor-rootfs-decrypted/kmodule-unsquashfs
 
-# 一张表看全：谁调谁
-$OD -dr $K/tm.ko | sed -n '/<sbrg_add_ipv6table>:/,/^$/p' | grep -A1 R_ARM_CALL
-
-# 寄存器协议
-$OD -dr --start-address=0xc694 --stop-address=0xc720 $K/tm.ko   # set_indreg_cmd, reg 19
-$OD -dr --start-address=0xc600 --stop-address=0xc694 $K/tm.ko   # access_timeout, reg 20
-$OD -dr --start-address=0xacb0 --stop-address=0xadf8 $K/tm.ko   # table_sel, reg 29
-
-# 哈希
-$OD -dr --start-address=0xc4b8 --stop-address=0xc600 $K/tm.ko
-
-# 表项打包
-$OD -dr --start-address=0xf1b0 --stop-address=0xf260 $K/tm.ko
+$OD -dr --start-address=0x5ce74 --stop-address=0x5e404 $K/tm.ko | grep -A1 R_ARM_CALL   # session_add 的真实调用
+$OD -dr --start-address=0x71a0  --stop-address=0x71dc  $K/tm.ko                        # cla_list_hash_addr_gen 全文
+$OD -dr --start-address=0x44c   --stop-address=0x520   $K/tm.ko                        # CLA 间接命令 (reg 1)
+$OD -dr --start-address=0x103c  --stop-address=0x11ac  $K/tm.ko                        # CLA 哈希 8 字配置 (reg 12)
+$OD -dr --start-address=0xeb50  --stop-address=0xf004  $K/tm.ko                        # sbrg lookup 的字段取值
+$OD -dr --start-address=0xf004  --stop-address=0xf8d0  $K/tm.ko                        # sbrg_add_ipv6table
 ```
