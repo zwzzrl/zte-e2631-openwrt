@@ -392,6 +392,17 @@ points at something in the repository or at a measurement.
       this address/prefix table actually does for forwarding - it carries no ports
       and no five-tuple, which is the final explanation for why v6 never matched the
       CLA hash.
+    * 2026-10-29 seventh round (on the board, tools/vendor-emu README "第七轮"): the
+      table is writable from this kernel.  A new module parameter `sbrg` (three data
+      words at 0x38801c/20/24, command 0x388014, status 0x388018, word 0 written last)
+      put the twelve words of a valid record (vlan 1, dip fd88::2, sip fd99::2) into
+      table 0 slots 0x3f4..0x3f7 and read them back word for word; a re-read later
+      still matched, tables 1..3 at the same index stayed zero, and the box kept
+      pinging its LAN peer.  So the access protocol, the slot addressing and the
+      48-byte layout are hardware facts, not inference.  What is left is no longer a
+      hardware probe: port sbrg_hash (328 bytes) into the driver so the kernel can
+      compute the slot itself, and then answer the behavioural question - what a
+      table of only vlan + two addresses + pt_mask does to a forwarded v6 flow.
     * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
       bench's only peer filters inbound IPv6, hence UDP above), then decide whether
       ipv6=1 becomes the default.

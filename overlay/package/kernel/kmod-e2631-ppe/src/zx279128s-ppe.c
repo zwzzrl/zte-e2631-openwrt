@@ -1424,6 +1424,134 @@ module_param_cb(xprobe, &zx_ppe_xprobe_ops, &zx_ppe_xprobe_storage, 0644);
 MODULE_PARM_DESC(xprobe,
 		 "probe a physical window: \"0x20000\" reads 16 words, \"w0x20000\" also writes and reads back");
 
+/*
+ * The vendor's IPv6 *forwarding* table - the one tm.ko reaches through
+ * sbrg_add_ipv6table() - lives in the bank at 0x388000 and uses the same
+ * indirect interface as the classifier: command at +0x14, status bit 0 at
+ * +0x18, and THREE data words at +0x1c/+0x20/+0x24 (the vendor's ONU registers
+ * 76/77/78).  A 48-byte entry is four consecutive indices, three words each.
+ *
+ * Everything about it is measured, not assumed: the register numbers come from
+ * tm.ko's sbragRegTable (tools/vendor-emu t_v6tbl.py anchors), the access
+ * sequence from running the vendor code (t_v6seq.py), and the reset values from
+ * the board itself (xprobe: reg 20 bit0 = 1 = access granted, reg 25 = 0 = idle,
+ * reg 29 mask 3 = 1 = the multicast-table gate).  One add is: read the four
+ * tables at the entry's four blocks, then write table 0 at the same blocks.
+ *
+ * This parameter is the primitive for the hardware test of that protocol:
+ *
+ *	echo "r <table> <index>" > .../parameters/sbrg
+ *	echo "w <table> <index> <w0> <w1> <w2>" > .../parameters/sbrg
+ *
+ * The write order is the vendor's: word 0 last, because that is the word the
+ * hardware latches the entry on.  Only three data registers are touched - the
+ * PP/CLA helper writes eight or seventeen - so a bad guess cannot scribble over
+ * the five registers behind them.
+ */
+#define ZX_SBRG_BASE	0x388000
+#define ZX_SBRG_WORDS	3
+
+struct zx_ppe_sbrg_op {
+	u32 table;
+	u32 index;
+	u32 w[ZX_SBRG_WORDS];
+	bool write;
+};
+
+static void zx_ppe_sbrg_adapter(struct zx_eth_adapter *adapter, void *data)
+{
+	struct zx_ppe_sbrg_op *op = data;
+	u32 v[ZX_SBRG_WORDS];
+	int i, ret;
+
+	mutex_lock(&adapter->ppe_lock);
+	ret = zx_pp_wait(adapter, ZX_SBRG_BASE);
+	if (ret) {
+		dev_info(adapter->dev, "sbrg: %s table %u index %#x: not ready (%d)\n",
+			 op->write ? "write" : "read", op->table, op->index, ret);
+		goto out;
+	}
+	if (op->write) {
+		writel(op->index | op->table << 22,
+		       adapter->base + ZX_SBRG_BASE + ZX_PP_IND_CMD);
+		for (i = ZX_SBRG_WORDS - 1; i >= 0; i--)
+			writel(op->w[i], adapter->base + ZX_SBRG_BASE +
+			       ZX_PP_IND_DATA + 4 * i);
+		for (i = 0; i < 64 &&
+		     (readl(adapter->base + ZX_SBRG_BASE + ZX_PP_IND_STATUS) & 1);
+		     i++)
+			;
+		ret = zx_pp_wait(adapter, ZX_SBRG_BASE);
+		if (ret) {
+			dev_info(adapter->dev, "sbrg: write table %u index %#x: no completion (%d)\n",
+				 op->table, op->index, ret);
+			goto out;
+		}
+		dev_info(adapter->dev, "sbrg: wrote table %u index %#x <- %08x %08x %08x\n",
+			 op->table, op->index, op->w[0], op->w[1], op->w[2]);
+	} else {
+		writel(op->index | op->table << 22 | ZX_PP_IND_READ,
+		       adapter->base + ZX_SBRG_BASE + ZX_PP_IND_CMD);
+		for (i = 0; i < 64 &&
+		     (readl(adapter->base + ZX_SBRG_BASE + ZX_PP_IND_STATUS) & 1);
+		     i++)
+			;
+		ret = zx_pp_wait(adapter, ZX_SBRG_BASE);
+		if (ret) {
+			dev_info(adapter->dev, "sbrg: read table %u index %#x: no completion (%d)\n",
+				 op->table, op->index, ret);
+			goto out;
+		}
+		for (i = 0; i < ZX_SBRG_WORDS; i++)
+			v[i] = readl(adapter->base + ZX_SBRG_BASE +
+				     ZX_PP_IND_DATA + 4 * i);
+		dev_info(adapter->dev, "sbrg: table %u index %#x = %08x %08x %08x\n",
+			 op->table, op->index, v[0], v[1], v[2]);
+	}
+out:
+	mutex_unlock(&adapter->ppe_lock);
+}
+
+static int zx_ppe_sbrg_storage;
+
+static int zx_ppe_sbrg_set(const char *val, const struct kernel_param *kp)
+{
+	struct zx_ppe_sbrg_op op = {};
+	char how[8];
+	unsigned int table, index, w0 = 0, w1 = 0, w2 = 0;
+	int n;
+
+	if (!val)
+		return -EINVAL;
+	n = sscanf(val, "%7s %i %i %x %x %x", how, &table, &index, &w0, &w1, &w2);
+	if (n < 3)
+		return -EINVAL;
+	if (!strcmp(how, "w") || !strcmp(how, "write")) {
+		if (n != 6)
+			return -EINVAL;
+		op.write = true;
+	} else if (strcmp(how, "r") && strcmp(how, "read")) {
+		return -EINVAL;
+	}
+	if (table > 4 || index >= 0x1000)
+		return -EINVAL;
+	op.table = table;
+	op.index = index;
+	op.w[0] = w0;
+	op.w[1] = w1;
+	op.w[2] = w2;
+	zx_eth_for_each_adapter(zx_ppe_sbrg_adapter, &op);
+	return 0;
+}
+
+static const struct kernel_param_ops zx_ppe_sbrg_ops = {
+	.set = zx_ppe_sbrg_set,
+	.get = param_get_int,
+};
+module_param_cb(sbrg, &zx_ppe_sbrg_ops, &zx_ppe_sbrg_storage, 0644);
+MODULE_PARM_DESC(sbrg,
+		 "vendor IPv6 table access at 0x388000: \"r <table> <index>\" or \"w <table> <index> <w0> <w1> <w2>\" (hex)");
+
 static void zx_ppe_dump_adapter(struct zx_eth_adapter *adapter, void *data)
 {
 	mutex_lock(&adapter->ppe_lock);
