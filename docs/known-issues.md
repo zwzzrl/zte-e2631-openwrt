@@ -914,6 +914,26 @@ e2631-wanport apply lan3                # 实测输出：e2631-wanport: WAN 口 
 
 ## PPE-AUTOLOAD-BOOT-LOCKOUT - 一次真实的自锁，以及为什么引擎不再随开机加载（2026-10-29）
 
+> **2026-10-29 晚更正：下面这条的归类和根因都是错的。**当天接上串口之后，日志显示
+> 盒子在 `pdt_getreal_kernelfs:539 verify_kernel … at ram:0x42020020` 之后执行
+> `bootm` 时就被拒绝了：
+>
+> ```
+> ## Booting kernel from Legacy Image at 42020020 ...
+> Wrong Image Format for bootm command
+> pdt_cspboot_run:1091 Start kernel failed
+> ```
+>
+> 也就是说**内核从来没有被加载**，卡死点不在"内核跑起来之后的模块加载"。真正的原因是
+> 那次刷进 slot1 的镜像（v9，10-28 13:57 全量构建的产物；v10 是同一缺陷）内核区里只有
+> 裸 zImage——没有 uImage 头、也没有 DTB，而包头 CRC 是对这份内容重算的，所以引导器的
+> 校验照样通过。逐字节证据、机制和已加的三道打包闸见 `KERNEL-EXTENT-NOT-A-UIMAGE`。
+>
+> 因此下面这段里"链路在、零 ARP ⇒ 内核跑起来之后挂死"的**判据不成立**：这两种故障在
+> 网络侧完全不可区分，必须上串口看 `bootm` 的输出。`e2631-ppe` 的 pending 守卫仍然保留
+> （作为对"开机路径上的模块加载"的防御，思路本身没错），但它不是这次自锁的原因，也没有
+> 被这次事故验证过。
+
 这是这台机器第一次把自己锁在门外，值得逐条记下来。
 
 **做了什么**：为了让 `zx279128s-ppe.ko` 能加载，镜像必须由"以太网驱动导出 hook
@@ -981,3 +1001,134 @@ entering boot mode***` 那一秒按 `1`、口令 `5cE080@fyBD` 进 U-Boot，然�
 
 两条都真，说明风险与具体固件/流量状态有关。默认取保守（不 reload），把"立刻生效"
 做成显式开关，而不是删掉这个能力。
+
+## KERNEL-EXTENT-NOT-A-UIMAGE - v9/v10 为什么起不来（CRC 一致不等于能启动）（2026-10-29）
+
+这是这台机器第二次"看起来死机"的真正原因，也是 2026-10-29 那次自锁的结论性更正
+（见下面的 PPE-AUTOLOAD-BOOT-LOCKOUT 条目）。**内核从头到尾没有被加载过**，不是加载
+之后挂死。
+
+**证据（v8 与 v9 的包逐字节比较，两个包都在 `02-固件产物/`）**
+
+| 观测点 | v8（能启动） | v9（起不来） |
+|---|---|---|
+| 槽 +0x20 处（`kFileOff` = `0x234`） | `27 05 19 56`（legacy uImage） | `00 00 a0 e1`（裸 zImage 的 ARM 跳转指令） |
+| uImage 头 | 有，`ARM OpenWrt Linux-6.18.55`，load = entry = `0x40008000` | 没有 |
+| 追加 DTB | 有，uImage 载荷末尾 10,823 B（`d00dfeed` @ 载荷 +0x3501b0） | 没有（`0x944` 那个 magic 是压缩数据误命中，全镜像是零个真 DTB） |
+| 内核载荷长度 | 3,484,663 B | 3,470,747 B（去尾部零填充） |
+| 32 字节槽标记 | `33333333cccccccc…`，在包内 `0x214` | 一模一样，也在 |
+| `kSize` / `kFileOff` / `rFileOff` | `0x3fffe0` / `0x234` / `0x400214` | 完全相同 |
+| `kCrc` | `0x00be98da` | `0x7d04b973`（对错内容重算，仍然自洽） |
+| rootfs | rCrc `0x81b0df59`（rSize `0xa60000`） | rCrc `0x6996884b`（rSize `0xa60000`，另一份构建） |
+
+**为什么 v9 会变成裸 zImage**：`tools/mkfactory.mjs` 的 `assemble()` 原本把"输入内核
+前 32 字节是不是槽标记"当作可选——是就剥掉再补，不是就直接补一个标记。所以 `--kernel`
+喂成 `build_dir/.../arch/arm/boot/zImage`（还没走过镜像配方的 `append-dtb | uImage none`
+两段）时，打出来就是 `[标记][裸 zImage]`：标记还在，uImage 头和 DTB 一起丢了。
+
+**引导器这边的因果链**（串口实拍，`10-私密记录/box-boot-2026-10-29.log` 第 161/201 行）：
+
+```
+pdt_getreal_kernelfs:539 verify_kernel readflash @0x2300000 size:0x400000 at ram:0x42020020
+csp_crc:103 ... crc=0x82fb468c, 0x7d04b973      ← 与头里 kCrc 一致，"校验通过"
+zteboot_verify_kernel:196 verify kernel success!!
+## Booting kernel from Legacy Image at 42020020 ...
+Wrong Image Format for bootm command
+pdt_cspboot_run:1091 Start kernel failed
+pdt_cspboot_run:1094 No image found!
+```
+
+`kCrc` 只能证明"存的字节就是头里描述的那些字节"，证明不了"这些字节是内核"。于是
+两道引导校验全过、`bootm` 一步拒绝，内核一个字节都没执行。盒子表现为网口链路
+1000M/Full（那是 U-Boot 把交换侧拉起来的状态）、零 ARP、抓包一帧都没有——**和"内核
+跑起来之后挂死"在外部完全不可区分**，所以只能靠串口判。
+
+**为什么当时没人拦住**：`host/verify_pkg.mjs` 本来就会拒（`release.mjs` 打包后必跑它，
+失败即 `do not flash it`）。拿它跑 v9，四条直接红：
+
+```
+FAIL  kernel extent begins with a legacy uImage magic
+FAIL  uImage os=Linux arch=arm type=kernel comp=none   os=0 arch=0 type=160 comp=225
+FAIL  load == entry == 0x40008000                       0xa0e1 / 0xa0e1
+FAIL  uImage data CRC (ih_dcrc) self-checks             0xa0e1 vs 0x51feb6a
+```
+
+v9/v10 是绕过 `release.mjs`、直接调 `mkfactory.mjs pack` 出的包，所以这四条从产物
+落地那一刻就成立，只是没人跑那一步。
+
+**现在 `mkfactory.mjs` 里的三道闸**（都在 `assemble()` 里，对 `pack` 强制，`selftest`
+回放原厂包时用 `allowNoDtb: true` 放行）：
+
+1. 剥完标记后 `+0x00` 必须是 `27051956`，否则 die——裸 zImage 不能再靠"补个标记"混过去；
+2. `ih_size + 64 <= 长度`，且 `crc32(uImage 载荷) == ih_dcrc`，否则 die（`bootm` 会以
+   `Bad Data CRC` 拒绝）；
+3. uImage 载荷必须**以一棵完整的 DTB 收尾**（`d00dfeed` 的 `total_size` 正好补齐到
+   载荷末尾），否则 die。这一条单独立出来是因为 v11 的教训：v11 把 uImage 头补回去
+   了、`ih_dcrc` 也对，但载荷是没有 DTB 的裸 zImage，ARM32 拿不到 device tree 会在
+   解压后**静默挂死**——一样不可启动，只是死法不同。
+
+自测（本机跑过）：v8 的内核打包通过并 `post-write verify` 全 ok；v9、v11 的内核都被
+拒且给出具体理由；`mkfactory.mjs selftest --template 06-分析与对比/原厂包分析/fwinspect/vendor.bin`
+仍然 `byte-exact: YES`。
+
+**教训**：打包器的输入必须是"能启动的内核镜像"，而不是"某个叫 zImage 的文件"；
+校验链要一路检到"这东西能不能 boot"，而不是停在"CRC 对得上"。
+
+## VM-FIREWALLD-BLOCKS-TFTP - U-Boot 的 TFTP 被防火墙以 admin-prohibited 拒掉（2026-10-29）
+
+现象：U-Boot 里 `ping 192.168.1.250` 是 `alive`，但
+`tftp 0x43000000 init.uImage` 只有一行 `Loading: *T T T T …`，五轮 `Retry count
+exceeded` 之后回到 `=>`。TFTP 服务端日志里一个请求都没有。
+
+定位方式（`AF_PACKET` 抓 ens34，不用装 tcpdump）：RRQ 确实到了网卡上——
+
+```
+UDP  192.168.1.10>192.168.1.250 3507>69 ulen=49 uck=0x0000
+ICMP 192.168.1.250>192.168.1.10 type=3 code=13 len=97     ← 紧跟其后 0 ms
+```
+
+`code 13` = administratively prohibited，即**本地策略拒绝**，不是"端口没人听"（那是
+`code 3`）。查下来 `ens34` 没有绑定区域，落在默认的 `public` 区，而 `firewalld` 的
+`public` 是 `target: default`：入站外来连接一律 reject，只放行了 `3080/3099/3100/tcp`
+——ICMP echo 默认放行，所以 ping 通、UDP 69 全灭。
+
+修法（运行时生效，重启失效；要长期就加 `--permanent` 再 `--reload`）：
+
+```sh
+firewall-cmd --zone=public --add-port=69/udp
+firewall-cmd --zone=public --list-ports      # 确认 69/udp 在列表里
+```
+
+放行后同一台机器、同一条线：`Bytes transferred = 13371783`，`886.7 KiB/s`。
+
+判据速记：U-Boot 的 `Loading: *` 那个 `*` 是"收到了 ICMP/非 TFTP 包"，随后连续 `T`
+是超时；**`ping` 通而 `tftp` 全 `T`，先查主机防火墙**，不要去怀疑串口、MAC 或 U-Boot
+网口驱动。
+
+## OVERLAY-BACKUP-TTYD-CORRUPT - 回灌用的 ttyd 配置是二进制垃圾（2026-10-29）
+
+`03-固件备份/openwrt-overlay-from-backup/upper/etc/config/ttyd` 只有 59 字节，内容是
+`\0\5\032\234\0?I\306Yk9.\274\347 -…` 这样的二进制，不是配置文本：抓取 overlay 那一步
+就把它写坏了。镜像里的正常内容是：
+
+```
+config ttyd
+	option interface '@lan'
+	option command '/bin/login'
+```
+
+后果（回灌后逐项核对时发现）：`uci commit ttyd` 报
+`uci: Parse error (invalid command) at line 0, byte 0`，`uci show ttyd` 全空，ttyd
+服务起不来（不影响 SSH/网络，所以很容易漏掉）。
+
+已处理：把镜像里的这份配置写回盒子并 `uci commit ttyd`；仓库里的备份文件也换成同样
+内容，避免下一次回灌再传染。
+
+顺手记一个核对手法：回灌后逐个跑
+
+```sh
+for p in $(ls /etc/config); do msg=$(uci commit "$p" 2>&1); [ -n "$msg" ] && echo "$p: $msg"; done
+```
+
+`*.bak-ula` / `*.bak-guard` 这类备份文件报错是正常的（它们本来不是配置），其余任何一条
+报错都说明回灌带进去了坏文件。

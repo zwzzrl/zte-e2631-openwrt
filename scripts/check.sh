@@ -92,8 +92,16 @@ g_dts() {
 		"$E2631_KIT/overlay/target/linux/sanechips/patches-6.18"
 }
 
+g_pack_guard() {	# the packer must refuse a kernel extent that cannot boot
+	e2631_need_cmd node "exercise the packer's kernel-extent guards" || return 77
+	local d="$E2631_OUT/fixture"
+	node "$E2631_KIT/tools/make_fixture.mjs" "$d" >/dev/null || { echo "make_fixture.mjs failed"; return 1; }
+	node "$E2631_KIT/tools/pack-guard-test.mjs" "$d"
+}
+
 run "shell syntax (bash -n)" g_shell
 run "javascript (node --check)" g_js
+run "packer refuses unbootable kernel" g_pack_guard
 run "device scripts (busybox ash)" g_ash
 run "slot tool (-Werror, parse, reject)" g_slot_tool
 run "board dts cross-reference" g_dts

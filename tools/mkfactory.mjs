@@ -43,6 +43,8 @@ const M = {
 const OUTER_MAGIC = Buffer.from('999999994444444455555555aaaaaaaa', 'hex');
 const INNER_MAGIC = Buffer.from('333333336666666699999999cccccccc', 'hex');
 const SLOT_MARKER = Buffer.concat([Buffer.from('33333333cccccccc88888888dddddddd', 'hex'), Buffer.alloc(16, 0xff)]);
+const UI_MAGIC = Buffer.from('27051956', 'hex');   // legacy uImage header - what `bootm` insists on
+const DTB_MAGIC = Buffer.from('d00dfeed', 'hex');  // flattened device tree - ARM32 has no other source
 const crc32 = (b) => zlib.crc32(b) >>> 0;
 const up = (x, a) => Math.ceil(x / a) * a;
 
@@ -94,6 +96,43 @@ function assemble(hdr, kernelBuf, rootfsBuf, opts = {}) {
   let k = Buffer.from(kernelBuf); const r = Buffer.from(rootfsBuf);
   // OpenWrt's zte-slot-marker step may already have prepended the 32-byte marker.
   if (k.subarray(0, 32).equals(SLOT_MARKER)) k = k.subarray(32);
+
+  // ---- what must be inside the kernel extent (2026-10-29 lockout) ----
+  //
+  // cspboot copies 4 MiB of the slot to 0x42020020 and runs `bootm` on it, then
+  // CRC-checks that copy against kSize/kCrc. The CRC can only say "these are the
+  // bytes the header describes", so a package built from the wrong file passes
+  // both bootloader gates and dies one step later at `bootm`. That is exactly
+  // what v9 and v10 did: their kernel extent starts with 00 00 a0 e1, a bare
+  // zImage (build_dir/.../arch/arm/boot/zImage, taken before the recipe's
+  // `append-dtb | uImage none` steps), so the marker was re-added here, the CRCs
+  // were computed over the bare zImage, and the box came back with `Wrong Image
+  // Format for bootm command` on the console and no ARP on the wire.
+  //
+  // So check the three things the CRC cannot: the uImage header, its data CRC,
+  // and the appended device tree (ARM32 has no DTB source other than the blob
+  // the kernel image carries - v11 restored the uImage header over v10's kernel
+  // and would still have hung silently for want of this).
+  if (!k.subarray(0, 4).equals(UI_MAGIC))
+    die(`kernel extent starts with 0x${k.subarray(0, 4).toString('hex')}, not a legacy uImage (27051956). ` +
+      'cspboot runs `bootm` on this extent: a bare zImage passes the CRCs and then fails with ' +
+      '"Wrong Image Format". Pack the kernel image from the build payload (marker + uImage + zImage + ' +
+      'appended dtb); arch/arm/boot/zImage is the wrong file.');
+  const ihSize = k.readUInt32BE(12), ihDcrc = k.readUInt32BE(24);
+  if (ihSize + 64 > k.length)
+    die(`uImage declares 0x${ihSize.toString(16)} bytes but only 0x${(k.length - 64).toString(16)} are stored`);
+  const uiPayload = k.subarray(64, 64 + ihSize);
+  if (crc32(uiPayload) !== ihDcrc)
+    die(`uImage data CRC 0x${ihDcrc.toString(16)} != 0x${crc32(uiPayload).toString(16)}: ` +
+      'bootm would reject this image with "Bad Data CRC"');
+  const dtOfs = uiPayload.lastIndexOf(DTB_MAGIC);
+  const dtOk = dtOfs > 0 && dtOfs + uiPayload.readUInt32BE(dtOfs + 4) === uiPayload.length;
+  if (!dtOk && !opts.allowNoDtb)
+    die('the uImage payload does not end with a flattened device tree (d00dfeed, total_size covering the ' +
+      'rest of the payload). ARM32 gets its device tree only from this blob, so the kernel would ' +
+      'decompress and then hang with a silent console. Rebuild with `append-dtb` in the kernel recipe ' +
+      '(target/linux/sanechips/image/Makefile), or pass --allow-no-dtb if the image really has none.');
+
   if (opts.version) putStr(hdr, M.version, 32, opts.version);
   if (opts.build) putStr(hdr, M.build, 16, opts.build);
   if (opts.product) putStr(hdr, M.product, 52, opts.product);
@@ -204,7 +243,8 @@ if (args.cmd === 'selftest') {
   const kernel = t.data.subarray(kOff, kOff + kLen);
   const rootfsStored = t.data.subarray(rOff, rOff + rLen);
   if (kernel.subarray(0, 4).toString('hex') !== '27051956') console.error('note: kernel extent is not a plaintext uImage');
-  const r = assemble(Buffer.from(t.hdr), kernel, rootfsStored, {});
+  // selftest replays a vendor package; vendor kernels carry no appended dtb
+  const r = assemble(Buffer.from(t.hdr), kernel, rootfsStored, { allowNoDtb: true });
   const same = Buffer.compare(r.out, t.data) === 0;
   console.log(`template    : 0x${t.data.length.toString(16)} bytes`);
   console.log(`rebuilt     : 0x${r.out.length.toString(16)} bytes  (kernel 0x${kLen.toString(16)}, rootfs-stored 0x${rLen.toString(16)})`);
@@ -233,7 +273,8 @@ if (args.cmd === 'pack') {
   const r = assemble(Buffer.from(t.hdr), kernel, rootfs, {
     version: args.o.version, build: args.o.build, product: args.o.product,
     key1: args.o.key1, key2: args.o.key2, keepCrc2: args.o.keepCrc2,
-    rootfsAt: args.o.rootfsAt, headerAt: args.o.headerAt });
+    rootfsAt: args.o.rootfsAt, headerAt: args.o.headerAt,
+    allowNoDtb: !!args.o.payloadFromTemplate || !!args.o.allowNoDtb });
   const slot = t.hdr.readUInt32LE(M.slotABase), span = t.hdr.readUInt32LE(M.slotASpan);
   const bodyLen = r.out.length - (OUTER + VER_HDR);
   console.log(`out      : ${args.o.out}  0x${r.out.length.toString(16)} bytes (body 0x${bodyLen.toString(16)})`);

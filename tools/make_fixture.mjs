@@ -42,14 +42,26 @@ fs.writeFileSync(f('template.bin'), Buffer.concat([
 ]));
 
 // --- payloads that look like the real ones ----------------------------------
-const kernel = Buffer.alloc(0x1000);
+// The extent has to be a *bootable* image, not just bytes with a uImage header:
+// mkfactory refuses a payload that does not end with a flattened device tree,
+// because ARM32 gets its DTB only from that blob (known-issues,
+// KERNEL-EXTENT-NOT-A-UIMAGE - v9/v10 shipped the bare zImage and the box came
+// back with "Wrong Image Format for bootm command"). So: header + zImage + dtb.
+const zimg = Buffer.alloc(0x1000 - 64);         // stands in for the compressed kernel
+zimg.fill(0xa5);
+const dtb = Buffer.alloc(64, 0x00);             // minimal, but parses as a DTB
+dtb.writeUInt32BE(0xd00dfeed, 0);
+dtb.writeUInt32BE(dtb.length, 4);               // total_size runs exactly to the end
+const payload = Buffer.concat([zimg, dtb]);
+const kernel = Buffer.alloc(64 + payload.length);
 kernel.writeUInt32BE(0x27051956, 0);            // uImage magic
-kernel.writeUInt32BE(kernel.length - 64, 12);   // data size
+kernel.writeUInt32BE(payload.length, 12);       // data size
 kernel.writeUInt32BE(0x40008000, 16);           // load  == entry, both slots use this
 kernel.writeUInt32BE(0x40008000, 20);
 kernel[28] = 5; kernel[29] = 2; kernel[30] = 2; kernel[31] = 0;  // Linux, ARM, kernel, no compression
-kernel.fill(0xa5, 64);
-kernel.writeUInt32BE(crc(kernel.subarray(64)), 24);              // data CRC, big endian as uImage stores it
+kernel.write('ARM OpenWrt Linux-FIXTURE', 32, 'latin1');
+payload.copy(kernel, 64);
+kernel.writeUInt32BE(crc(payload), 24);                          // data CRC, big endian as uImage stores it
 fs.writeFileSync(f('kernel.bin'), kernel);
 
 const rootfs = Buffer.alloc(0x1000);
