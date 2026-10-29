@@ -12,6 +12,16 @@
 # that finds the marker still set knows the previous load never confirmed and
 # skips the engine for that boot.  The marker is cleared by the loader only after
 # the box has stayed up and the stage-2 callback has run; a hang leaves it set.
+#
+# No `procd_set_param respawn` line on purpose.  v9b shipped `respawn 0`, which
+# procd reads as "respawn with threshold 0" = restart forever: the loader exits 0
+# after arming its 60 s window, procd started it again 5 s later, the new copy
+# found the marker the old one had just written, called it "the previous boot
+# hung", wrote /etc/e2631-ppe-failed and skipped the engine - 33 incarnations in
+# the first minute on real hardware, then one bogus failure log and one 93-byte
+# flash write every 5 s for as long as the box stayed up.  Without the respawn
+# line an instance is not supervised at all, which is what a one-shot wants;
+# /sbin/e2631-wifi-boot next door relies on exactly the same default.
 START=99
 USE_PROCD=1
 
@@ -24,6 +34,5 @@ start_service() {
 	procd_set_param command /sbin/e2631-ppe-boot "${DEFER:-20}"
 	procd_set_param stdout 1
 	procd_set_param stderr 1
-	procd_set_param respawn 0
 	procd_close_instance
 }

@@ -978,6 +978,65 @@ entering boot mode***` 那一秒按 `1`、口令 `5cE080@fyBD` 进 U-Boot，然�
 3. `e2631-fwslot flash --slot 1` 会连带擦掉 mtd7/mtd8（rootfs 与 overlay 都在槽内），
    所以刷 slot1 不只是换系统，还会清掉全部运行时配置——刷之前先假设配置会丢。
 
+## PPE-GUARD-RESPAWN-LOOP - 守卫把自己判成"上次卡死"，引擎加载成功却被永久拉黑（2026-10-29 实测）
+
+v9b（slot1，`serial=42`，`V1.0.0.8B8.9700`）是第一个真正带引擎跑起来的镜像：
+内核 hook（PPE-MODULE-NEEDS-ETH-HOOKS）、`zx279128s-ppe.ko`、`e2631-ppe` 加载器都在里面。
+真机上**引擎确实加载了**——`lsmod` 给出 `zx279128s_ppe 24576 0`，dmesg 给出
+`zx279128s-ppe: engine loaded, IPv6 classifier off`，SSH 与 WAN/LAN 全正常。也就是说
+v9 要验的那件事（引擎能不能在真机上以模块方式活下来）**答案是能**。
+
+但同一次开机里，守卫把自己判成了"上一次启动内核卡死"，因此这一条必须连同证据一起记下来，
+否则下一次谁看到 `/etc/e2631-ppe-failed` 都会以为是引擎的锅。
+
+**症状（同一台机器、同一次开机，日志原文按时间顺序）**
+
+```
+01:15:22 e2631-ppe-boot[3057]: 引擎已加载；60 秒后…撤掉 pending 标记
+01:15:27 e2631-ppe-boot[...]: 上次加载没有确认（内核可能卡死过），本次跳过引擎
+01:15:32 … 01:16:18  同上，每 5 秒一条，3 分钟里 36 条
+/etc/e2631-ppe-pending  0 字节      ← 第一个实例刚写的
+/etc/e2631-ppe-failed   93 字节     ← 每 5 秒被重写一次
+```
+
+第一次实例在 20 秒延迟后写下 pending 并 `modprobe` 成功，然后它 fork 出 60 秒确认子进程、
+自己 `exit 0`。**procd 在 5 秒后又把它拉起来**，新实例一进门就看到 pending（上一个实例刚写的），
+按设计判成"上一次启动没确认"→ 跳过引擎、写 failed。此后每 5 秒一次，直到盒子重启；
+每次都在 overlay 上重写一个 93 字节文件（overlay 在 NAND 上，这是实打实的无谓擦写）。
+
+**两个各自独立、叠在一起才致命的缺陷**
+
+1. `etc/init.d/e2631-ppe` 里的 `procd_set_param respawn 0` 不是"不要 respawn"。
+   真机上 `ubus call service list '{"name":"e2631-ppe"}'` 直接给出
+   `"respawn": {"threshold": 0, "timeout": 5, "retry": 5}`——**threshold 0 是"永远重启"**，
+   timeout 5 就是那 5 秒间隔。对照隔壁 `e2631-wifi-load`：它**没有**任何 `respawn` 行，
+   同一份输出里就没有 `respawn` 键——procd 的默认是"不管"，一次性脚本要的正是这个。
+2. pending 标记只表示"有文件在"，没有**启动身份**。任何第二个调用者都会把
+   "本次启动正在加载"误读成"上次启动没确认"。文件存在性不是启动身份。
+
+**修法（两个都改了，缺一不可）**
+
+- 去掉了 `respawn 0` 那一行（一次性脚本不该被监管），并在脚本注释里写明为什么"删一行"是修复。
+- `sbin/e2631-ppe-boot` 的 pending 首行改写成 `/proc/sys/kernel/random/boot_id`：
+  - 首行与本次 boot_id **相同** → 本次启动已经认领过，重复调用直接退出，什么都不写；
+  - **不同** → 真的是上一次启动没确认，跳过引擎并写 `failed`；
+  - 认领用 `set -C`（noclobber）原子创建，抢输的实例安静退出，不会误写 failed；
+  - 60 秒确认子进程只撤**属于自己这次 boot 的**标记，避免跨启动误清。
+
+**验证**：`05-路由器操作脚本/ppe-guard-test.sh` 在真机上 10 项全过（pending 首行是本次
+boot_id / 正常路径不写 failed / 同启动重复调用被识别且不写 failed / 确认窗口到点撤标记 /
+日志有确认记录 / 无 failed 残留 / 旧 boot_id 触发跳过 / failed 写明原因 / 跳过时保留 pending），
+随后冷重启复验：一次开机只有一条"引擎已加载"，60 秒后 pending 自动消失，`failed` 不出现。
+
+**教训**
+
+1. "文件在 = 上次失败" 这种守卫必须带**启动身份**（boot_id / 开机计数），否则它把
+   自己的正常执行当成故障证据。
+2. procd 的 `respawn` 语义反直觉：**不写这行 = 不重启**，写 `respawn 0` = 永远重启。
+   一次性脚本（加载器、探针、迁移脚本）要么不写，要么别用 procd。
+3. 守卫的失败路径也会写 flash。一个"永远不会自己好"的失败标记如果落在被反复重试的
+   路径上，等于拿 NAND 擦写寿命换日志。
+
 ## WANPORT-RELOAD-POLICY - 切 WAN 口默认不动运行态（2026-10-29）
 
 `e2631-wanport apply <port>` 现在有两道保护，都是吸收上游 v1.8.0 的做法：

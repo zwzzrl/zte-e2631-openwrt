@@ -2,14 +2,18 @@
 # Load the zx279128s packet-processor engine, guarded so a bad module can never
 # lock the box out (see /etc/init.d/e2631-ppe for the why; 2026-10-29 incident).
 #
-# Markers live in the overlay, so they survive a reboot:
-#   /etc/e2631-ppe-pending  written BEFORE insmod, removed only after the box has
-#                           demonstrably stayed alive with the module loaded.  A
-#                           boot that finds it means the previous attempt either
-#                           hung the kernel or died before confirming - so this
-#                           boot does NOT load the engine and the box comes up.
-#   /etc/e2631-ppe-failed   left behind by that skip, with the reason; delete both
-#                           files to arm another attempt.
+# The guard must tell two situations apart, and the v9b test on real hardware
+# (2026-10-29) proved a bare "file exists" check cannot:
+#   - this boot already started a load   -> duplicate call, nothing to do
+#   - the PREVIOUS boot started a load and never confirmed it (kernel hung)
+#     -> skip the engine for this boot
+# So the pending marker carries this kernel's boot identity (boot_id) as its
+# first line; only a marker from a DIFFERENT boot means "unconfirmed".
+#
+#   /etc/e2631-ppe-pending  boot_id + timestamp of the attempt in progress;
+#                           still present after a reboot means the attempt hung
+#   /etc/e2631-ppe-failed   written by the skip, with the reason
+# Delete both files to arm another attempt by hand.
 #
 # Usage: e2631-ppe-boot [defer-seconds]
 set -u
@@ -18,14 +22,23 @@ MARK_PENDING=/etc/e2631-ppe-pending
 MARK_FAILED=/etc/e2631-ppe-failed
 DEFER=${1:-20}
 CONFIRM=${CONFIRM:-60}
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+[ -n "$BOOT_ID" ] || BOOT_ID=unknown
 
 log() { logger -t e2631-ppe "$*" 2>/dev/null; echo "e2631-ppe: $*" >&2; }
+marker_id() { head -n 1 "$1" 2>/dev/null; }
 
+# 1. A marker already there? Same boot id = this boot is already loading, so a
+#    second caller (manual start, rc reload) must not be mistaken for a hang.
 if [ -e "$MARK_PENDING" ]; then
-	log "上次加载没有确认（内核可能卡死过），本次跳过引擎；确认无误后删掉 $MARK_PENDING 与 $MARK_FAILED 再试"
+	if [ "$(marker_id "$MARK_PENDING")" = "$BOOT_ID" ]; then
+		log "本次启动已经认领过引擎加载（boot_id 相同），重复调用直接退出"
+		exit 0
+	fi
+	log "上次加载没有确认（pending 的 boot_id 与本次不同，内核可能卡死过），本次跳过引擎；确认无误后删掉 $MARK_PENDING 与 $MARK_FAILED 再试"
 	{
 		echo "skipped at $(date 2>/dev/null || echo '?')"
-		echo "reason: $MARK_PENDING still present at boot"
+		echo "reason: $MARK_PENDING from an earlier boot never confirmed"
 	} > "$MARK_FAILED"
 	# 不删 pending：下次开机继续跳过，直到人确认
 	exit 0
@@ -34,7 +47,12 @@ fi
 # 等网络/防火墙都起来再动 CLA，失败也不影响已经可用的系统
 sleep "$DEFER"
 
-: > "$MARK_PENDING" || log "警告：写不了 $MARK_PENDING，本次加载没有守卫"
+# Claim the marker atomically: noclobber create loses if another instance won
+# the race, and that loser exits quietly instead of writing a bogus failure.
+if ! (set -C; printf '%s\n%s\n' "$BOOT_ID" "$(date 2>/dev/null || echo '?')" > "$MARK_PENDING") 2>/dev/null; then
+	log "另一个实例刚刚认领了 $MARK_PENDING，本次让路（不算失败）"
+	exit 0
+fi
 
 if ! modprobe zx279128s_ppe 2>/dev/null; then
 	log "modprobe 失败（模块不存在或不接受当前内核），引擎不可用，其余功能照常"
@@ -44,12 +62,14 @@ fi
 
 log "引擎已加载；$CONFIRM 秒后若这台机器还活得下来就撤掉 pending 标记"
 
-# 确认窗口：卡死时这个子进程根本不会跑完，标记就留在 overlay 里
+# 2. Confirmation window: a hang means this subshell never runs, so the marker
+#    survives into the next boot carrying this boot id - that is what arms the
+#    skip.  Only clear a marker that still belongs to this boot.
 (
 	sleep "$CONFIRM"
-	if rm -f "$MARK_PENDING" 2>/dev/null; then
-		logger -t e2631-ppe "engine confirmed alive after ${CONFIRM}s" 2>/dev/null
-		rm -f "$MARK_FAILED"
+	if [ "$(marker_id "$MARK_PENDING")" = "$BOOT_ID" ]; then
+		rm -f "$MARK_PENDING" "$MARK_FAILED"
+		logger -t e2631-ppe "engine confirmed alive after ${CONFIRM}s (boot_id=$BOOT_ID)" 2>/dev/null
 	fi
 ) </dev/null >/dev/null 2>&1 &
 
