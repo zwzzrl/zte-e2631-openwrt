@@ -1593,16 +1593,44 @@ H_FW_SIZE    = kernel_area + fs_size
 对当前几何等于擦一片空白，盒子会继续从 slot1 起 —— 这就是 03:48 那次"擦完还在跑
 OpenWrt"的全部原因，不是 cspboot 又挑了 slot1。
 
+同一轮刷完之后的启动判决（`Total found ...` 那行，从串口抓的）：
+
+```
+# 擦完 slot1 头、reset：
+zteboot_search_firmware:95 correct header has been found @1b60000
+zteboot_update_bootpara:864 totalImgNum=1 validImgNum=1 bootWhichImg=0 runmode=3
+ Total found 1 firmwares(valid:1), start from ver 0 :      <- 只剩 slot0，起原厂
+
+# WebUI 上传 v12fix、自重启后：
+zteboot_search_firmware:95 correct header has been found @1b60000
+zteboot_search_firmware:95 correct header has been found @3700000
+zteboot_update_bootpara:864 totalImgNum=2 validImgNum=2 bootWhichImg=0 runmode=3
+pdt_getimgindex:230 pdt_getimg select = 1, serial0=0x30, serial1=0x31,
+ Total found 2 firmwares(valid:2), start from ver 1 :      <- 新包在 slot1，serial 高，选中它
+```
+
+顺带一条没定案的：cspboot 报 slot0 的头在 `0x1b60000`（= slot0 + 0x1460000），
+而早前 `.scratch/cspboot-slot-select.md` 记的是 `0x1b40000`（= slot0 + 0x1440000）。
+按几何规则，头位置 = slot 起点 + `H_FW_SIZE`，所以两种记录对应两个不同的 fs_size
+（0x1120000 / 0x1100000）—— slot0 里可能同时留着两个头，扫描挑哪一个没有定案。
+以串口实际打出来的 `correct header has been found @...` 为准。
+
 #### 顺带实测：原厂 httpd 写头时的三个动作
 
 拿上面那份逐字节比对当证据，`vendor-web.py upload` 成功后，httpd 实际做了：
 
 1. **丢掉包最前面 0x14 字节**（16 B 外魔数 + u32 hdr_ofs），把 512 B 版本头
    原样写到 `slot 起点 + body 长度`；
-2. **自己重算 H_SERIAL**：包里的 63 被改成 **49**（当时 slot0 = 0x2f = 47，
-   slot1 那个包 = 48，49 = 两槽最大值 + 1）。所以 `retitle_pkg.py --serial`
-   在这条路线里**不决定写哪个槽**，它的作用是让包本身合法、能被 httpd 接收；
+2. **自己写 H_SERIAL**：包里的 63 被改成 **49**。所以 `retitle_pkg.py --serial`
+   在这条路线里**不决定写哪个槽**，它的作用是让包本身合法、能被 httpd 接收。
+   但"它到底怎么算"没有定案：v12（包 63）和 v12fix（包 65）两次上传**都写成 49**，
+   而两次的起始状态不同（后者上传前 slot1 已经是 49），所以不是简单的 max+1；
 3. 相应地**重算 CRC2**（覆盖 [0:0x1fc]，含 serial）；CRC1 覆盖 [0:0xa4]，不受影响。
+
+> 待验：本轮启动日志里 `serial0=0x30`（48），而 10-29 的笔记记的是 `0x2f`（47），
+> 中间除了两次原厂 httpd 上传没有别的写入 —— 所以 httpd 很可能**连活动槽的头也重盖**
+> 了一次。要验就下一次上传前后各读一次 slot0 的头（`dd if=/dev/mtd5 bs=1 skip=$((0x1b60000-0x700000)) count=512`），
+> 两次都是合法头、cspboot 也都验过了，不影响启动。
 
 写头之外的 body 字节，httpd 是按包内偏移原样落的（fs 落在 slot1+0x400000 这件事
 由包内 body 布局决定，与头位置无关）。
