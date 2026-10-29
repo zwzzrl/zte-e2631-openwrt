@@ -966,6 +966,8 @@ entering boot mode***` 那一秒按 `1`、口令 `5cE080@fyBD` 进 U-Boot，然�
   下次开机会看到标记还在，于是**跳过引擎**继续正常启动，并留一份
   `/etc/e2631-ppe-failed` 说明原因。要再试就删掉这两个文件。
   这和 Wi-Fi 那次（`e2631-wifi-boot` 的 pending 标记）是同一套思路。
+  （2026-10-29 晚补：标记现在带 boot_id，且 init 脚本去掉了 `procd_set_param respawn 0`，
+  否则守卫会把**自己**判成上次卡死——见 `PPE-GUARD-RESPAWN-LOOP`。）
 - 附带效果：引擎出问题最多让这一台少一次硬件加速，而不是少一台路由器。
 
 **教训（写给下一次的自己）**：
@@ -1027,6 +1029,10 @@ v9 要验的那件事（引擎能不能在真机上以模块方式活下来）**
 boot_id / 正常路径不写 failed / 同启动重复调用被识别且不写 failed / 确认窗口到点撤标记 /
 日志有确认记录 / 无 failed 残留 / 旧 boot_id 触发跳过 / failed 写明原因 / 跳过时保留 pending），
 随后冷重启复验：一次开机只有一条"引擎已加载"，60 秒后 pending 自动消失，`failed` 不出现。
+
+修好后的产物是 v9c：`02-固件产物/e2631-openwrt-v9c-ppe-20261029-slot1.bin`
+（slot1、`serial=43`、`V1.0.0.8B8.9800`、sha256 `bc75048d…6fd7`），
+经 `sysupgrade -n` 刷进 slot1 后冷启动复验通过，机器现在跑的就是它。
 
 **教训**
 
