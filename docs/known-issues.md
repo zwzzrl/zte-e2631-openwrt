@@ -570,6 +570,20 @@ points at something in the repository or at a measurement.
       compiled-in default: a UCI option that the init script applies after the module
       loads, so a bad default is fixable from failsafe instead of needing a power
       cycle.  Until then the image stays on ipv6=0 and the switch is a one-liner.
+    * **更换引擎：原厂的 IPv6 卸载不在 CLA 哈希里，而在 ACL L3 hardfast 表里。**
+      2026-10-30 在原厂系统（slot1）上读到，原厂对 IPv6 的硬件卸载走的是
+      `switch.ko` 的 `sw_acl_l3_hardfast_session_add/_del` 和它内部的
+      `hf_set_l3_entry` / `hf_del_l3_entry` / `hf_query_l3_status`，
+      由 `tm.ko` 的 `zte_api_fast_l3_session_add` 触发；开关是
+      `/proc/zte/sys/ffe/cmd` 里的 `ipv6_tcp 2` / `ipv6_udp 2`（2 = FFE+NPU）。
+      也就是说第九轮"CLA 的 IPv6 哈希查找被排除"这个结论，排除掉的很可能**本来就
+      不是原厂的 v6 快转路径** —— 六种 CLA 实验全负与此自洽。
+      下一步应改为移植 ACL 的 L3 hardfast 条目格式（能力矩阵见
+      `docs/vendor-ipv6-accel-2026-10-30.md` §4/§7），而不是继续在 CLA 里试窗口/槽号。
+    * 同上那份文档 §4 还有一条会限制"任意有线口可作 WAN"的硬事实：原厂的
+      NPU 能力表按 **(入端口组, 出端口组)** 穷举，IPv6 只给了
+      `pon*/eth* → eth*/wlan*` 以及反向这两组，eth↔eth 方向**只有 IPv4 raw**。
+      我们的 ACL 移植必须自己定义这张端口组表，不能照抄。
     * Untested with the trap lifted: MLD/multicast IPv6 (the switch has its own MLD
       tables in the vendor design - `drv_add_mld_addr_gpon_sfu` - and our port does not
       program them), and IPv6 over the (unused) WAN.
