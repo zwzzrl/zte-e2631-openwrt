@@ -1426,18 +1426,30 @@ MODULE_PARM_DESC(xprobe,
 		 "probe a physical window: \"0x20000\" reads 16 words, \"w0x20000\" also writes and reads back");
 
 /*
- * The vendor's IPv6 *forwarding* table - the one tm.ko reaches through
- * sbrg_add_ipv6table() - lives in the bank at 0x388000 and uses the same
- * indirect interface as the classifier: command at +0x14, status bit 0 at
- * +0x18, and THREE data words at +0x1c/+0x20/+0x24 (the vendor's ONU registers
- * 76/77/78).  A 48-byte entry is four consecutive indices, three words each.
+ * The vendor's IPv6 *multicast* table (MLD snooping / IPTV) - the one tm.ko
+ * reaches through tm_ipv6table_add_set() -> sbrg_add_ipv6table() - lives in the
+ * bank at 0x388000 and uses the same indirect interface as the classifier:
+ * command at +0x14, status bit 0 at +0x18, and THREE data words at
+ * +0x1c/+0x20/+0x24 (the vendor's ONU registers 76/77/78).  A 48-byte entry is
+ * four consecutive indices, three words each.
  *
- * Everything about it is measured, not assumed: the register numbers come from
- * tm.ko's sbragRegTable (tools/vendor-emu t_v6tbl.py anchors), the access
- * sequence from running the vendor code (t_v6seq.py), and the reset values from
- * the board itself (xprobe: reg 20 bit0 = 1 = access granted, reg 25 = 0 = idle,
- * reg 29 mask 3 = 1 = the multicast-table gate).  One add is: read the four
- * tables at the entry's four blocks, then write table 0 at the same blocks.
+ * It is *not* the unicast forwarding table: switch.ko is the only caller of
+ * tm_ipv6table_add_set(), from sw_add_mld_addr_e8v4() / sw_del_mld_addr_e8v4()
+ * and drv_del_mld_addr_gpon_sfu(), and that function fills the 52-byte record
+ * as valid=1, age=0, mode=1, vlan, dip = the multicast group, pt_mask = 1 <<
+ * switch port (the egress port bitmask) and sip = 0 unless the group is
+ * source-specific.  So the key is (sip, dip, vlan) = an MLDv2 (S,G,V) entry and
+ * "pt_mask" is a port mask.  Unicast IPv6 acceleration is a different engine
+ * (switch.ko's NPU/hardfast path); this table cannot do it.  See
+ * tools/vendor-emu README "第八轮" for the evidence.
+ *
+ * Everything about the access path is measured, not assumed: the register
+ * numbers come from tm.ko's sbragRegTable (tools/vendor-emu t_v6tbl.py anchors),
+ * the access sequence from running the vendor code (t_v6seq.py), and the reset
+ * values from the board itself (xprobe: reg 20 bit0 = 1 = access granted,
+ * reg 25 = 0 = idle, reg 29 mask 3 = 1 = the table selector).  One add is: read
+ * the four tables at the entry's four blocks, then write table 0 at the same
+ * blocks.
  *
  * This parameter is the primitive for the hardware test of that protocol, and
  * carries the whole add path the vendor module uses (tools/vendor-emu README,
@@ -1569,8 +1581,8 @@ static void zx_ppe_sbrg_entry(const struct zx_ppe_sbrg_op *op,
 	u64 sip_hi = zx_ppe_sbrg_le64(op->sip + 8);
 
 	memset(w, 0, ZX_SBRG_ENTRY_WORDS * sizeof(u32));
-	/* valid = 1, age = 0, mode = 1: the flags an entry that should forward
-	 * carries.
+	/* valid = 1, age = 0, mode = 1: what the vendor's MLD add fills in.
+	 * op->pt_mask is the egress port bitmask (1 << port).
 	 */
 	w[0] = 1 | (1 << 2) | ((op->vlan & 0xfff) << 3) |
 	       ((dip_hi & 0x1ffff) << 15);
@@ -1730,7 +1742,7 @@ static const struct kernel_param_ops zx_ppe_sbrg_ops = {
 };
 module_param_cb(sbrg, &zx_ppe_sbrg_ops, &zx_ppe_sbrg_storage, 0644);
 MODULE_PARM_DESC(sbrg,
-		 "vendor IPv6 table at 0x388000: \"r <table> <index>\", \"w <table> <index> <w0> <w1> <w2>\", or \"h|a|d <sip32hex> <dip32hex> <vlan> [pt_mask]\"");
+		 "vendor IPv6 multicast table at 0x388000: \"r <table> <index>\", \"w <table> <index> <w0> <w1> <w2>\", or \"h|a|d <sip32hex> <dip32hex> <vlan> [pt_mask]\" (pt_mask = egress port bits)");
 
 static void zx_ppe_dump_adapter(struct zx_eth_adapter *adapter, void *data)
 {

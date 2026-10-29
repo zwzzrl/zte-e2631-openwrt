@@ -425,6 +425,28 @@ points at something in the repository or at a measurement.
       was module swap + reboot.  Offsets in that bank are relative to
       ZX_SBRG_BASE only.  Still open: tables 1..3, the SNAT/DNAT bounds, and the
       behavioural question below.
+    * 2026-10-29 correction to the third round (found while finishing the eighth;
+      tools/vendor-emu README "第八轮" section 6): that 48-byte table is the
+      IPv6 **multicast (MLD) table**, not the unicast forwarding table, so the
+      third round's "the vendor's IPv6 forwarding entry is a different table"
+      conclusion is wrong on what the table is for.
+        - `tm_ipv6table_add_set` / `_delete_set` / `_lookup_get` have no caller
+          inside tm.ko at all (the only relocations into them are from their own
+          bodies); they are exported for switch.ko.
+        - switch.ko calls add_set only from `sw_add_mld_addr_e8v4`,
+          `sw_del_mld_addr_e8v4` and `drv_del_mld_addr_gpon_sfu`, i.e. MLD
+          address add/remove.
+        - `sw_add_mld_addr_e8v4` (switch.ko 0x11a14) builds the 52-byte record as
+          valid=1, age=0, mode=1, vlan, dip = the multicast group it was handed,
+          `pt_mask = 1 << port` and sip = 0 - so the key (sip, dip, vlan) is an
+          MLDv2 (S,G,V), (*,G) when sip is 0, and `pt_mask` is the egress port
+          bitmask ("pt" = port), not a protocol mask.
+      So this table cannot accelerate unicast IPv6.  The driver's `sbrg`
+      add/delete/read path stays (it is a faithful MLD-entry programmer and the
+      only two-way link to that bank we have), but the unicast goal moves to
+      switch.ko's NPU/hardfast path: `npu_ipv6_l3{tcp,udp}{up,down}_cap`,
+      `npu_drv_create_flow`, and `sw_acl_l3_hardfast_session_add` ->
+      `zte_api_fast_l3_session_add`.  Not started.
     * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
       bench's only peer filters inbound IPv6, hence UDP above), then decide whether
       ipv6=1 becomes the default.

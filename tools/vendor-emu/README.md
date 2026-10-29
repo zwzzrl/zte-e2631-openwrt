@@ -585,12 +585,39 @@ sbrg:   w09 000099fd 00000000 00000000
 后续任何取这把锁的操作都会卡住 —— 所以修好偏移后是用"换模块 + 重启"回到干净状态的，
 不是原地 rmmod。教训：**这块窗口的偏移一律相对 `ZX_SBRG_BASE` 写，不和绝对地址混加。**
 
-### 6. 还没做的
+### 6. 纠正：这张表是 IPv6 **组播**（MLD）表，不是单播转发表
 
-1. **table 1..3 的用途**、`g_IPv6_{Snat,Dnat}_Ram_Length` 的边界（只读不写，仍未知）。
-2. **这张表对转发做什么**：表项只有 vlan + 两个地址 + pt_mask，没有端口/五元组。要回答
-   它是不是"IPv6 转发加速"，得让一条真实被路由的 IPv6 流经过盒子，看流量是否被这块表接管
-   （需要重建 v6 双向测试台）。
-3. 引擎开机自启：板上有一个 10 月 13 日残留的 `/etc/e2631-ppe-pending`（不同 boot_id），
-   守卫会判定"上次加载没确认"而跳过；要么删标记再重启验证，要么做进镜像。
+第八轮顺手把调用者查清楚了，结论推翻了第三轮"原厂 IPv6 转发走这张表"的假设：
+
+- `tm_ipv6table_add_set` / `lookup_get` / `delete_set` 在 `tm.ko` 里**没有任何直接调用者**
+  （重定位表里只有 `tm_ipv6table_add_set` 内部对 `sbrg_add_ipv6table` 的调用），它们是导出给
+  `switch.ko` 的。
+- `switch.ko` 里调用它们的函数只有三个：`sw_add_mld_addr_e8v4`、`sw_del_mld_addr_e8v4`、
+  `drv_del_mld_addr_gpon_sfu`——**MLD**（IPv6 组播成员发现）地址增删。
+- 看 `sw_add_mld_addr_e8v4`（`0x11a14`，420 字节）怎么填那 52 字节记录：清零后写
+  `valid=1`、`age=0`、`mode=1`、`vlan`，把上游递进来的 16 字节组播地址拷进 `dip`，
+  再写 `pt_mask = 1 << 端口号`，`sip` 保持 0。最后调 `tm_ipv6table_add_set(record)` 和
+  `sw_mld_mulrule_deal(record, vlan, 1)`。
+
+即：key 是 `(sip, dip, vlan)`，也就是 MLDv2 的 (S,G,V)；`sip=0` 就是 (*,G)；
+`pt_mask` 是**出端口位图**（"pt" = port），不是协议掩码；`valid/age/mode` 是表项状态。
+这解释了这个表为什么没有五元组、没有出端口字段、没有 MAC 改写——它是组播复制表，不是单播快表。
+
+**对目标的影响**：单播 IPv6 硬件加速不在这条线上。原厂的 IPv6 单播快路在 `switch.ko` 的
+NPU/hardfast 那一套（`npu_ipv6_l3{tcp,udp}{up,down}_cap`、`npu_drv_create_flow`、
+`sw_acl_l3_hardfast_session_add -> zte_api_fast_l3_session_add`），是另一台引擎，本轮没动。
+这张表的正确用途是 MLD snooping/IPTV 复制，OpenWrt 侧要用它得先有 MLD snooping 的控制面
+（bridge mdb），而且组播本身能不能被硬件复制还没测。
+
+### 7. 还没做的
+
+1. **table 1..3 的用途**、`g_IPv6_{Snat,Dnat}_Ram_Length` 的边界（只读不写，仍未知）；
+   有了 MLD 这个定位，它们更可能是组播的 SNAT/DNAT 或不同组播库，而不是单播。
+2. **MLD 表的行为验证**：组一个 IPv6 组播组、让盒子转发，看组播是不是被硬件复制（现在的
+   `pt_mask` 只需要端口位图，比单播好造）。
+3. **单播 IPv6 加速**：去 `switch.ko` 的 `sw_acl_l3_hardfast_session_add` /
+   `npu_drv_create_flow` 这条线上找（那是原厂真正的 v6 单播快路），工作量另计。
+4. 引擎开机自启已经验证：删掉 10 月 13 日残留的 `/etc/e2631-ppe-pending` 后重启，引擎在
+   45.7 s 自启（`S99e2631-ppe` + `DEFER=20`），`/etc/e2631-ppe-*` 标记由守卫自己清掉。
+
 
