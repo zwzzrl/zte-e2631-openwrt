@@ -830,6 +830,13 @@ upstream - is scripted in `wsl/vendor-flash-table.sh`.
 
 ## VENDOR-RUNTIME-TABLES - 判定：死路（2026-10-28）
 
+> **已推翻（2026-10-30）。** 目的达成了，见下面的
+> `VENDOR-SHELL-VIA-WEBUI-UPGRADE`。
+> 2026-10-28 失败的原因**不是这条路不通**，而是当时用的"重建版镜像"根本起不来
+> （`/dev` 341 个设备节点被写成普通文件，见
+> `VENDOR-ROOTSH-NO-DEVICE-NODES`）。换了"只追加、不重建"的打包方式之后一次就成。
+> 本节其余内容保留，作为"当时怎么试的"的历史记录。
+
 目的：拿到原厂 PPE 分类器的运行时 index/rule/hash 表，用它替掉驱动里那份"外推版" v6 表。
 
 手段：把改过的**原厂 rootfs** 写进原厂**非活动槽**，启动后让盒子自己把
@@ -892,6 +899,12 @@ UpTime 单调增长（没有重启循环），WebUI 响应正常（也没有 res
 **不是"这次启动的是哪个镜像"**。拿它当启动证据会直接把结论带偏。
 
 ## VENDOR-WEB-SHELL - 判定：死路（2026-10-28）
+
+> **部分推翻（2026-10-30）。** 本节的结论只对"注入类入口"成立：
+> `ping_diag_data`、`do_restore_usrcfg` 这些确实一个都走不通，结论保留。
+> 但"用原厂的**升级接口**把改过的原厂 rootfs 写进非活动槽、从而拿到 root shell"
+> 这条路**走通了** —— 不是注入，是直接用原厂的合法刷机通道。
+> 见 `VENDOR-SHELL-VIA-WEBUI-UPGRADE`。
 
 目的：在原厂 8B8 上拿一个 root shell，用它 dump PPE 运行时表、或改 `TelnetCfg`。
 （`VENDOR-RUNTIME-TABLES` 之后换的路子：不再刷镜像，只打它自己的 WebUI。）
@@ -1431,3 +1444,94 @@ body 长度 / fs_crc / 槽起点 / serial / H_NEW / 两个 CRC。
 - 然后 `telnet <IP> 2323` 拿 root shell（`/sbin/shd`，口令见 `shd.c`）；
 - 若依然 10 秒复位，则剩下的唯一变量就是"内容"本身（3 个改动 + shd），按
   `/etc/init.norm` → `/etc/shadow` → `shd` 的顺序二分。
+
+## VENDOR-SHELL-VIA-WEBUI-UPGRADE - 成功：只追加节点 + 原厂 WebUI 升级（2026-10-30）
+
+**结论：通了。** 原厂系统跑在 slot1，`telnet 192.168.5.1 2323` 直接是 root
+（`uid=0`），slot0 一个字节没动。整个过程没有手写过一次 `nand write`。
+
+### 关键思路（用户提的）
+
+"既然进原厂系统了，直接走原厂刷机不就好了" —— 对。原厂 WebUI 的升级接口本来就会
+把包写进**非活动槽**，那就不必和 U-Boot 的 NAND 写时序、ECC 参数较劲；我们要做的
+只是**造一个原厂认的包**，里面除了原厂的一切，再多三个节点。
+
+### 工艺一：一个字节都不重建 rootfs，只在尾部**追加节点**
+
+`09-工具脚本/jffs2_append.py` 在 pristine 镜像尾部追加节点，前 `0x1100000` 字节
+与出厂 `mtd5` 逐字节相同（已 diff 验证）。追加的三个：
+
+| 路径 | ino | 作用 |
+|---|---|---|
+| `/etc/rc` | 415 (v2) | 强制 `LOADTYPE=3`、keep-alive `shd`、每 ~20 s 跑 `/sbin/dump6` |
+| `/sbin/shd` | 520 | `shd.arm.static`（17268 B），2323 端口 root 壳 |
+| `/sbin/dump6` | 521 | 采集脚本（1635 B，**必须纯 ASCII**） |
+
+原厂 JFFS2 节点格式（实测，不是照规范猜的）：
+
+- CRC 是**反射 CRC32、init=0、xorout=0**（`raw_crc32`），**不是** `zlib.crc32`；
+- `inode` 节点头 **68 字节**（data 在 +68）：`+0 magic 0x1985`、`+2 type 0xE002`、
+  `+4 totlen`、`+8 hdr_crc=raw(buf[0:8])`、`+12 ino`、`+16 version`、`+20 mode`、
+  `+24 uid`、`+26 gid`、`+28 isize`、`+32 atime`、`+36 mtime`、`+40 ctime`、
+  `+44 offset`、`+48 csize`、`+52 dsize`、`+56 compr`、`+57 usercompr`、`+58 flags`、
+  `+60 data_crc=raw(data)`、**`+64 raw(buf[12:60])`**（原厂私有字段）；
+- `dirent` 节点头 40 字节：`+12 pino`、`+16 version`、`+20 ino`、`+24 mctime`、
+  `+28 nsize`、`+29 type`、`+32 node_crc=raw(buf[0:32])`、`+36 name_crc=raw(name)`、
+  `+40 name`；
+- 两个必踩的坑：**节点必须 4 字节对齐**（`ofs += (totlen+3) & ~3`），
+  否则下一个节点的 magic 会被读成 nodetype；`add_dirent` 要**先填 hdr_crc 再填
+  node_crc**（node_crc 覆盖 [0:32]，含 hdr_crc）。
+
+### 工艺二：cspboot 的镜像几何规则（两个实例反推，已验证）
+
+```
+fs 起始      = kernel 起始 + align_up(k_size + 0x20, 0x10000)
+fs_ofs 字段  = fs 的 flash 偏移 + 0x214     （写进版本头）
+H_FW_SIZE    = kernel_area + fs_size
+版本头紧跟在镜像末尾
+```
+
+对照：slot0 出厂 `k_size=0x33fdcc` → fs 在 +0x340000；slot1 出厂 `k_size=0x3fffe0`
+→ fs 在 +0x400000。我们这版 `KERNEL_AREA=0x340000`、`FS_OFS_FIELD=0x340214`、
+`H_FW_SIZE=0x1460000`、`fs_size=0x1120000`、serial 62，版本头落在 `0x3760000`。
+先前失败的那几版都是这条算错：fs 摆 +0x400000 而 `k_size` 仍 0x33fdcc，
+cspboot 到 +0x340000 校验对不上 → `validImgNum=1` → 回落 slot0。
+
+### 刷机动作（可重复）
+
+```
+# 1) U-Boot 里抹掉 slot1 的版本头（逼它回落 slot0 的标准做法；只碰 slot1）
+=> nand erase 0x3760000 0x20000
+=> reset
+# 2) slot0 原厂起来后，用 WebUI 接口把包写进 slot1
+./vendor-web.py upload 02-固件产物/vendor-root-shell/e2631-vendor-slot1-append-up.pkg --yes
+# 3) 盒子自己重启进 slot1（serial 更高的那个）
+```
+
+选 WebUI 而不是 U-Boot `nand write`：原厂内核写 NAND 的 ECC/几何与 U-Boot 是否一致
+**从未被验证过**（U-Boot 写的镜像一次都没见它启动成功）。
+
+### 顺带查清的两件事
+
+1. **"自动推流一直没到"不是工具问题。** 原厂 nat 表里有
+   `SNAT all -- 192.168.5.0/24 → 192.168.5.0/24 to:192.168.43.119`，把去
+   `192.168.5.50` 的包源地址改成了 `192.168.43.119`（因为原厂把 br0 既当 LAN 又当
+   WAN，`br0` 上就是 `192.168.43.119`，默认路由 `via 192.168.43.1 dev br0`）。
+   主机侧只把 `192.168.5.0/24` 配在 ens34 上 → 回程走默认路由 → 连接永远停在
+   `SYN_SENT`。抓包实证：`192.168.43.119 -> 192.168.5.50 [SYN]`。
+   **结论：这条路线用 vsh 拉取，别推。**
+2. **"内核日志采空"是 `timeout` 用错。** 原厂 busybox 1.17 的 `timeout` 要
+   `timeout -t 3 cat …`；写成 `timeout 3 cat …` 直接报
+   `can't execute '3'`，看起来像"没有日志"。改对之后 `/dev/logger_main`
+   **每次打开都会回放整段开机积压**（一次 477 KB），内核 printk 从此可读。
+
+### 原厂 IPv6 加速的实测事实
+
+已单独成文：`docs/vendor-ipv6-accel-2026-10-30.md`。三条要点先记在这里：
+
+- 加速分两层：**FFE**（软件快转，内核里，v4/v6 的 raw/tcp/udp/mc 全支持）+
+  **NPU**（硬件，`switch.ko` 的 ACL L3 hardfast，v6 只支持 tcp/udp/mc）；
+- **NPU 不做 IPv6 NAT66**：`CONFIG_CSPKERNEL_NPU_SUPPORT_NAT6 is not set`，
+  且 `npufilter` 里单独挂了 `flow_ipv6_nat_filter` 把 NAT 流挡在 NPU 之外；
+- 原厂对 IPv6 的加速形态是**只有 routed 的 v6 TCP/UDP/组播、且必须 WAN↔LAN 方向**；
+  `ipv6_raw`（ICMPv6/ESP）与 eth↔eth 的 v6 一律软件。
