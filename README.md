@@ -95,16 +95,18 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
 当前包：Release **`v1.3`** —— 主题"从能刷到能用"。相对 v1.2 的四件事，每件的证据链在
 [docs/known-issues.md](docs/known-issues.md)：
 
-1. **流卸载（硬件加速）：功能齐全，默认关闭**：v1.2 的 305/190 Mbit/s 封顶不是缺引擎——gmac
+1. **流卸载（硬件加速）：默认开启**：v1.2 的 305/190 Mbit/s 封顶不是缺引擎——gmac
    驱动一直带着 PPE 硬件流卸载（`zx279128s-ppe.c`），缺的只是 nft flowtable 语句包和防火墙开关。
    v1.3 补齐 `kmod-nft-offload` 并默认打开 `flow_offloading=1`（含 hw），实测 ≥395 Mbit/s；
    同时默认启用 RPS/XPS、IRQ 亲中和 PAUSE 帧通告关闭（后者依据同族 ZX279133 端口的实测，
    恩山 thread-8486503）。
-   **2026-10-27 起默认值改为关**：`flow_offloading=0` + `flow_offloading_hw=0`。原因是硬件
-   卸载会打断 IPv6 TCP（PPE 的 IPv6 卸载路径有 bug：握手 1 ms 成功、之后 0 字节；ICMPv6 与
-   IPv4 不受影响）。包、驱动、两个开关全都在，想要加速就在 LuCI 的
-   `网络 → 防火墙 → 常规设置` 里勾回「软件/硬件流量卸载」。
-   已知边界（打开后）：IPv6 TCP 会再挂；PPPoE 可能不走硬件路径；PPE 表 384 条，溢出自动回落软件路径。
+   这两个开关 2026-10-27 改过两次，最终**回到默认开启**：当天先打开，IPv6 TCP 卡死（握手
+   1 ms 成功、之后 0 字节），当天改关；根因不是"IPv6 卸载有 bug"，而是 PPE 一接管，端口 MAC
+   就从 trap 表搬进 ONU 路由表，而分类器没有 IPv6 规则，v6 帧回 CPU 的路被自己拆了。改成
+   IPv6 以太网类型 trap 永不解除（`3eab2a4`）之后 1/1 重新安全，镜像是这个状态。
+   **IPv6 不会被加速**：IPv6 帧仍然上送 CPU（有意的取舍，见 `docs/architecture.md`）。
+   容量上限 127 条流（≈60 条双向连接，7 位改写索引的硬件宽度），溢出回落软件路径；
+   PPPoE 上行可能不走硬件路径。
 2. **Wi-Fi 开机自启（默认开启）**：时序与恢复机制来自 tigaotg 的交接 PR#1（真机验证过双频自动
    广播、改 SSID/密码重启保留）。首次开机配 WPA2-PSK（密码由本机 MAC 派生并打印在 console），
    绝不广播开放网络；上次启动未完成则跳过本次自启。不想要：`touch /etc/e2631-wifi-noautoload`。

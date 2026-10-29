@@ -18,7 +18,7 @@
 | 上游内容 | 为什么不吸收 |
 |---|---|
 | `zx279128s-ppe.c`（内建整引擎，含 IPv6 trap 修复） | 我们已把引擎拆成 `kmod-e2631-ppe` 包。而且那条 IPv6 trap 修复我们**早就有等价实现且更细**：`zx_update_traps()` 里 `v6 = zx_ppe_v6_offload`，默认 0 时 IPv6 ethertype trap 保持打开（IPv6 走 CPU），只有引擎真把 IPv6 表写进硬件才抬 trap（`zx_ppe_set_v6_offload`）。上游写成 `v6 = ppe_active \|\| !sw`，效果在默认路径上一致 |
-| `zx279128s-ffe.c` + `zx-ffe-ops.h`（FFE 控制面） | 全新的功能面，与本轮目标（PPE 的 IPv6 真值、刷机自锁善后）无关，且需要内核改动 + 真机验证 |
+| `zx279128s-ffe.c` + `zx-ffe-ops.h`（FFE 控制面） | 不吸收：全新的功能面，要内核改动 + 真机验证。但它的文件头现在是一份现成证据——上游写明 IPv6 只学进表做统计、留在 CPU 路径，因为厂商的 `npu_cap_nat6` key/extract 格式"not reconstructed"，`zx_ffe_flow_add()` 对 v6 直接 `-EOPNOTSUPP`；这和我们第九轮从硬件侧得到的结论互证（`docs/architecture.md`） |
 | `slotpart` 取代 `slotfix` | 上游判定老 `slotfix` 在真机启动路径上从未命中（bootpara 块被 zImage 解压当页表用）。我们的镜像目前从 slot1 启动，不受影响；等换启动路径时再评估 |
 | `e2631-upgrade`（三段式版本号、按数字排序） | 我们没有这个工具；发版命名规则以后要跟上，但不影响当前功能 |
 | `README.md` / `docs/*` 的结构重写 | 我们的文档结构承载了更多本地证据（串口恢复、事故记录），整份取上游会丢东西 |

@@ -137,6 +137,73 @@ What crosses the boundary, and what deliberately does not:
   driver list the core fills is the truth, because a counter cannot survive a ruleset
   reload (bind new, then unbind old) or an unload (see PPE-BIND-ACCOUNTING).
 
+## Where the classifier's values come from, and what upstream covers
+
+The module is ours; the numbers in it are not. Both halves are worth stating exactly,
+because "reverse engineered" is a word that hides where each fact came from:
+
+* **Code is ours.** The built-in driver's header says it plainly - the tables are
+  "programmed from scratch, with the values of the vendor firmware"
+  (`zx279128s-main.c:19`, copyright Navid Ghahremani) - and `zx279128s-ppe.c` is added to
+  git as our own file in `e05198f` ("顺带把驱动搬进仓库 overlay：之前 IPv4 那版只存在于
+  构建树里，仓库没有"), then moved into the `kmod-e2631-ppe` package in `1e85955`.
+  Nothing here is a decompiled vendor module.
+* **Values are the vendor's, read off its own tables.** `zx_ppe_v4_rule[]` is CLA rule
+  registers 152/153 word for word, `zx_ppe_v4_index[]` is 0x90..0x94 plus `0x00150151`,
+  the two CRC32 polynomials (`0x04c11db7`, `0x1edc6f41`) come from a table in the vendor
+  `.rodata`, and the extract indices 9/10 with rules `0x98`/`0x99` come from tm.ko's
+  parameter marshaler. Each was checked by writing it and reading the register back;
+  the witness is the register comparisons in `docs/known-issues.md` plus the vendor dumps
+  kept in the workspace (`06-分析与对比/`).
+* **The plumbing is mainline's.** The vendor has no `nf_flow_table`: `nf_flow_table`,
+  `flow_cls_offload` and `TC_SETUP_FT` each appear zero times in its vmlinux. So
+  `ndo_setup_tc`, the `flow_block` trampolines, dissector parsing and the offload
+  callbacks are new code, written against Linux 6.18's TC API.
+
+That is also why the vendor's logic and this driver look "inconsistent" and still both
+forward IPv4 at wire speed: the hardware only cares that the tables are written
+correctly. What differs is *who triggers the write* (vendor: the NPU's own learning;
+here: netfilter's flowtable) and *which protocols reach the fast path*.
+
+| vendor (cspkernel 4.1) | here / mainline | shared between the two |
+|---|---|---|
+| `npu_drv_create_flow` (switch.ko) hands a flow to the NPU | `FLOW_CLS_REPLACE` -> `ndo_setup_tc(TC_SETUP_FT)` | only the entry format |
+| `cla_set_hash` / `cla_set_extra_rule` / `cla_set_extra_index` (tm.ko) | `zx_ppe_hash_entry()`, `zx_ppe_v4_rule[]`, `zx_ppe_v4_index[]`, crc32 slot pick | the layout: 7 match windows, 45-byte key, 384 hash slots |
+| `pp_pm_*` | PM flow / next-hop / subnet tables (512 / 16 entries) | table addresses and field offsets |
+| IPv6 ethertype trap | `zx_update_traps()` | this one *is* a port - of a workaround |
+| learn table, per-protocol capability tables | upstream's `zx279128s-ffe.c` (not in this repo) | the key shape, from `re/ffe/` |
+| DPI / ACL sessions, `idm_skb_stack` handoff | not implemented | - |
+
+**Upstream reads the same hardware and stops at the same place, from the other side.**
+`origin/main`'s `zx279128s-ppe.c` rejects anything that is not IPv4 at the door
+(`addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS -> -EOPNOTSUPP`, :340), ships only
+`zx_ppe_v4_index`/`zx_ppe_v4_rule`, and says so itself: "the classifier holds IPv4 rules
+only" (:589) - its only IPv6 action is keeping the ethertype trap armed so v6 frames can
+reach the CPU. Its later FFE control plane states the reason in its file header (:17-19):
+IPv6 flows are "learned into the table for accounting, kept on the CPU path. The vendor
+offloads v6 through the `npu_cap_nat6` plugin whose key/extract formats are not
+reconstructed yet", and `zx_ffe_flow_add()` returns `-EOPNOTSUPP` for v6 on purpose
+(:220). So no, upstream's reverse engineering never produced a v6 fast path - it produced
+a v6 *trap*, and an explicit "not reconstructed". `docs/upstream-absorb-2026-10-29.md`
+is the commit-by-commit account of what was taken from it.
+
+## The capacity ceiling, and what happens past it
+
+`ZX_PPE_FLOWS` is 128 because the rewrite index inside a classifier entry
+(`ZX_CLA_W0_FLOW`) is 7 bits; the allocator starts at 1 (`zx_ppe_alloc(..., 1)`), so
+indices 1..127 are usable and index 0 is the reserved "no rewrite". The stock firmware
+never used more than 125, which is where the 127 comes from - it is a hardware field
+width, not a tuning choice. One TCP connection wants an entry per direction, so the
+practical ceiling is roughly 60 simultaneous offloaded connections; past that
+`zx_ppe_alloc()` returns `-ENOSPC` and the flow simply stays in the software flowtable
+(`ppe_add_fail` counts it, `ppe_add_skip` counts flows the hardware refuses for other
+reasons). Nothing breaks, the hardware path is just not used for the extra flows.
+
+Do not confuse this with the hash table: 384 slots (256 in bank 0, 128 in bank 1) is
+where *lookups* land by crc32, and several flows can share the tables without sharing a
+slot. "384 entries" in older text (README v1.3, the uci-defaults comment) conflated the
+two; the flow ceiling is 127.
+
 ## Traps, and the one thing that made IPv6 offload impossible
 
 The switch sends a frame to the CPU when a trap matches it, and a trapped frame is
@@ -169,15 +236,22 @@ runtime for exactly this reason - it programs the v6 tables and lifts the trap, 
 puts it back - and with it on those 2,000 frames cost 18 CPU packets
 (`docs/known-issues.md`, PPE-IPV6-TRAP-CPU).
 
-That leaves the third finding, which is why this section is not called "the fix": with the
-trap lifted and the extract in place, the classifier hands IPv6 to the CPU, the driver
-writes the hash entry, and the hardware still never matches it - not with the entry in all
-384 slots at once, not with any window offset type, not with a key of 7 to 19 halfwords.
-The 45-byte IPv6 key this driver builds is not the hardware's key; the vendor computes it
-in software from per-family descriptors (`tm_acl_fast_add_v4v6()` in tm.ko), and until
-that is reproduced IPv6 stays on the CPU path. It works there - that is the shipped
-configuration (`ipv6=0`, trap on) and the measured one (`ipv6=1` forwards just as well,
-only without a fast path).
+That leaves the third finding, which is why this section is not called "the fix": with
+the trap lifted and the extract in place, the classifier hands IPv6 to the CPU, the driver
+writes the hash entry, and the hardware still never matches it - not with the entry in
+every slot at once, not with any window offset type, not with a key of 7 to 19 halfwords.
+The ninth round closed the last explanation that still pointed at our key: a rule patched
+to extract a *single* window (protocol only) cannot miss for key-format reasons, and it
+missed anyway - 617 CPU submissions per 600 packets against 98 for IPv4 in the same
+hairpin topology, with the rule read back exactly as written. So it is not the key: this
+classifier has no IPv6 hash lookup on this silicon, and the vendor never wrote one either
+- its v6 "ACL add" writes a 13-byte entry that contradicts its own shipped rule mask and
+no rule or index at all (every write captured by `tools/vendor-emu/t_v6rule.py`), because
+vendor IPv6 acceleration lives in the NPU (`npu_drv_*`, `npu_cap_nat6`), not in the
+classifier. IPv6 therefore stays on the CPU path in every configuration we ship; the v6
+tables and `ipv6=1` stay in the driver as the record of the attempt and as one command to
+re-test (`docs/known-issues.md`, `PPE-IPV6-TCP`, holds the falsified hypotheses and the
+counter-conditions that would revive the idea).
 
 ## Wi-Fi, and why it is off by default
 

@@ -22,14 +22,18 @@
 #  - WiFi-originated flows are rejected by the PPE on purpose (ingress must be
 #    a switch port) - they stay on the CPU and top out around 200 Mbit/s.
 #  - PPPoE uplinks may not take the hardware path (sibling ZX279133 behaviour).
-#  - the hash table holds 384 entries; overflow falls back to software
-#    (counters ppe_add_skip / ppe_add_fail under
-#    /sys/kernel/debug/92000000.ethernet/)
-#  - the classifier's IPv6 tables do exist in the driver (zx279128s-ppe.c,
-#    extract index 10 + rule 0x99) but are off unless the module parameter
-#    ipv6=1 is set: on hardware they could wedge the switch, and the vendor's
-#    own IPv6 table templates are incomplete (docs/known-issues.md,
-#    PPE-IPV6-TCP). Do not enable them expecting working IPv6.
+#  - 127 flows can be offloaded at once (the rewrite index is a 7-bit field,
+#    index 0 reserved; the 384 crc32 hash *slots* are a different thing -
+#    see docs/architecture.md).  Overflow falls back to software, counted as
+#    ppe_add_fail (ppe_add_skip = the hardware refused for another reason),
+#    under /sys/kernel/debug/92000000.ethernet/
+#  - the classifier's IPv6 tables exist in the driver (zx279128s-ppe.c,
+#    extract index 10 + rule 0x99, 19 windows) but are off unless the module
+#    parameter ipv6=1 is set. They accelerate nothing: hardware experiments
+#    never got a v6 hash entry to match (the single-window rule test
+#    included), and the vendor's v6 fast path is in the NPU, not in the
+#    classifier (docs/known-issues.md PPE-IPV6-TCP, docs/architecture.md).
+#    With ipv6=1 IPv6 forwards just as well, only without a fast path.
 #
 # Turn them off from LuCI (Network -> Firewall -> General Settings) or:
 #   uci set firewall.@defaults[0].flow_offloading_hw='0'

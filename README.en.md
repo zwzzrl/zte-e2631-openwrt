@@ -130,8 +130,15 @@ chain for every item in [docs/known-issues.md](docs/known-issues.md):
    package and the firewall switch.  v1.3 ships `kmod-nft-offload` plus
    `flow_offloading=1` (and hw), and defaults RPS/XPS, IRQ affinity and PAUSE-frame
    advertisement off (that last one traced to an upload ceiling on the sibling ZX279133 port,
-   right.com.cn thread-8486503).  Known limits: PPPoE may not take the hardware path; the PPE
-   table holds 384 entries, overflow falls back to software.
+   right.com.cn thread-8486503).  The two switches were flipped twice on 2026-10-27 and end up
+   **on**: turning them on first stalled IPv6 TCP (handshake in 1 ms, then zero bytes) and they
+   were turned off the same day, but the cause was not v6 offload - with the PPE active the port
+   MACs leave the trap table for the ONU routed table and the classifier had no IPv6 rule, so v6
+   frames had no way to the CPU.  Keeping the IPv6 ethertype trap armed for good (`3eab2a4`)
+   makes 1/1 safe again, which is what the image ships.  **IPv6 is not accelerated** (frames
+   still go to the CPU, by design).  Capacity: 127 flows (~60 bidirectional connections; the
+   rewrite index is a 7-bit field), overflow falls back to software; PPPoE may not take the
+   hardware path.
 2. **Wi-Fi autoload on by default**: sequencing and recovery from tigaotg's handoff PR#1
    (verified on this hardware: dual-band auto-broadcast, SSID/key change survives reboot).
    First boot provisions WPA2-PSK (key derived from the unit MAC, printed on the console),
