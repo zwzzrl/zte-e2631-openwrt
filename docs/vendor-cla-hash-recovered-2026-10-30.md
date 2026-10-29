@@ -21,6 +21,20 @@ slot_hash = CRC32_msb_first(poly[type], 0x00 || reverse(key[0..43])) & 0xffff
 
 来源：`代码`——`tm.ko` 中 `cla_acl_hash_addr_gen`（虚拟地址 0x6cec，长度 0x4b4）完整反汇编。
 
+**验证（2026-10-30，真跑原厂代码）**：`tools/vendor-emu/t_clahash.py` 用 unicorn 执行
+`tm.ko` 里这个函数本身（只把 printk 桩掉），对 200 个随机 44 字节键 × 4 种类型共 800 次
+调用，与上式**零不一致**：
+
+```
+cd tools/vendor-emu
+docker run --rm -v <vendor-rootfs>/kmodule-unsquashfs/tm.ko:/ko/tm.ko:ro \
+  -v "$PWD":/w -w /w --entrypoint python3 e2631-uni:py312 t_clahash.py 200
+=> type 0..3 的四条多项式打印出来，keys 200: mismatches {0: 0, 1: 0, 2: 0, 3: 0}
+```
+
+同目录的 `t_hash.py` 对 `sbrg_hash()` 做了同样的事（300 个随机键、init 0 零不一致，
+init 0xffff 300 个全错，作为反例）。
+
 ---
 
 ## 2. 四条多项式（含定位依据）
@@ -154,6 +168,7 @@ extra_data[j]= (key[4+2j+1]<<7) | (key[4+2j]>>1) | ((key[4+2j+2]&1)<<15)
 所以它不能当全量基准，只能当「算法族正确」的部分验证 —— 而 §4.1 的 21 项精确命中已经把「CRC32 + 前导 0 + 44 字节逆序 + 截 16 位」这个结构钉死了。
 
 反过来看：生产路径算槽位用的是软件函数（`cla_acl_hash_addr_gen` 的返回值），硬件只要在同一个地址找到表项即可；所以**驱动按下式实现即与生产路径一致**，无需关心调试面为何偏离。
+而且 §1 的公式已经**用 unicorn 真跑原厂这个函数验证过 800/800**（不是从反汇编推的），所以这里的偏离只可能是调试面/硬件侧的问题，不可能是公式错。
 
 ---
 
@@ -168,7 +183,8 @@ extra_data[j]= (key[4+2j+1]<<7) | (key[4+2j]>>1) | ((key[4+2j+2]&1)<<15)
 
 ## 6. 诚实未知
 
-- §4.2 偏离的确切成因未查清（推断：`fpga_write_reg` 的寄存器号/状态字参与运算，或该窗口是 NP 侧另一套哈希）。这**不影响**生产路径算法的可信度，但如果将来要靠这个调试面做回归测试，必须先解开。
+- §4.2 偏离的确切成因未查清（推断：`fpga_write_reg` 的寄存器号/状态字参与运算，或该窗口是 NP 侧另一套哈希）。这**不影响**生产路径算法的可信度（§1 已由真跑原厂代码验证），但如果将来要靠这个调试面做回归测试，必须先解开。
+  已排除的方向：`fpga_write_reg`/`fpga_read_reg` 定义在 `zx_ponreg.ko`，就是 `base[reg] = val` 的一次读写，`base = 0xf4000000`（`fpga_module_init` 里 `mov lr,#0xf4000000`），是 SoC 的固定硬件窗口 —— 所以读回值确实由硬件产生，不是内存里的残留。
 - `outport`/`inport`/`extra_data` 的**语义**（哪个是 vlan、哪个是 sip 片段）尚未与真实 ACL 规则对上。我们只知道位宽与排布，字段名来自原厂 printk。要落地 IPv6 单播，还得把 `sw_acl_l3_hardfast_session_add` 里「规则 → 44 字节键」的那一步也解出来。
 - `type` 2/3 的多项式（`0xF4ACFB13` / `0x32583499`）对应哪类通道未确认；生产路径由调用方传 `r6`，需要追 0x4ccd0 / 0x4cdb4 两个调用点的实参。
 
