@@ -695,6 +695,15 @@ points at something in the repository or at a measurement.
       UDP，`tx_submitted` 只涨 **+138**，`ppe_flows=2` —— 即 99.9% 的包没经过 CPU。
       所以这台的计量是可信的：同一个台子、同一天、同一版镜像，
       **IPv4 +138 / IPv6 +115,407**，差三个数量级。
+      **顺带把"ipv6=1 能加速桥内 v6"这条 claim 复测了，结论是"未复现"**：主机上再建
+      一个 macvlan（`fdee:70df:d02e::3`，独立 MAC），从 `::2` 发给 `::3`，帧进 lan1 又被
+      交换机转回 lan1，两轮各 64,000 包：
+        `ipv6=1`：1.18 Gbit/s，`tx_submitted` **+53**
+        `ipv6=0`（模块默认，v6 陷阱在里面）：1.16 Gbit/s，**+39**
+      两组都几乎不花 CPU —— 桥内 v6 的转发是 **SoC 交换芯片**在做，跟 `ipv6` 这个参数
+      无关。所以早先"ipv6=1 让 LAN-to-LAN 从 2,018 次 CPU 发包降到 18 次"这条（当时
+      没记端口组合）在本台**复现不出来**，要么那时是 lan1→lan2 两个物理口、要么测的是
+      别的路径。在有人用两个物理口重测之前，这条只能记作"未复现"。
     * 于是"IPv6 单播路由加速"在本板上只剩 NPU 一条路，而原厂能力表把这条路也限定死了，
       见下一条；`ipv6=1` 能被证明的价值仍然只是**桥内（LAN↔LAN）IPv6 快转**。
     * Untested with the trap lifted: MLD/multicast IPv6 (the switch has its own MLD
