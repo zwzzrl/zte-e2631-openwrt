@@ -669,6 +669,28 @@ points at something in the repository or at a measurement.
       剩下没试过的只有两条（写在该文档 §5）：① `ipv6=1 v6_rule=2 v6_key=0xa0
       v6_idxw4=0x00150004` 这个组合（第九轮 `v6_key` 一直跟着 `v6_rule` 走，从没显式设
       0xa0）；② 不要再用 rule 160（`cla_set_extra_rule_table` 自己就拒绝 >0x9f）。
+    * 2026-10-30 第十一轮（真机，把上面那条唯一剩下的组合打掉了）：**厂商那一对参数
+      同样不命中，CLA 这条路可以正式结案。** 台子是主机侧现搭的单向回环（地址/路由都是
+      运行时的，不落配置）：主机 `fdee:70df:d02e::2` → 路由器 → `fd88::2`（盒子侧
+      `ip -6 route add fd88::2/128 via fdee:70df:d02e::2 dev br-lan`、主机侧
+      `... via fe80::e660:4dff:fe86:71ef dev ens34`），判据仍是 `dma_state` 的
+      `tx_submitted`：
+      - 先用 50 个 ICMPv6 echo 验台子：主机侧 AF_PACKET 抓到 **47 个**回来的帧
+        （目的 `fd88::2`），说明确实"进 br-lan → 路由 → 又出 br-lan"，不是本地投递；
+        盒子的 conntrack 也有一条 `packets=100 [UNREPLIED]` 的转发条目。
+      - 基线（出厂参数 `v6_rule=153 v6_key=-1`）：两轮各 64,000 个 UDP，`tx_submitted`
+        `2454 → 118820`，即 **+116,366（90.9%）**，`ppe_flows` 4。
+      - 厂商组合（重载成 `ipv6=1 v6_ext=10 v6_entry=10 v6_rule=2 v6_key=0xa0
+        v6_idxw4=0x00150004`，dmesg 报 `IPv6 classifier on (experimental)`）：
+        `118851 → 234258`，两轮 **+115,407（90.2%）**，`ppe_flows` 4。
+      - 两组相差 0.7 个百分点，也就是**没有差别**；那 ~9% 的缺口两组都在（是这台台的
+        常数，不是卸载），所以结论是"条目照样写进去了，但硬件一个包都没走快路"。
+      - 顺带复验了文档里那条：`rmmod` + `insmod` 之后 `ppe_active` 自己就回到 1，
+        不需要再动防火墙。
+      工具：主机的 `.scratch/bench6.py`（`sniff <秒> <前缀>` / `blast <包数> <源> <目的>
+      <端口>`，AF_PACKET + UDP 盲发，不依赖 tcpdump/iperf3 对端）。
+    * 于是"IPv6 单播路由加速"在本板上只剩 NPU 一条路，而原厂能力表把这条路也限定死了，
+      见下一条；`ipv6=1` 能被证明的价值仍然只是**桥内（LAN↔LAN）IPv6 快转**。
     * Untested with the trap lifted: MLD/multicast IPv6 (the switch has its own MLD
       tables in the vendor design - `drv_add_mld_addr_gpon_sfu` - and our port does not
       program them), and IPv6 over the (unused) WAN.
