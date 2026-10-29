@@ -618,6 +618,21 @@ points at something in the repository or at a measurement.
       想跳过：`touch /etc/e2631-ppe-norebind`（引擎会保持闲置）。
       验收脚本里 `ipv6` 那一项也一并改成认 `Y`——内核给 bool 参数打印的是
       `Y`/`N`，不是 `1`/`0`，原来那条断言会误报成 FAIL。
+      另外那条"引擎 start 过"的断言不能写 `==1`：重载会让 enabled/disabled/enabled
+      出现两三次，改成 `>=1` 并把次数打进标题（v12fix 上实测 2 次）。
+      **2026-10-30 04:0x 真机验收（v12fix，串口与 SSH 双证）**：擦掉 slot1 版本头
+      回落 slot0 → WebUI 上传 `e2631-openwrt-v12fix-ppe-20261030-slot1.bin`（serial 65
+      的包，httpd 自己写成 49）→ 盒子自重启进 slot1，之后**一次手工操作都没做**：
+        [   51.093988] zx279128s-ppe: engine loaded, IPv6 classifier off
+        [   51.395863] zx279128s-eth 92000000.ethernet: hardware flow offload enabled
+        [   51.396054] zx279128s-eth 92000000.ethernet: hardware flow offload disabled
+        [   51.567117] zx279128s-eth 92000000.ethernet: hardware flow offload enabled
+      前一行是模块加载（此时 ipv6 仍是 0），中间那对 disabled/enabled 就是
+      `e2631-ppe-boot` 主动 reload 防火墙时的解绑-重绑。logread 依次是
+      `引擎已加载` → `IPv6 卸载已打开` → `已重载防火墙规则，让 flowtable 带着引擎重新绑定`
+      → `引擎已接管硬件卸载（dmesg 有 hardware flow offload enabled）`，
+      60 秒后还有 `engine confirmed alive after 60s (boot_id=…)`。
+      `verify-wanport.sh` 20/20 PASS；uptime 113 s 时 pending 标记已撤、sbrg `sel 1`。
     * **更换引擎：原厂的 IPv6 卸载不在 CLA 哈希里，而在 ACL L3 hardfast 表里。**
       2026-10-30 在原厂系统（slot1）上读到，原厂对 IPv6 的硬件卸载走的是
       `switch.ko` 的 `sw_acl_l3_hardfast_session_add/_del` 和它内部的
