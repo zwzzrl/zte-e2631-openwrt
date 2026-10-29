@@ -841,3 +841,21 @@ inport 2 的 60 B 表项:
 坑（别踩第二次）：168 B 会话里的 IPv6 地址是掩码编码（`00 40 03 00 50 ...`），不是
 `fd99...` 原始字节，所以"改地址再 dump 看哪几个字变"在仿真里做不成；`t_extidx.py flow`
 的槽号只能当"idx 参与键"的证据（跨 Unicorn 实例的 sip/dip 指针失效，key 退化）。
+
+### 第十三轮追加：v6 的哈希键与槽算法已对上
+
+用 `t_v6flowdump.py` 加 `TRACE_ARGS=1`（poke 只读探针，不替换函数）能打出
+`cla_acl_hash_addr_gen` / `aclGetAvailableHashAddr` / `cla_set_hash_table` 的入参：
+
+* `cla_set_hash_table(r0=槽, r1=45 字节键, r2=0x40|idx, r3=0x40)`；
+* 我们这条 v6 流的键 = `00 00 00 18 22 00 06 80 a0 00 06 00 a1` + 32 个 0，
+  规则字节 `0xa0` 在 **byte 8**；
+* 用驱动同一套 `crc(0x04c11db7, key, 45) & 0xff` 算出 **27**，与厂商写的槽一致；
+  把会话 0x08/0x10/0x20 三段改成标记值后，槽 214/125/17 也全部复现。
+  **哈希算法没问题，缺的是键的 13 字节布局。**
+
+用法：
+```bash
+docker run --rm -e TRACE_ARGS=1 -e DUMP_LR=1 -v "$KO":/ko:ro -v "$PWD":/w -w /w \
+  --entrypoint python3 e2631-uni:py312 t_v6flowdump.py 2
+```

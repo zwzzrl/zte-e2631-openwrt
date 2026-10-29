@@ -18,13 +18,14 @@
     python3 t_v6flowdump.py 2          # 入端口 2 = lan1
     python3 t_v6flowdump.py 0          # 入端口 0 = lan3，用来看 byte16 / 槽怎么跟着变
 """
+import os
 import struct
 import sys
 
 import t_hfsess
 import flowadd
 from km import Mod, REG0_12
-from unicorn.arm_const import UC_ARM_REG_R0
+from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1
 
 TM = '/ko/tm.ko'
 
@@ -52,7 +53,15 @@ def build_entry(inport):
     return bytes(e)
 
 
+def run_tm_with_keys(entry):
+    return _run_tm(entry, want_keys=True)
+
+
 def run_tm(entry):
+    return _run_tm(entry, want_keys=False)
+
+
+def _run_tm(entry, want_keys=False):
     c = flowadd.Case.__new__(flowadd.Case)
     c.log, c.got, c.quiet, c.extidx = [], [], True, 0
     ic = tuple(n for n in flowadd.INTERCEPT
@@ -60,6 +69,62 @@ def run_tm(entry):
     c.m = m = Mod(TM, intercept=ic, log=lambda *a: None)
     for n in ic:
         m.handlers[n] = c._h(n)
+    if os.environ.get('TRACE_HASH'):
+        hits = []
+
+        def mk(nm):
+            def h(mm, _a):
+                hits.append(nm)
+            return h
+
+        for idx2, sym in enumerate(m.symtab):
+            nm = sym.name
+            if not nm or 'ash' not in nm:
+                continue
+            try:
+                m.pokes[m.sym_addr(sym)] = mk(nm)
+            except Exception:                            # noqa: BLE001
+                pass
+        m._hash_hits = hits
+    if os.environ.get('TRACE_ARGS'):
+        want = ('cla_acl_hash_addr_gen', 'aclGetAvailableHashAddr.constprop.16',
+                'tm_acl_get_fastHashRule', 'cla_list_hash_addr_gen',
+                'cla_get_hash_poly_config')
+        for nm in want:
+            i = m.sym_index(nm)
+            if i is None:
+                continue
+
+            def mk(nm2):
+                def h(mm, _a):
+                    r = r0v(mm)
+                    try:
+                        b0 = mm.rd(r[0], 48).hex()
+                    except Exception:                    # noqa: BLE001
+                        b0 = '?'
+                    try:
+                        b1 = mm.rd(r[1], 128).hex()
+                    except Exception:                    # noqa: BLE001
+                        b1 = '?'
+                    print('   [%s] r0..r3=%s' % (nm2, ' '.join('%#x' % x for x in r[:4])))
+                    print('      @r0: %s' % b0)
+                    print('      @r1: %s' % b1)
+                return h
+            m.pokes[m.sym_addr(m.symtab[i])] = mk(nm)
+    if os.environ.get('DUMP_LR'):
+        from unicorn.arm_const import UC_ARM_REG_LR, UC_ARM_REG_SP
+        base = m.handlers['cla_set_hash_table']
+
+        def hooked(_n):
+            lr = m.uc.reg_read(UC_ARM_REG_LR)
+            r = r0v(m)
+            sp = m.uc.reg_read(UC_ARM_REG_SP)
+            print('   call cla_set_hash_table lr=%#x r0..r3=%s sp=%#x'
+                  % (lr, ' '.join('%#x' % x for x in r[:4]), sp))
+            print('     key48 @r1: %s' % m.rd(r[1], 48).hex())
+            return base(_n)
+
+        m.handlers['cla_set_hash_table'] = hooked
 
     def h_status(_n):
         r = r0v(m)
@@ -96,6 +161,15 @@ def run_tm(entry):
         except KeyError:
             continue
         m.wr(fe, 8, struct.pack('<II', 0xe3a00000, 0xe12fff1e))
+    keys = []
+    if want_keys:
+        import struct as _st
+
+        def _pk(mm, _a):
+            keys.append(mm.rd(mm.uc.reg_read(UC_ARM_REG_R1), 48))
+        i2 = m.sym_index('cla_acl_hash_addr_gen')
+        if i2 is not None:
+            m.pokes[m.sym_addr(m.symtab[i2])] = _pk
     flow = m.calloc(0xa8)
     m.wr(flow, 0xa8, bytes(entry))
     out = m.calloc(0x40)
@@ -103,6 +177,14 @@ def run_tm(entry):
     m.wr(l1 + 0x148, 4, struct.pack('<I', 1))
     ret = m.run('zte_api_fast_l3_session_add', (flow, out, out),
                 max_steps=2000000)
+    if os.environ.get('TRACE_HASH'):
+        seen = []
+        for x in getattr(m, '_hash_hits', []):
+            if x not in seen:
+                seen.append(x)
+        print('   hash 相关函数命中:', seen)
+    if want_keys:
+        return ret, c.got, keys
     return ret, c.got
 
 
