@@ -376,6 +376,22 @@ points at something in the repository or at a measurement.
       strip is the interface itself, not an alias. What is left of the fourth round's
       list is unchanged and now the *whole* list: where the entry slot number comes
       from (sbrg_hash / sbrg_get_table_sel) and what the four tables are for.
+    * 2026-10-29 sixth round (offline, `tools/vendor-emu/t_v6seq.py`, README
+      "第六轮"): the slot question is closed.  Instead of stubbing the helpers, the
+      script lets the vendor code run and only intercepts the ONU accessors, feeding
+      the three register values measured in the fifth round (reg 20 bit0 = 1, reg 25
+      = 0, reg 29 = 1).  One add is then: read the four tables at the entry's four
+      blocks (start=1), then write table 0 only (start=0), three words per block via
+      regs 78/77/76.  The index comes from `sbrg_hash()` through the arithmetic at
+      0x1000f184: table_sel 1 -> ((hash & 0x7f) << 2) | 0x200, table_sel 2 ->
+      ((hash << 2) & 0xff) | 0x300, and the 48-byte entry occupies index..index+3.
+      Verified on three records (0x3fd -> 0x3f4, 0x45 -> 0x314, 0x26a -> 0x3a8), and
+      the twelve words the vendor code assembles are byte-identical to
+      t_v6entry.py's build() from the fourth round.  Still open: what tables 1..3
+      hold, sbrg_hash's algorithm (needed to compute a slot in the driver), and what
+      this address/prefix table actually does for forwarding - it carries no ports
+      and no five-tuple, which is the final explanation for why v6 never matched the
+      CLA hash.
     * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
       bench's only peer filters inbound IPv6, hence UDP above), then decide whether
       ipv6=1 becomes the default.

@@ -389,3 +389,77 @@ f260: str r2, [sp, #0x94]      @ w11
 5. 仍然未知，且与第四轮一致：**表项槽号怎么算**、**4 张 table 各管什么**。第四轮已经把槽号的
    候选路径指到 `sbrg_hash` / `sbrg_get_table_sel`，下一步要么在仿真里把这两个的真实语义接上，
    要么直接在真机上做一次"写一条已知 48 字节表项再读回"。
+
+---
+
+## 2026-10-29 第六轮：让厂商代码自己跑出完整命令序列（槽号问题结案）
+
+第四轮把访问协议"定"下来了，但那是靠 stub 拼出来的：`sbrg_hash` 和 `sbrg_get_table_sel`
+都被替换成常量，所以槽号从哪来一直悬着。这一轮换了个做法——`t_v6seq.py` **只拦截边界**
+（`tmOnuRegWrite` / `tmOnuRegRead` / `printk`），`sbrg_hash`、`sbrg_get_table_sel`、
+`sbrg_set_indreg_cmd`、两个 cfg 包装和 `sbrg_access_timeout` 全部让模块自己的代码跑。
+
+唯一"喂"进去的是第五轮在板上量到的三个值，不是猜的：
+
+    reg 20 (0x92388018) bit0 = 1   ← 访问门是开的
+    reg 25 (0x92388180) bits0..5 = 0
+    reg 29 (0x92388184) mask 3   = 1   ← 这条不给，函数直接打"ipv6 multicast address table is zero"返回 -1
+
+### 一次 add 的完整序列（记录：valid=1 mode=1 vlan=1 dip=fd88::2 pt_mask=0xff sip=fd99::2）
+
+```
+read  reg 29 -> 1                       # 门的开关
+[4 张 table × 4 个块]  每一块：
+  read  reg 20 -> 1                     # sbrg_access_timeout：非 0 放行
+  write reg 19 <- 0x08000000|table<<22|index   # start=1（读方向）
+  read  reg 76 / 77 / 78                # 3 个字
+[写阶段] 只写 table 0，同样 4 个块：
+  write reg 19 <- 0x00000000|index        # start=0（写方向）
+  write reg 78 / 77 / 76 <- 3 个字
+```
+
+即：**先按 4 张 table × 4 块把旧表项读回来（12 个字 ×4），再只把 table 0 的同一组块写下去。**
+读表 1..3 却没写回去，说明那是同一把 key 在别的库里的副本或对照，用途还没定（见下）。
+
+### 槽号：`sbrg_hash` 的结果经过一次移位再拼上库基址
+
+反汇编（`0x1000f14c` 的 `bl` 之后，capstone 从真机加载后的内存直接读）是这段：
+
+```
+0x1000f184  cmp   r2, #1
+0x1000f188  andeq r2, r0, #0x7f      ; r0 = sbrg_hash() 的返回值
+0x1000f18c  lslne r2, r0, #2
+0x1000f190  lsleq r2, r2, #2
+0x1000f194  uxtbne r2, r2
+0x1000f198  orreq r2, r2, #0x200     ; table_sel == 1 → 0x200 库
+0x1000f19c  orrne r2, r2, #0x300     ; table_sel == 2 → 0x300 库
+```
+
+也就是：
+
+```
+table_sel == 1:  index = ((hash & 0x7f) << 2) | 0x200     # 128 个桶，每桶 4 块
+table_sel == 2:  index = ((hash << 2) & 0xff) | 0x300     #  64 个桶，每桶 4 块
+```
+
+48 字节表项占用 `index .. index+3` 四个块（4 块 × 3 字 × 4 字节 = 48），与实测的
+`0x3f4..0x3f7` 完全吻合。**三个记录逐一验证，公式一次不差**：
+
+| 记录 | `sbrg_hash` 返回 | `hash & 0x7f` | 预测 index | 实测 index |
+|---|---|---|---|---|
+| vlan 1, fd88::2/fd99::2 | `0x3fd` | `0x7d` | `0x200+4*0x7d = 0x3f4` | `0x3f4` |
+| vlan 2, fd88::3/fd99::4 | `0x45`  | `0x45` | `0x200+4*0x45 = 0x314` | `0x314` |
+| vlan 0x34, fd88::5/fd99::6 | `0x26a` | `0x6a` | `0x200+4*0x6a = 0x3a8` | `0x3a8` |
+
+顺带交叉核对第四轮的表项组装：这次是**模块自己的代码**写出的 12 个字
+（`0000000d 00000000 00000100 0088fdff 00000000 00000000 00000000 02000000 00000000
+000099fd 00000000 00000000`），与 `t_v6entry.py build()` 对同一条记录算出来的逐字相同。
+
+### 这一轮之后仍未知的三件事
+
+1. **table 1..3 是什么**：只读不写；`g_IPv6_{Snat,Dnat}_Ram_Length` 的边界应该就在这几个库上。
+2. **`sbrg_hash` 的算法**：要让驱动在内核里算出同一个槽号，得把这段（328 字节）逆出来，
+   现在只能靠仿真器代跑。
+3. **这张表对转发到底做什么**：表项里只有 vlan、两个 IPv6 地址和 pt_mask，没有端口和
+   五元组，它是"地址/前缀表"，不是流表——这正是它和 `zx_ppe_hash_entry()` 那条 CLA 快表
+   的根本区别，也是"IPv6 为什么不走 CLA"的最终解释。
