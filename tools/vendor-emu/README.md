@@ -859,3 +859,28 @@ inport 2 的 60 B 表项:
 docker run --rm -e TRACE_ARGS=1 -e DUMP_LR=1 -v "$KO":/ko:ro -v "$PWD":/w -w /w \
   --entrypoint python3 e2631-uni:py312 t_v6flowdump.py 2
 ```
+
+## 第十四轮（2026-10-31 第二轮）：外部哈希表 = phys 0x20000，而这台机器上没有那块地
+
+上一轮所有脚本都把 `cla_set_hash_table` / `cla_set_extra_*` **替换**掉了（`intercept`
+即桩），所以"原厂写了什么"只看到入参、看不到它真的往哪张表写。这一轮把桩往下挪一层：
+
+* `t_v6ops.py` —— **只桩函数栈底部**（`cla_set_indirect_rw_cmd/data`、`*_status`、
+  `fpga_read_reg/write_reg`、`printk`、`memset/memcpy/__memzero`、分配器），其余真身跑。
+  底部收到的 `(table, index, word)` 记进一个 RAM 模型，跑完打印；同时挂
+  `UC_HOOK_MEM_WRITE` 抓"模块内存之外"的直接写。默认会话用
+  `t_hfsess.build_desc(d14=1, type=10, ...)`（地址真实），`LEGACY=1` 复现上一轮那条。
+  结果：**地址真实的 v6 会话只调一次 `cla_set_external_hash_table(0x3c00, 0x13, entry, 0x43)`，
+  间接写流水是空的**；`LEGACY` 那条才走 `cla_set_hash_table`。
+* `t_v6trace.py` —— 只截调用序列（poke 所有 `cla_/acl_/tm_acl_/fpga_` 函数入口），用来快速
+  看一次 add 走了哪条分支。
+* `t_v6extdump.py` —— 跑完把"落在模块内存之外"的页 dump 出来（外部表是直接内存写）。
+* `t_clainit.py` —— 在原厂初始化函数上跑同一套底部桩（`tm_pon_pp_cla_initial` 目前只做锁
+  初始化；要找真正的 CLA 初始化得换函数名当参数）。
+* `t_onureg.py` —— dump `tmOnuGlbRegValidation()` 的寄存器描述符（base/mask/shift/stride）；
+  参数是 `(out, tmp, regid, 1)`，`outspace cfg` 就是 ONU reg 0xd。
+* `redis.py` —— 就是原来那份 capstone 反汇编小工具（文件名不能叫 `dis.py`，会顶掉标准库）。
+
+结论与复现命令写进 `docs/ppe-ipv6-external-hash-2026-10-31.md`；一句话：外部表的落点是
+`phys 0x20000 + 64*addr`，落盘时每 8 字节一组逆序，而本板那里是启动 ROM 的别名、
+写会 external abort——CLA 的 v6 单播快表在这块板上没有存储。

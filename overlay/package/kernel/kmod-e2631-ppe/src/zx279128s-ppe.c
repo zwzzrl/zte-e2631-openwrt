@@ -162,6 +162,19 @@ static int zx_ppe_v6_key = -1;
 module_param_named(v6_key, zx_ppe_v6_key, int, 0644);
 MODULE_PARM_DESC(v6_key, "id the IPv6 hash key carries (-1: same as v6_rule)");
 
+static unsigned int zx_ppe_v6_w1;
+module_param_named(v6_w1, zx_ppe_v6_w1, uint, 0644);
+MODULE_PARM_DESC(v6_w1, "word 1 of the IPv6 entry (0: 0xfa11c000)");
+
+static unsigned int zx_ppe_v6_w3;
+module_param_named(v6_w3, zx_ppe_v6_w3, uint, 0644);
+MODULE_PARM_DESC(v6_w3, "word 3 of the IPv6 entry (0: 0x80000000)");
+
+static unsigned int zx_ppe_v6_tag_byte = 0x14;
+module_param_named(v6_tag, zx_ppe_v6_tag_byte, uint, 0644);
+MODULE_PARM_DESC(v6_tag,
+	"byte 2 of the IPv6 entry key string (stock value 0x14; 0 = leave 0)");
+
 static int zx_ppe_v6_idxw4 = -1;
 module_param_named(v6_idxw4, zx_ppe_v6_idxw4, int, 0644);
 MODULE_PARM_DESC(v6_idxw4, "word 4 of the IPv6 extract index entry (-1: shipped value)");
@@ -421,6 +434,11 @@ static unsigned int zx_ppe_v6_key_byte(void)
 {
 	return zx_ppe_v6_key < 0 ? (unsigned int)zx_ppe_v6_rule_idx
 				 : (unsigned int)zx_ppe_v6_key;
+}
+
+static unsigned int zx_ppe_v6_tag(void)
+{
+	return zx_ppe_v6_tag_byte & 0xff;
 }
 
 /*
@@ -725,13 +743,25 @@ static int zx_ppe_hash_entry(const struct zx_ppe_tuple *t, u16 flow, int port,
 	/* valid, extract index, upstream */
 	zx_ppe_put_bits(key, 0, 8,
 			0x40 | (t->v6 ? zx_ppe_v6_entry_idx() : ZX_PPE_V4_INDEX));
+	/* The vendor's own flow-add (tm.ko run in tools/vendor-emu) puts 0x14
+	 * in byte 2 of a v6 key string, where the v4 string has 0.  Whether the
+	 * hardware compares that byte is unproven; this makes our entry
+	 * byte-identical to theirs, which is what the parameter is for.
+	 * Byte 1 stays 0.
+	 */
+	if (t->v6)
+		zx_ppe_put_bits(key, 16, 8, zx_ppe_v6_tag());
 	for (i = 0; i < n; i++)
 		zx_ppe_put_bits(key, 24 + 16 * i, 16, hw[i]);
+	/* word 0 bit 3 is set in every stock v6 entry and clear in every v4
+	 * one: it marks the entry as an IPv6 flow.
+	 */
 	w[0] = FIELD_PREP(ZX_CLA_W0_FLOW, flow) | ZX_CLA_W0_FWD |
-	       FIELD_PREP(ZX_CLA_W0_EGRESS, ZX_BRPORT(port)) | ZX_CLA_W0_BITS;
-	w[1] = 0xfa11c000;
+	       FIELD_PREP(ZX_CLA_W0_EGRESS, ZX_BRPORT(port)) | ZX_CLA_W0_BITS |
+	       (t->v6 ? BIT(3) : 0);
+	w[1] = (t->v6 && zx_ppe_v6_w1) ? (u32)zx_ppe_v6_w1 : 0xfa11c000;
 	w[2] = 0x00000608;
-	w[3] = 0x80000000;
+	w[3] = (t->v6 && zx_ppe_v6_w3) ? (u32)zx_ppe_v6_w3 : 0x80000000;
 	/* 4 control words plus the string, rounded up to whole words */
 	words = 4 + (24 + 16 * n + 31) / 32;
 	for (i = 4; i < words; i++)
@@ -1201,6 +1231,16 @@ static const u32 zx_ppe_v4_rule[16] = {
  * fast path", which is why it is not the default.  Details in
  * docs/known-issues.md, PPE-IPV6-TCP.
  *
+ * 2026-10-31: the reason is now structural rather than a guess.  Re-running the
+ * vendor's own flow-add with a *real* AF_INET6 session (tools/vendor-emu/
+ * t_v6ops.py) shows it never touches the internal banks for IPv6: its only
+ * write is cla_set_external_hash_table(), which lands at the vendor VA
+ * 0xF1020000 + 64*idx - physical 0x20000 + 64*idx through their iotable.  That
+ * window is the boot ROM alias on this board (writes raise an imprecise
+ * external abort), and the indirect command register has no "external space"
+ * selector (its first argument is the read/write direction).  So a v6 unicast
+ * entry has no table to live in here; see docs/ppe-ipv6-external-hash-2026-10-31.md.
+ *
  * The index entry is aclRamInit's: extract field ids 0..15, word 4 the proven
  * v4 entry (bit 0 = v4 fast enable) carrying the v6 enable bit 2 instead, byte
  * 17 = 0x01 "look up the hash banks" and byte 18 = 0x15 as in the v4 entry.
@@ -1451,10 +1491,13 @@ static void zx_ppe_dump_regs(struct zx_eth_adapter *adapter)
 
 /* Which table ids the indirect command register actually answers.  The vendor's
  * IPv6 add path also writes an "external" hash table at (0x3c40000 + 0x800 +
- * idx) << 6; if the hardware reads IPv6 entries from there rather than from the
- * two internal banks, that would explain a v6 lookup that is clearly active
- * (frames are dropped instead of being sent to the CPU) and never matches.
- * Asking for that memory directly may fault, ids are free to try.
+ * idx) << 6, i.e. vendor VA 0xF1020000 + 64*idx = physical 0x20000 + 64*idx
+ * through their iotable; the hardware could have read v6 entries from there
+ * instead of from the internal banks.  Measured 2026-10-31: this scan answers
+ * for table ids 2..6 only (the five internal hash banks), and the vendor's
+ * indirect command word has no "external space" bit (its first argument is the
+ * read/write direction), so there is no fifth table to reach this way either.
+ * The external window itself is the boot ROM alias on this board.
  */
 static void zx_ppe_dump_tablescan(struct zx_eth_adapter *adapter)
 {

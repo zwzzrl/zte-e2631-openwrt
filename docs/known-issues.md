@@ -565,6 +565,33 @@ points at something in the repository or at a measurement.
           下一步要么先把原厂 v6 表项的真实 key 反解出来（离线），要么给驱动加一个
           "整条 60 字节 v6 表项直写"的调试参数，用它验证原厂形状能不能被硬件接受。
           细节、原始读数、复现命令：`docs/vendor-v6-entry-format-2026-10-31.md`。
+    * 2026-10-31 第二轮：**"缺的那次写"找到了，就是外部哈希表；而这块板子没有那张表。**
+      把上一轮 `t_v6flowdump.py` 的会话换成地址真实存在的形状（`desc[0x0c]=10`，16 字节
+      地址真的进了会话）之后，让 `tm.ko` 真身跑（只桩函数栈底部，见
+      `tools/vendor-emu/t_v6ops.py`），原厂 v6 会话添加的完整流水是：
+      `aclGetAvailableHashAddr(sel=0)` → `aclGetAvailableHashAddr(sel=1)` →
+      **`cla_set_external_hash_table(0x3c00, 0x13, entry, 0x43)`** → 返回 0。
+      间接写流水**是空的**：不写内部哈希表、不写规则表、不写索引表。同一个脚本加
+      `LEGACY=1`（上一轮那条掩码地址会话）才走 `cla_set_hash_table`，也就是说上一轮看到的
+      "原厂 v6 表项 `0100004c …` 短 key"是**另一种会话形状**的产物，不是原厂运行态。
+      - 外部表落点 = `((0x3c40800 + addr) << 6) & 0xffffffff`，即原厂 VA
+        `0xF1020000 + 64*addr`；`addr = 0x3c00` → `0xF1110000`。落盘时**每 8 字节一组
+        逆序**（七组逐组对过，不是整条逆序）。
+      - 原厂内核 iotable 最后一条 `virt 0xF1000000 <- phys 0x00000000 len 0x520000`，
+        所以那是**物理 `0x00020000 + 64*addr`**；本板 2026-10-29 用 `xprobe` 实测过，
+        那里是启动 ROM 的异常向量表（六个 64 KiB 间隔地址读回同一份 `e59ff120 …`），
+        写 `0x20840` 触发 imprecise external abort。**没有可写的表存储。**
+      - 间接接口也**没有**"外部空间"口子：`cla_set_indirect_rw_cmd(sel, table, index)` 的
+        `sel` 是**读写方向**（写函数一律 0、读函数一律 1），命令字 =
+        `index | table<<22 | sel<<27`，`table ≤ 9`（0 索引、1 规则、2..6 哈希五档库、
+        7 cpu queue、8 aging、9 dscp/tc/qid）。真机 `dump 8` 扫 0..15 号表，只有 2..6
+        读得回我们写的数据，和这张表一致。
+      - 结论：**CLA 内部哈希不查 v6（上一轮已从反面证过），CLA 的 v6 单播快表在另一块
+        存储上，这块板子没有那块存储。** 原厂在这台机器上的 v6 加速只能是 FFE（内核里的
+        conntrack 软件快转）+ NPU（他们 switch.ko 的 ACL L3 hardfast，能力矩阵里 ipv6
+        只有 tcp/udp/mc 且限 WAN↔LAN）。
+      细节：`docs/ppe-ipv6-external-hash-2026-10-31.md`。本轮之后 `ipv6=1` 的定位可以
+      收口成"二层 IPv6 硬件交换 + IPv6 组播硬件表"，不再包含路由 v6 快转的期待。
     Measurement note, because it cost a wrong conclusion once: tx_submitted in
     /sys/kernel/debug/92000000.ethernet/dma_state proves that the CPU did *not* touch
     a packet, which is not the same as proving the hardware forwarded it - a dropped
