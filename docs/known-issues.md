@@ -363,6 +363,19 @@ points at something in the repository or at a measurement.
       78/77/76（`0x9238801c/20/24`），读阶段是 4 张 table × 4 个块（index 0x248..0x24b）
       × 3 字、写阶段只写 table 0。仍未定：槽号从哪来、4 张 table 各管什么 —— 两者都卡在
       reg 20 的真实语义上，只能上板读一次复位值再接下去。
+    * 2026-10-29 fifth round (real hardware, read-only; `tools/vendor-emu` README
+      "第五轮"): the reset values the fourth round said were the only remaining gate.
+      Dumping 0x92388000..0x92388200 through the driver's own `xprobe` parameter
+      (ioremap+readl), with the register numbers taken from tm.ko's `sbragRegTable`
+      (`t_v6tbl.py anchors`), gives: cmd word 0x92388014 = 0x01000001 (table=4,
+      index=1, rw=0, start=0 - a leftover from a boot-time write), access gate
+      reg 20 bit0 at 0x92388018 = **1** (sbrg_access_timeout wants non-zero, so the
+      interface is granted on this board), the three data words at 0x1c/0x20/0x24 =
+      0xa1/0/0 (table still empty), all six status bits at 0x92388180 = 0 (idle).
+      No read raised an external abort and nothing past 0x92388200 decodes, so this
+      strip is the interface itself, not an alias. What is left of the fourth round's
+      list is unchanged and now the *whole* list: where the entry slot number comes
+      from (sbrg_hash / sbrg_get_table_sel) and what the four tables are for.
     * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
       bench's only peer filters inbound IPv6, hence UDP above), then decide whether
       ipv6=1 becomes the default.
