@@ -31,6 +31,7 @@ The image is `python:3.12-slim` plus `unicorn` and `pyelftools`.
 | `t_real3.py` | the flow-add path with the tables and the polynomial config filled with the values the hardware really holds (read back with the driver's `dump` parameter), so the vendor's read-modify-write of an index entry produces its real final value |
 | `t_gfhr.py` | calls `tm_acl_get_fastHashRule()` on its own with a descriptor we control and prints, for every descriptor byte, which byte of the 60-byte hash rule it lands in (`map 3 5` sweeps IPv4 and IPv6) |
 | `t_key.py` | the whole `tm_add_acl_flow_rule()` path with a hook on each key builder; `paths` shows which builder a type takes, `map` tags descriptor bytes, `key` prints the 45-byte key handed to `aclGetAvailableHashAddr()` |
+| `t_v6rule.py` | 跑一次 IPv6 流添加，打印它写/读的规则表和索引表（结论：一张都不写） |
 | `t_v6win.py` | block-sweeps the descriptor and reports, for every buffer the run produces (entry, 45-byte key, 60-byte hash rule, external hash), which descriptor offset landed in which output byte |
 | `t_v6path.py` | pokes every acl/fast function entry and prints the order they actually run, per rule type and fast flag |
 | `t_v6tbl.py` | decodes the ONU register descriptors out of the ELF (`regs`) and emulates `sbrg_add_ipv6table()` (`call`) |
@@ -619,5 +620,65 @@ NPU/hardfast 那一套（`npu_ipv6_l3{tcp,udp}{up,down}_cap`、`npu_drv_create_f
    `npu_drv_create_flow` 这条线上找（那是原厂真正的 v6 单播快路），工作量另计。
 4. 引擎开机自启已经验证：删掉 10 月 13 日残留的 `/etc/e2631-ppe-pending` 后重启，引擎在
    45.7 s 自启（`S99e2631-ppe` + `DEFER=20`），`/etc/e2631-ppe-*` 标记由守卫自己清掉。
+
+---
+
+## 2026-10-29 第九轮：单窗口规则也匹配不上，CLA 的 IPv6 哈希查找被排除
+
+这一轮先纠正了两个测量判据，再用它们把「IPv6 表项到底差在哪」这个问题**证伪**掉了。
+
+### 1. 老化位不是判据，`tx_submitted` 才是
+
+之前一直把 hash 槽的 aging word 当命中判据。这一轮拿一条**确认走硬件**的 IPv4 流
+（`iperf3` 跨子网、`tx_submitted` 几乎不涨）去看：aging word 一个都没变。所以
+「老化位为 0」不等于「没命中」，此前所有基于它的 v6 结论都只算弱证据。
+
+能用的判据是 `/sys/kernel/debug/92000000.ethernet/dma_state` 里的 `tx_submitted`：
+硬件转发的包不进 CPU 发送环，CPU 提交数几乎不动。为了让这个判据可信，同一拓扑下要有
+对照——同一条「LAN 主机 → 路由器 → 同口回环」的流，IPv4 是 **600 个包只花 98 个 CPU 提交**，
+所以端口回环本身不是 IPv6 匹配不上的原因。
+
+### 2. `t_v6rule.py`：原厂 IPv6 添加路径不写规则表
+
+`t_v6win.py` 已经证明 type-5 的 hash 表项只写 13 字节；这次把它写/读的**规则表和索引表**
+也记下来：一次 IPv6 添加**一张都不写**，只有那 60 字节表项。也就是说表项必须去匹配
+原厂开机时预置的规则——而那条规则的窗口 0 掩码是 `0xff00`（协议在高字节），原厂表项却把
+协议放在低字节。**原厂自己这条 ACL v6 路径也对不上它的规则**，再次印证他们的 IPv6 快路
+在 NPU（`switch.ko` 的 hardfast 那一套），不在 ACL。
+
+### 3. 驱动的诊断能力（这一轮加的）
+
+| 参数 | 作用 |
+| --- | --- |
+| `v6_wins "ofs[:mask],..."` | 自定义窗口列表：按同一份描述同时生成提取规则（偏移 bit 7n、掩码 140+16n、类型 480+3n、hash 长度 468/472）、哈希 key 和表项 |
+| `v6_fix` | 位 0 协议放低字节、位 1 端口半字互换、位 2 地址半字互换 |
+| `cla_clear` | 清零全部 520 个槽（交换芯片 SRAM 不随模块重载复位；上一轮 shotgun 灌满全表，正是一次 IPv4 测试看起来"坏了"的原因） |
+| `dump 32` | 紧凑打印 520 个老化字 |
+
+### 4. 决定性实验：一个窗口都不命中
+
+`v6_wins "6:ff00"` = 规则里只有**一个窗口**（下一报头字节，掩码 `0xff00`，hash 长度 1），
+并且把表项灌进**全部 520 个槽**，槽号模型不可能影响结果。回读硬件：规则窗口 0 偏移 6、
+掩码 `0xff00`、hashlen=1；表项窗口值 `0x1100`，都对。结果：**600 个包 617 次 CPU 提交**，
+一个都没命中。再换表项索引字节 `0x6a`（原厂的真值）、把规则写到索引 2（原厂
+`cla_set_extra_rule_table` 的去处）、把原厂 CLA 配置寄存器也写进去（`+0x80=0x00000e00`、
+`+0x88=0x3fff`、`+0x94=2`、`+0x98=0x3fff3fff`，我们读到的是 `0x301a/0x7fff/4/0x7fff7fff`），
+全部不命中；同一条路径的 IPv4 流用同一份驱动、同一套槽号、同一套测量就命中。
+
+**结论**：这颗交换芯片在我们能触及的范围内**不做 IPv6 哈希查找**（或者需要一个不在 CLA
+窗口里的开关，原厂任何能仿真的代码都没碰它）。所以 mainline 侧「改 key 布局」这条路走到头
+了；要在 mainline 上做 IPv6 硬件加速只能搬原厂 NPU（驱动核在 4.1 vmlinux 里），不在本轮
+工作量范围内。现状保留：`ipv6=1` = IPv6 正确转发但走 CPU（所以不做默认），IPv4 继续硬件加速。
+
+### 5. 下一轮可用的对端
+
+`DESKTOP-A5A2TK2` 上有一个 iperf3 服务（5201），它的防火墙只放行 `192.168.0.0/16` 和 IPv6
+链路本地地址。因此：
+
+- **IPv4 路由流**可以自己造：`iperf3 -c 192.168.1.243 -B 192.168.5.50`，主机加
+  `192.168.1.243/32 via 192.168.1.1`，路由器加 `192.168.5.0/24 via 192.168.1.250`。
+- **IPv6 路由流**被对端策略挡住（只收 fe80 源），所以 IPv6 仍用单向回环台
+  `fd99::2:48211 -> fd88::2:9999`；这台不需要对端，是最可靠的那套。
+- 该 iperf3 服务本会话里挂过两次（连不上、SYN 无回），别把它当唯一判据。
 
 

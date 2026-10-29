@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/rhashtable.h>
 #include <linux/slab.h>
+#include <linux/swab.h>
 #include <net/flow_offload.h>
 
 #include "zx279128s-ppe.h"
@@ -188,6 +189,117 @@ MODULE_PARM_DESC(v6_hwn,
 	"halfwords of the IPv6 key (windows hashed, -1: all 19)");
 
 /*
+ * Byte order inside one window.  The vendor's own IPv6 table entry is the
+ * reference (tools/vendor-emu/t_v6win.py, and the 60-byte dump of a real run):
+ * its first window holds the protocol in the *low* byte (e19 = 0x11, e20 = 0)
+ * where this driver writes it into the high byte like the v4 mask suggests,
+ * its port windows hold the two bytes in wire order, while its address
+ * windows are the big-endian halfwords this driver already writes.  Either
+ * the windows really are ordered differently for IPv6, or the vendor has a
+ * different mask in the same rule id.  Rather than guess, each difference is
+ * a bit that can be flipped on a loaded module:
+ *
+ *	bit 0: protocol in the low byte of window 0
+ *	bit 1: swap the two port halfwords
+ *	bit 2: swap the address halfwords
+ *
+ * With all bits clear the key is what earlier rounds wrote, so a hardware
+ * test can walk from the old layout to the vendor's in three steps.
+ */
+static int zx_ppe_v6_fix;
+module_param_named(v6_fix, zx_ppe_v6_fix, int, 0644);
+MODULE_PARM_DESC(v6_fix,
+	"IPv6 key byte order: bit 0 protocol low byte, 1 swapped ports, 2 swapped addresses");
+
+/*
+ * A window list of our own.  The extract rule is just a table, so instead of
+ * reverse-engineering the layout the stock firmware's rule 2 was written with,
+ * the driver can define the windows it wants: "offset[:mask]" per window,
+ * offset in bytes from the start of the IPv6 header (the L4 ports live at 40
+ * and 42 in that same buffer), mask in hex.  The rule table is patched to the
+ * same list and the hash length set to the window count, so rule, key and
+ * entry are always built from one description.
+ *
+ * This exists because a one-window rule ("6:ff00", the next-header byte) is
+ * the cheapest possible question to the hardware: if even that never matches
+ * an IPv6 flow, the classifier does not look up IPv6 hashes at all.  If it
+ * does match, the list can be grown window by window until it stops.
+ */
+#define ZX_PPE_V6_WIN_MAX 19
+static int zx_ppe_v6_win_ofs[ZX_PPE_V6_WIN_MAX];
+static u16 zx_ppe_v6_win_mask[ZX_PPE_V6_WIN_MAX];
+static int zx_ppe_v6_win_n;
+
+static void zx_ppe_patch_bits(u8 *buf, int pos, int width, u32 val)
+{
+	int i;
+
+	for (i = 0; i < width; i++, pos++) {
+		if (val & BIT(i))
+			buf[pos / 8] |= BIT(pos % 8);
+		else
+			buf[pos / 8] &= ~BIT(pos % 8);
+	}
+}
+
+static void zx_ppe_v6_wins_apply(void);
+
+static int zx_ppe_v6_wins_set(const char *val, const struct kernel_param *kp)
+{
+	char buf[128];
+	const char *cur;
+	size_t len;
+	int n = 0;
+
+	if (!val)
+		return -EINVAL;
+	/* sysfs hands the buffer over with its trailing newline */
+	len = strscpy(buf, val, sizeof(buf));
+	if (len < 0)
+		return -EINVAL;
+	while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
+		       buf[len - 1] == ' '))
+		buf[--len] = '\0';
+	for (cur = buf; *cur && n < ZX_PPE_V6_WIN_MAX; cur++) {
+		unsigned int ofs, mask = 0xffff;
+		char *end;
+
+		ofs = simple_strtoul(cur, &end, 0);
+		if (end == cur || ofs > 46)
+			return -EINVAL;
+		cur = end;
+		if (*cur == ':') {
+			cur++;
+			mask = simple_strtoul(cur, &end, 16);
+			if (end == cur || mask > 0xffff)
+				return -EINVAL;
+			cur = end;
+		}
+		zx_ppe_v6_win_ofs[n] = ofs;
+		zx_ppe_v6_win_mask[n] = mask;
+		n++;
+		if (*cur == ',')
+			continue;
+		if (*cur)
+			return -EINVAL;
+		break;
+	}
+	zx_ppe_v6_win_n = n;
+	zx_ppe_v6_wins_apply();
+	pr_info("zx279128s-ppe: v6_wins: %d window(s)\n", n);
+	return 0;
+}
+
+static const struct kernel_param_ops zx_ppe_v6_wins_ops = {
+	.set	= zx_ppe_v6_wins_set,
+	.get	= param_get_int,
+};
+static int zx_ppe_v6_wins_storage;
+module_param_cb(v6_wins, &zx_ppe_v6_wins_ops, &zx_ppe_v6_wins_storage, 0644);
+MODULE_PARM_DESC(v6_wins,
+	"custom IPv6 window list \"ofs[:mask],...\" (offset in bytes of the IPv6 header, mask hex)");
+
+/*
  * Diagnostic: write the same IPv6 flow into a range of hash slots instead of
  * only the one zx_ppe_slots() computed.  That separates the two remaining
  * explanations for a flow the hardware never matches -- "the key string is
@@ -209,6 +321,16 @@ MODULE_PARM_DESC(v6_shot_lo, "first slot of the shotgun range (-1: 0)");
 static int zx_ppe_v6_shot_hi = -1;
 module_param_named(v6_shot_hi, zx_ppe_v6_shot_hi, int, 0644);
 MODULE_PARM_DESC(v6_shot_hi, "last slot of the shotgun range (-1: 383)");
+/*
+ * One conntrack entry offloads two flows, and the second add overwrites every
+ * slot the first one wrote.  For a one-way IPv6 bench only the forward tuple
+ * (the one that actually carries frames) is worth shotgun-ing, so this picks
+ * it by source port: the reverse flow of "sport X -> dport Y" has sport Y.
+ */
+static int zx_ppe_v6_shot_sport = -1;
+module_param_named(v6_shot_sport, zx_ppe_v6_shot_sport, int, 0644);
+MODULE_PARM_DESC(v6_shot_sport,
+	"only shotgun a flow whose source port is this value (-1: every flow)");
 
 /*
  * The vendor's way of telling the classifier "this IPv6 address is one of
@@ -476,14 +598,49 @@ static int zx_ppe_halfwords(const struct zx_ppe_tuple *t, u16 *hw)
 	u32 s, d;
 	int i, n;
 
+	if (t->v6 && zx_ppe_v6_win_n) {
+		u8 hdr[48] = {};
+		u16 sp = be16_to_cpu(t->sport);
+		u16 dp = be16_to_cpu(t->dport);
+
+		hdr[6] = t->proto;
+		memcpy(hdr + 8, t->saddr6, 16);
+		memcpy(hdr + 24, t->daddr6, 16);
+		hdr[40] = sp >> 8;
+		hdr[41] = sp & 0xff;
+		hdr[42] = dp >> 8;
+		hdr[43] = dp & 0xff;
+		for (i = 0; i < zx_ppe_v6_win_n; i++) {
+			int o = zx_ppe_v6_win_ofs[i];
+
+			hw[i] = ((u16)hdr[o] << 8 | hdr[o + 1]) &
+				zx_ppe_v6_win_mask[i];
+		}
+		return zx_ppe_v6_win_n;
+	}
+
 	if (t->v6) {
-		hw[0] = t->proto << 8;
-		for (i = 0; i < 8; i++)
-			hw[1 + i] = t->saddr6[2 * i] << 8 | t->saddr6[2 * i + 1];
-		for (i = 0; i < 8; i++)
-			hw[9 + i] = t->daddr6[2 * i] << 8 | t->daddr6[2 * i + 1];
+		bool plow = zx_ppe_v6_fix & 1;
+		bool pswap = zx_ppe_v6_fix & 2;
+		bool aswap = zx_ppe_v6_fix & 4;
+
+		hw[0] = plow ? t->proto : t->proto << 8;
+		for (i = 0; i < 8; i++) {
+			u16 v = t->saddr6[2 * i] << 8 | t->saddr6[2 * i + 1];
+
+			hw[1 + i] = aswap ? swab16(v) : v;
+		}
+		for (i = 0; i < 8; i++) {
+			u16 v = t->daddr6[2 * i] << 8 | t->daddr6[2 * i + 1];
+
+			hw[9 + i] = aswap ? swab16(v) : v;
+		}
 		hw[17] = be16_to_cpu(t->sport);
 		hw[18] = be16_to_cpu(t->dport);
+		if (pswap) {
+			hw[17] = swab16(hw[17]);
+			hw[18] = swab16(hw[18]);
+		}
 		n = ZX_PPE_V6_WINDOWS;
 		if (zx_ppe_v6_hwn >= 0 && zx_ppe_v6_hwn < n)
 			n = zx_ppe_v6_hwn;
@@ -884,7 +1041,9 @@ static int zx_ppe_flow_add(struct zx_eth_adapter *adapter,
 	if (ret)
 		goto err_nh;
 
-	if (t.v6 && zx_ppe_v6_shotgun) {
+	if (t.v6 && zx_ppe_v6_shotgun &&
+	    (zx_ppe_v6_shot_sport < 0 ||
+	     be16_to_cpu(t.sport) == zx_ppe_v6_shot_sport)) {
 		int top = zx_ppe_v6_shot_ext ? ZX_PPE_HASH_SLOTS_EXT : ZX_PPE_HASH_SIZE;
 		int lo = zx_ppe_v6_shot_lo < 0 ? 0 : zx_ppe_v6_shot_lo;
 		int hi = zx_ppe_v6_shot_hi < 0 ? top - 1 : zx_ppe_v6_shot_hi;
@@ -1030,14 +1189,17 @@ static const u32 zx_ppe_v4_rule[16] = {
  * 19 halfwords (v6_hwn), and the index/rule byte inside the key (v6_key) as
  * 0x99, 10, 11 and 0x98.  No combination hit, while the far end counted every
  * one of the 2,800 packets, so the frames were being forwarded and not dropped.
- * The remaining difference is the key string itself: the vendor does not build
- * it from a homogeneous window list.  tm.ko's tm_acl_fast_add_v4v6() packs the
- * 45 bytes out of a hash rule computed in software by tm_acl_get_fastHashRule()
- * (60-byte struct, halfword windows at offsets 16..46), and switch.ko's
- * per-family descriptors differ between the families (npu_ipv4_l3tcpup_cap vs
- * npu_ipv6_l3tcpup_cap, same size, different field map).  Until that is
- * reproduced ipv6=1 means "correct forwarding, no fast path" - which is why it
- * is not the default.
+ * Ninth round (2026-10-29) closed that question: a rule with a *single*
+ * window (the next-header byte, mask 0xff00, hash length 1) written by this
+ * driver, with the matching entry written into all 520 slots, still sends
+ * every packet through the CPU - while an IPv4 flow in the same topology
+ * costs 98 of 600 packets.  The vendor's own IPv6 add does not even write a
+ * rule (tools/vendor-emu/t_v6rule.py), and its 13-byte entry contradicts the
+ * shipped rule's 0xff00 mask.  So the classifier does not look up an IPv6
+ * hash on this part and no key layout can change that; the vendor's IPv6
+ * acceleration is their NPU.  ipv6=1 therefore stays "correct forwarding, no
+ * fast path", which is why it is not the default.  Details in
+ * docs/known-issues.md, PPE-IPV6-TCP.
  *
  * The index entry is aclRamInit's: extract field ids 0..15, word 4 the proven
  * v4 entry (bit 0 = v4 fast enable) carrying the v6 enable bit 2 instead, byte
@@ -1082,6 +1244,21 @@ static void zx_ppe_v6_tune(void)
 	if (zx_ppe_v6_type >= 0)
 		for (i = 0; i < ZX_PPE_V6_WINDOWS; i++)
 			zx_ppe_put_bits(rule, 480 + 3 * i, 3, zx_ppe_v6_type);
+	/*
+	 * A window list of our own overrides offsets, masks and hash length:
+	 * the rule is then exactly the description the key is built from.
+	 */
+	if (zx_ppe_v6_win_n) {
+		for (i = 0; i < zx_ppe_v6_win_n; i++) {
+			zx_ppe_patch_bits(rule, 7 * i, 7, zx_ppe_v6_win_ofs[i]);
+			zx_ppe_patch_bits(rule, 140 + 16 * i, 16,
+					  zx_ppe_v6_win_mask[i]);
+			zx_ppe_patch_bits(rule, 480 + 3 * i, 3,
+					  zx_ppe_v6_type >= 0 ? zx_ppe_v6_type : 3);
+		}
+		zx_ppe_patch_bits(rule, 468, 4, zx_ppe_v6_win_n & 0xf);
+		zx_ppe_patch_bits(rule, 472, 1, (zx_ppe_v6_win_n >> 4) & 1);
+	}
 	if (zx_ppe_v6_idxw4 >= 0)
 		zx_ppe_v6_index[4] = zx_ppe_v6_idxw4;
 }
@@ -1113,6 +1290,11 @@ static void zx_ppe_v6_toggle_adapter(struct zx_eth_adapter *adapter, void *data)
 		zx_update_traps(adapter);
 	}
 	mutex_unlock(&adapter->ppe_lock);
+}
+
+static void zx_ppe_v6_wins_apply(void)
+{
+	zx_eth_for_each_adapter(zx_ppe_v6_toggle_adapter, NULL);
 }
 
 /*
@@ -1744,6 +1926,8 @@ module_param_cb(sbrg, &zx_ppe_sbrg_ops, &zx_ppe_sbrg_storage, 0644);
 MODULE_PARM_DESC(sbrg,
 		 "vendor IPv6 multicast table at 0x388000: \"r <table> <index>\", \"w <table> <index> <w0> <w1> <w2>\", or \"h|a|d <sip32hex> <dip32hex> <vlan> [pt_mask]\" (pt_mask = egress port bits)");
 
+static void zx_ppe_dump_agewords(struct zx_eth_adapter *adapter);
+
 static void zx_ppe_dump_adapter(struct zx_eth_adapter *adapter, void *data)
 {
 	mutex_lock(&adapter->ppe_lock);
@@ -1757,6 +1941,8 @@ static void zx_ppe_dump_adapter(struct zx_eth_adapter *adapter, void *data)
 		zx_ppe_dump_regs(adapter);
 	if (zx_ppe_dump & 8)
 		zx_ppe_dump_tablescan(adapter);
+	if (zx_ppe_dump & 32)
+		zx_ppe_dump_agewords(adapter);
 	mutex_unlock(&adapter->ppe_lock);
 }
 
@@ -1777,7 +1963,76 @@ static const struct kernel_param_ops zx_ppe_dump_ops = {
 };
 module_param_cb(dump, &zx_ppe_dump_ops, &zx_ppe_dump, 0644);
 MODULE_PARM_DESC(dump,
-		 "read the classifier back to dmesg: 1 = index/rule tables, 2 = hash banks + aging, 4 = CLA registers, 8 = table-id scan");
+		 "read the classifier back to dmesg: 1 = index/rule tables, 2 = hash banks + aging, 4 = CLA registers, 8 = table-id scan, 32 = aging words only");
+
+/*
+ * The aging word of every slot, eight to a line: the oracle for "did the
+ * hardware look up this key, and in which slot".  Diffing two of these is far
+ * cheaper than dumping 520 entries, and it fits in dmesg.
+ */
+static void zx_ppe_dump_agewords(struct zx_eth_adapter *adapter)
+{
+	char buf[8 * 9 + 24];
+	int s, i, len;
+
+	for (s = 0; s < ZX_PPE_HASH_SLOTS_EXT; s += 8) {
+		len = scnprintf(buf, sizeof(buf), "cla-age[%3d]", s);
+		for (i = 0; i < 8 && s + i < ZX_PPE_HASH_SLOTS_EXT; i++) {
+			u32 ag = 0;
+
+			if (zx_pp_read_word0(adapter, ZX_CLA_BASE, ZX_CLA_AGING,
+					     s + i, &ag))
+				ag = 0xffffffff;
+			len += scnprintf(buf + len, sizeof(buf) - len, " %08x", ag);
+		}
+		dev_info(adapter->dev, "%s\n", buf);
+	}
+}
+
+/*
+ * Zero every hash slot.  The classifier keeps its entries in switch SRAM that
+ * survives a module reload, so a diagnostic run that wrote all 520 slots (the
+ * shotgun) leaves them behind: the driver's bookkeeping comes back fresh while
+ * the hardware is full, and every later add lands in a slot the hardware never
+ * looks in.  This clears that state without a power cycle.
+ */
+static void zx_ppe_cla_clear_adapter(struct zx_eth_adapter *adapter, void *data)
+{
+	int s;
+
+	mutex_lock(&adapter->ppe_lock);
+	for (s = 0; s < ZX_PPE_HASH_SLOTS_EXT; s++) {
+		u32 table, index;
+
+		zx_ppe_hash_loc(s, &table, &index);
+		zx_pp_write(adapter, ZX_CLA_BASE, table, index, NULL, 0);
+		zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_AGING, index, NULL, 0);
+	}
+	bitmap_zero(adapter->ppe_hash_used, ZX_PPE_HASH_SIZE);
+	mutex_unlock(&adapter->ppe_lock);
+	dev_info(adapter->dev, "cla_clear: %d hash slots and their aging words zeroed\n",
+		 ZX_PPE_HASH_SLOTS_EXT);
+}
+
+static int zx_ppe_cla_clear_storage;
+
+static int zx_ppe_cla_clear_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (ret)
+		return ret;
+	if (zx_ppe_cla_clear_storage)
+		zx_eth_for_each_adapter(zx_ppe_cla_clear_adapter, NULL);
+	return 0;
+}
+
+static const struct kernel_param_ops zx_ppe_cla_clear_ops = {
+	.set	= zx_ppe_cla_clear_set,
+	.get	= param_get_int,
+};
+module_param_cb(cla_clear, &zx_ppe_cla_clear_ops, &zx_ppe_cla_clear_storage, 0644);
+MODULE_PARM_DESC(cla_clear, "write 1 to zero all 520 IPv6/IPv4 hash slots and their aging words");
 
 /*
  * "echo 1 > .../parameters/ipv6" programmes the v6 tables and lifts the v6

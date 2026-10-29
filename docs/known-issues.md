@@ -447,9 +447,58 @@ points at something in the repository or at a measurement.
       switch.ko's NPU/hardfast path: `npu_ipv6_l3{tcp,udp}{up,down}_cap`,
       `npu_drv_create_flow`, and `sw_acl_l3_hardfast_session_add` ->
       `zte_api_fast_l3_session_add`.  Not started.
-    * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
-      bench's only peer filters inbound IPv6, hence UDP above), then decide whether
-      ipv6=1 becomes the default.
+    * 2026-10-29 ninth round (board, `tools/vendor-emu/t_v6rule.py` + a far-end
+      bench): the CLA IPv6 hash path is excluded, not just unmatched.
+      First, two measurement corrections.  The aging word is *not* a usable oracle:
+      an IPv4 flow that provably goes through the hardware (tx_submitted flat) does
+      not change any aging word either, so "aging bit stayed 0" never meant "no
+      match".  tx_submitted in dma_state is the oracle that works, and it needs a
+      control in the same topology: the same hairpin flow (LAN host -> router ->
+      same LAN host) over IPv4 costs 98 of 600 packets of CPU, so the topology is
+      not what stops IPv6.
+      - `t_v6rule.py` runs the vendor flow-add again and records rule/index writes:
+        a type-5 (IPv6) add writes **no rule and no index table at all**, only the
+        60-byte hash entry, so the entry has to match whatever rule the vendor
+        provisioned at boot.  That entry is 13 bytes (protocol in the *low* byte,
+        four bytes of each address, both ports in wire order) - which contradicts
+        the shipped rule, whose window 0 mask is 0xff00 and therefore puts the
+        protocol in the *high* byte.  The vendor's own ACL IPv6 path cannot match
+        either; their IPv6 fast path is the NPU (previous bullet).
+      - The driver grew the diagnostics to test that directly instead of guessing:
+        `v6_wins "ofs[:mask],..."` defines an arbitrary window list, patches the
+        extract rule to exactly that list (offset at bit 7n, mask at 140+16n, type
+        at 480+3n, hash length at 468/472) and builds rule, hash key and entry from
+        one description; `v6_fix` flips protocol/port/address byte order; `cla_clear`
+        zeroes all 520 slots (switch SRAM survives a module reload, and a previous
+        shotgun run left every slot occupied, which is what made one IPv4 test look
+        broken); `dump 32` prints all 520 aging words compactly.
+      - Decisive run: `v6_wins "6:ff00"`, i.e. a **one-window** key that only holds
+        the next-header byte (mask 0xff00, hash length 1), with the entry written
+        into **all 520 slots** so the slot model cannot matter.  Rule read back from
+        the hardware: offset 6, mask 0xff00, hashlen 1; entry read back: window value
+        0x1100.  Result: 617 of 600 packets through the CPU, no match.  Repeated with
+        the entry index byte 0x6a (the value the vendor writes), with the rule at
+        index 2 (where the vendor's `cla_set_extra_rule_table` call goes), and with
+        the vendor's CLA config registers written in (`+0x80=0x00000e00`,
+        `+0x88=0x3fff`, `+0x94=2`, `+0x98=0x3fff3fff`; ours read 0x301a/0x7fff/4/
+        0x7fff7fff): all miss.  An IPv4 flow in the same topology hits with the same
+        driver, same slot model, same measurement.
+      Conclusion: this classifier does not look up an IPv6 hash on this silicon (or
+      needs a knob outside the CLA window that no vendor code we can emulate
+      touches).  Reproducing the vendor's IPv6 acceleration in mainline is therefore
+      not a matter of the key layout; it needs the vendor NPU, whose driver cores
+      live in their 4.1 vmlinux and talk to `CSPKernel_skb_SelectQueue`.  IPv6 stays
+      on the CPU path (`ipv6=1` = correct forwarding, no fast path, which is why it
+      is not the default), IPv4 stays accelerated.
+    * Bench that made the above cheap, for the next round: DESKTOP-A5A2TK2 runs an
+      iperf3 server on 5201 and its firewall accepts 192.168.0.0/16 plus IPv6
+      link-local only.  So a *routed* IPv4 flow is made by using a second subnet
+      inside 192.168/16 (`iperf3 -c 192.168.1.243 -B 192.168.5.50`, host route
+      `192.168.1.243/32 via 192.168.1.1`, router route `192.168.5.0/24 via
+      192.168.1.250`), and routed IPv6 to that peer is blocked by policy, which
+      leaves the one-way hairpin bench (`fd99::2:48211 -> fd88::2:9999`) as the IPv6
+      traffic source.  The iperf3 server hung twice mid-session and had to be left
+      alone; the hairpin bench needs no far end and is the reliable one.
     * The local IPv6 address register file (ONU reg 19) and the ONU S/D IPv6 file (reg
       23) are now programmable - module parameters local6/onu6s/onu6d take the address
       as four 32-bit words, and the offsets were derived from the vendor's register
