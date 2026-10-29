@@ -185,16 +185,20 @@ points at something in the repository or at a measurement.
        (finding 3) and the EN_V6FAST_EXTIDXTBL read-modify-write of the index
        entry's word 4, which is a write to the *internal* index table we do control.
   workaround: |
-    IPv6 *works* in the configuration that ships: ipv6=0 keeps the IPv6 trap on, so
-    IPv6 takes the CPU software path exactly as it did before any of this, and that
-    path is proven end to end (2,800 of 2,800 packets of a forwarded IPv6 UDP burst
-    arrive at the far end; IPv6 traffic to the router itself reaches the stack -
-    ICMPv6 4/4, TCP 22/80/53 connect, HTTP 200).
-    ipv6=1 is now also safe but still does not make anything faster: it programs the
-    v6 tables, lifts the trap and offloads v6 flows into the hash, and the datapath
-    stays on the CPU because of finding 3.  Both settings forward 1,800 of 1,800
-    packets (2026-10-28, measured after the index went back to 10), so ipv6=1 is a
-    "correct but no faster" switch, not a trap.
+    IPv6 forwards correctly in **both** settings; what differs is who moves the
+    frames.  `ipv6=0` keeps the IPv6 trap on, so every IPv6 frame crosses the CPU
+    exactly as it did before any of this (proven end to end: 2,800 of 2,800 packets
+    of a forwarded IPv6 UDP burst reach the far end; traffic to the router itself
+    reaches the stack - ICMPv6 4/4, TCP 22/80/53 connect, HTTP 200).
+    `ipv6=1` programs the v6 tables, lifts the trap and offloads v6 flows into the
+    hash.  It is safe (1,800 of 1,800 forwarded in both settings, 2026-10-28) and it
+    does speed up **LAN-to-LAN** IPv6 switching a lot - 2,000 UDP frames cost the CPU
+    18 packets instead of 2,018 - but a *routed* v6 flow still goes through the
+    classifier to the CPU, because of finding 3 above.
+    **2026-10-30: the image now ships `ipv6=1`** (set from /sbin/e2631-ppe-boot after
+    the module loads, not compiled in; `touch /etc/e2631-ppe-noipv6` or
+    `ZX_PPE_IPV6=0` puts it back).  The LAN-to-LAN win is the reason; the pending
+    marker still guards the boot if the programming ever hangs.
     zx_update_traps() only lifts the IPv6 trap when the module reports its v6 tables
     are in the hardware (zx_ppe_set_v6_offload()), so a module that fails to program
     them leaves the box on the old, safe path.
