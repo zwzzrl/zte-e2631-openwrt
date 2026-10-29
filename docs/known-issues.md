@@ -688,7 +688,13 @@ points at something in the repository or at a measurement.
       - 顺带复验了文档里那条：`rmmod` + `insmod` 之后 `ppe_active` 自己就回到 1，
         不需要再动防火墙。
       工具：主机的 `.scratch/bench6.py`（`sniff <秒> <前缀>` / `blast <包数> <源> <目的>
-      <端口>`，AF_PACKET + UDP 盲发，不依赖 tcpdump/iperf3 对端）。
+      <端口>`，AF_PACKET + UDP 盲发，不依赖 tcpdump/iperf3 对端），搭/拆台子的命令在
+      `.scratch/bench6-setup.sh up|down`。
+      **同一台子同一时刻的 IPv4 对照（这才是"硬件到底卸没卸"的尺子）**：
+      主机 `192.168.1.250` → 盒子 → `10.88.0.1`（盒子把它路由回主机），两轮各 64,000 个
+      UDP，`tx_submitted` 只涨 **+138**，`ppe_flows=2` —— 即 99.9% 的包没经过 CPU。
+      所以这台的计量是可信的：同一个台子、同一天、同一版镜像，
+      **IPv4 +138 / IPv6 +115,407**，差三个数量级。
     * 于是"IPv6 单播路由加速"在本板上只剩 NPU 一条路，而原厂能力表把这条路也限定死了，
       见下一条；`ipv6=1` 能被证明的价值仍然只是**桥内（LAN↔LAN）IPv6 快转**。
     * Untested with the trap lifted: MLD/multicast IPv6 (the switch has its own MLD
