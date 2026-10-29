@@ -84,6 +84,34 @@ else
 	log "找不到 ipv6 参数节点，IPv6 走软件转发"
 fi
 
+# 4. 让 flowtable 重新绑一次，否则引擎一直闲着。
+#    为什么：模块故意放到开机很晚才加载（见 /etc/init.d/e2631-ppe），而 fw4 在约 40 秒
+#    就把 flowtable 装好了。那一刻 zx_eth_setup_tc 收到 FLOW_BLOCK_BIND，但
+#    zx_ppe_engine_get() 找不到引擎模块 → 这个绑定被**直接拒掉**（-EOPNOTSUPP），
+#    驱动侧的 zx_ppe_block_cb_list 里什么都不会留下。等模块 60 秒到位时，
+#    zx_ppe_has_bound_blocks() 自然查不到任何绑定，zx_ppe_start() 也就不会被调用。
+#    2026-10-30 真机实测（v12 首次刷入）：dmesg 只有 "engine loaded, IPv6 classifier
+#    off"，手工 `fw4 reload` 之后立刻出现 "hardware flow offload enabled"。
+#    所以这里在模块和 ipv6 都就位之后，让 fw4 重装一次规则，绑定就会带上引擎。
+#    顺序要在 ipv6 置位之后：这样 start 是一次把 v6 表和 offload 位一起写好的。
+if [ -e /etc/e2631-ppe-norebind ]; then
+	log "按 /etc/e2631-ppe-norebind 跳过防火墙重载（引擎会保持闲置）"
+elif [ -x /etc/init.d/firewall ]; then
+	if /etc/init.d/firewall reload >/dev/null 2>&1; then
+		log "已重载防火墙规则，让 flowtable 带着引擎重新绑定"
+	else
+		log "防火墙重载失败，硬件卸载可能没开（v4/v6 都会走软件转发）"
+	fi
+else
+	log "找不到 /etc/init.d/firewall，跳过重载（引擎可能闲置）"
+fi
+# 引擎真接管了才有这一行。没有就是上面那条路没走通——别静默，写进日志。
+if dmesg 2>/dev/null | grep -q "hardware flow offload enabled"; then
+	log "引擎已接管硬件卸载（dmesg 有 hardware flow offload enabled）"
+else
+	log "警告：dmesg 里没有 hardware flow offload enabled，硬件卸载没开"
+fi
+
 # 2. Confirmation window: a hang means this subshell never runs, so the marker
 #    survives into the next boot carrying this boot id - that is what arms the
 #    skip.  Only clear a marker that still belongs to this boot.

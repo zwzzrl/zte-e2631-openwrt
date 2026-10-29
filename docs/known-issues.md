@@ -594,6 +594,30 @@ points at something in the repository or at a measurement.
       同期在驱动里补了原厂那道理所当然的闸门：`table_sel`（reg 29）不是 1/2 时
       拒绝写 sbrg 表（`sbrg_add_ipv6table+0x178` 就是这么做的），否则条目会落进
       硬件永远不看的那半张表，外表却像"加速没生效"。
+      **2026-10-30 真机实测（v12 刷入后）：`0x388184` 读出来是 `sel 1`**——用
+      `sbrg` 参数节点的 `h`（只算不写）模式，dmesg 打的是
+      `sbrg: vlan 1 hash 0x3b3 sel 1 index 0x2cc (plan)`。两个结论同时落地：
+      (a) 那个寄存器确实就是原厂说的 ONU reg 29 的 table_sel 字段，闸门不会误伤；
+      (b) 槽号也对得上移植的公式，`((0x3b3 & 0x7f) << 2) | 0x200 = 0x2cc`。
+      闸门本身在真机上没触发过（因为读到的就是 1），所以它目前只是保险。
+     * **引擎默认"装了但不干活"——fw4 的绑定比模块早（2026-10-30 真机定位并修好）。**
+      v12 首次刷入后验收发现 `ipv6` 参数是 `Y`、模块也加载了，但 dmesg 里**没有**
+      `hardware flow offload enabled`，`dump`/sbrg 全是空的。原因不是模块坏：
+      fw4 在开机约 40 秒就把 flowtable 装好（`nft list ruleset` 里
+      `flowtable ft { devices = {...} flags offload }` 一直在），那一刻
+      `zx_eth_setup_tc` 收到 `FLOW_BLOCK_BIND`，但 `zx_ppe_engine_get()` 找不到
+      引擎模块，于是这次绑定被**直接拒掉**（`-EOPNOTSUPP`），
+      `zx_ppe_block_cb_list` 里不会留下任何条目；等模块 60 秒才加载时，
+      `zx_ppe_has_bound_blocks()` 查不到东西，`zx_ppe_start()` 也就不会跑。
+      实测对照：手工 `fw4 reload` 后同一台机器立刻出现
+      `[  106.788391] zx279128s-eth 92000000.ethernet: hardware flow offload enabled`。
+      修法在用户态（驱动侧那条路要"先有绑定"，而绑定在模块缺席时就被拒了，
+      改不动这个先后）：`/sbin/e2631-ppe-boot` 在写完 `ipv6=1` 之后
+      `/etc/init.d/firewall reload` 一次，绑定就会带上引擎；随后用
+      `dmesg | grep "hardware flow offload enabled"` 自证，没有就报警。
+      想跳过：`touch /etc/e2631-ppe-norebind`（引擎会保持闲置）。
+      验收脚本里 `ipv6` 那一项也一并改成认 `Y`——内核给 bool 参数打印的是
+      `Y`/`N`，不是 `1`/`0`，原来那条断言会误报成 FAIL。
     * **更换引擎：原厂的 IPv6 卸载不在 CLA 哈希里，而在 ACL L3 hardfast 表里。**
       2026-10-30 在原厂系统（slot1）上读到，原厂对 IPv6 的硬件卸载走的是
       `switch.ko` 的 `sw_acl_l3_hardfast_session_add/_del` 和它内部的
