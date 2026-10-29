@@ -706,3 +706,54 @@ NPU/hardfast 那一套（`npu_ipv6_l3{tcp,udp}{up,down}_cap`、`npu_drv_create_f
 
 细节、逐次写流水的表、68 字节规则项的完整位图和下一步真机实验：
 `docs/vendor-cla-extra-rule-2026-10-30.md`。
+
+---
+
+## 2026-10-30 第十一轮：`hf_set_l3_entry` 整条链 + 条目里到底有没有入端口
+
+这一轮的靶子是一个具体问题：**ACL L3 hardfast 的条目本身有没有“入端口 / 端口组 / 方向”字段**。
+如果有，`npu_cap_array` 里“eth→eth 不做 IPv6”就可能是硬件格式限制；如果没有，那只是一层
+厂商软件策略，值得我们自己下发条目。
+
+**两个新工具，都是只读分析，不碰仓库 C 源码：**
+
+* `t_hfset.py` —— 带符号标注的反汇编器。`objdump -dr` 在这种 `ld -r` 合并出来的 `.ko` 上会把
+  多个 `.o` 里同名的 `.LC43` 并成一个名字，字符串全错。这里复用 `km.py` 的段布局 + 重定位，
+  每条 `bl`、每对 `movw/movt`、每个 `ldr rX,[pc,#n]` 都能落到唯一的函数/字符串。
+  子命令：`dis` / `mem` / `data` / `str` / `xref` / `calls`。
+  用法 `python3 t_hfset.py [/ko/tm.ko] dis <sym>`（注意默认加载的是 `switch.ko`，
+  查 tm 里的函数要显式传 `/ko/tm.ko`）；`xref`/`calls` 对局部函数无效，改用
+  `grep 'bl.*<name>' tm.dis`。
+* `t_hfsess.py` —— 两段式取证。`sess` 在 switch.ko 里跑 `sw_acl_l3_hardfast_session_add(desc)`，
+  拦 `zte_api_fast_l3_session_add` 把 168 字节 `zteHffEntry` 落到 `$HFSESS`
+  （默认 `/o/ztehff.bin`，所以要把 `.scratch/hf2` 挂到 `/o`）；`hw` 再把这个条目喂给 tm.ko，
+  录下 CLA 表项 + `tmOnuRegWrite` + 调用序列；`ab <off> <val>` 只改一个字节做 A/B。
+  里面有几个必要补丁：`patch_sym_ptr()` 把 `g_sw_cap` 挪到自建页（整表写进去会踩坏相邻 stub
+  代码，症状是 `!! handler __memzero: Invalid memory write (UC_ERR_WRITE_UNMAPPED)`）；
+  以及给 `findSubnetIdBySrcMac` / `pp_pm_*` / `pon_pp_set*` / `tm_ipv6table_*` / `sbrg_add*`
+  的入口打 `mov r0,#0 ; bx lr`（否则 `ret=-12` + `invalid source mac addr`）。
+
+**结论（细节与地址见 `docs/vendor-acl-hardfast-re-2026-10-30.md`）：**
+
+1. 60 字节 / 15 字的 CLA 规则条目里**没有任何入端口 bitmap / 端口组 id / WAN 侧标记**。
+   唯一的端口字段是 `word0` 的 **bit12..23**，由 `zteHffEntry+0x9a`（= 出口设备名经
+   `get_sw_port_from_devname` 换算出的端口）填进来：`word0 = 0x0100004c | (port<<12)`，
+   扫 `0..0xff` 线性成立。另一个字段是 `byte16 = 0x40 | extract_index`。
+2. 入端口 `zteHffEntry+0x9e` 对条目**零影响**（A/B 0/3/5/0x99 十五个字逐字节相同）。
+   它只被 `aclGetExtIdxRuleRamAddrByPort()` 用来选 **extract index**：v4 由方向标志硬编码
+   9/10，v6 走 `s_aclPortExtIdxTblMap` 的 `{0→1,1→2,2→3,3→4,4→5,5→8,0x10..0x17→6,0x18..0x1f→7}`。
+   → **硬件不因为“从 eth 进来”而拒绝 v6 条目**，eth→eth 的限制在 FFE 软件层。
+3. 反过来，原厂自己也没把这条 v6 路径跑通：`tm_acl_fast_init` 只 provision 了 extract index
+   **9** 和 **10**（IPv4），v6 要用的 1..8 一次都没写过；且会话 type 3 会落到 rule type 3、
+   与 v4-tcp 共用 index 9。所以“自己下发 v6 条目”必须**连 index 表一起补**。
+4. `npu_cap_array`（`.data`+0x1b4，0x7b0 B = 6×0x148，第 6 组全零）是**流特征描述表**：
+   每组有 rxdev/txdev 名字列表 + 一串 44 字节 `npu_*_cap` 指针，只被 `npu_drv.cap` 引用、
+   交给 `npu_register_driver` → FFE，switch.ko/tm.ko 里没有任何代码读它或把它写进硬件。
+   其中 g1 一组是 rxdev `eth* wlan*` → txdev `eth* pon ptm0`，并且**挂着
+   `npu_ipv6_l3tcpup_cap` / `npu_ipv6_l3udpup_cap`**——厂商自己在能力矩阵里就声明了 eth→eth 的
+   IPv6 L3 硬转能力。44 字节记录 = 11 字（`w1`=pps、`w2`=frag/layer），v4 与 v6 两条只差
+   一个字的偏移、位值完全相同。
+
+**没解掉的**：60 字节条目其余位（`word0[11:0]`/`[31:24]`、`word2`、`word5`、`word6`）语义；
+extract index 1..8 的窗口模板字节级布局；44 字节能力记录的精确位域；`npu_cap_filter`
+（FFE 侧 priority −200）在 `vendor-vmlinux.bin` 里的函数体没定位到。
