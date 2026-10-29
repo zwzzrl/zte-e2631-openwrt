@@ -541,6 +541,30 @@ points at something in the repository or at a measurement.
           里没有任何 IPv6 地址被读进窗口；而驱动写的是 19 窗口 38 字节。要么原厂
           v6 快表项只用前缀+端口做 key、地址靠规则掩码在硬件侧比，要么
           `tm_acl_fast_add_v4v6()` 不是原厂 IPv6 快路径走的那条。
+    * 2026-10-31：按端口 provision extract index 1..8 的方案**在真机上执行完了**
+      （`docs/vendor-cla-extract-index-2026-10-30.md` §4.4 那份流水，全用模块参数，
+      没刷机、没改源码），结果是一条明确的负结果，但把问题缩小到了表项格式：
+        - index 3（lan1）+ rule 56 + `v6_key=0x38` + entry byte16 `0x43` 之后，
+          **分类器变成"活的"**：同一股 v6 流（`ipv6=0` 时 60,000 帧里 52,137 帧回到
+          主机、CPU 提交 58,400 次）变成**回程 0 帧、CPU 提交 17~26 次**——帧被吃掉了，
+          既不走 CPU 也不从任何口出去。
+        - 先把 v6 trap 住让流装进 hash（`ppe_flows` 2~6 条），再撤 trap：仍然 0 回程。
+        - 表项铺满 0..383 槽、再铺到 0..519 槽（含原厂另外三个库 4/5/6）：仍然 0 回程。
+          所以"槽算错"不是唯一原因，**条目本身不被接受**。
+        - 规则写到 8 号、56 号留空：一样丢。所以也不是我们那份 19 窗口规则把 ACL
+          变成 deny——丢包是"index 有效 + 分类器接管"这件事本身带来的。
+        - 原厂 v6 会话表项（`tools/vendor-emu/t_v6flowdump.py`）是
+          `0100004c f513e100 00000608 00000000 11140043 50400300 50800300` 后面全 0，
+          而且这一次添加**不写规则表、不写索引表**。对照驱动写的同一条流
+          （`03003044 fa11c000 ... 80000000 00000043 <40 字节 19 窗口 key>`）：
+          w0 的 flow/egress/bit3 不同、w3 不同、w1 不同，**key 只有 3 个字 vs 40 字节**。
+          即：原厂 v6 表项是另一套形状（`flow=0`、`egress=0`=PON 侧、短 key），
+          驱动是把 v4 形状套到了 v6 上。这和上面 2026-10-29 那条"没解的矛盾"是同一件事。
+        - 本机 OpenWrt 没有任何 PON netdev（只有 lan1/2/3、wan、br-lan、wlan），
+          所以原厂那种 egress=PON 的 v6 快转在这台机器上也没有可测的出口；
+          下一步要么先把原厂 v6 表项的真实 key 反解出来（离线），要么给驱动加一个
+          "整条 60 字节 v6 表项直写"的调试参数，用它验证原厂形状能不能被硬件接受。
+          细节、原始读数、复现命令：`docs/vendor-v6-entry-format-2026-10-31.md`。
     Measurement note, because it cost a wrong conclusion once: tx_submitted in
     /sys/kernel/debug/92000000.ethernet/dma_state proves that the CPU did *not* touch
     a packet, which is not the same as proving the hardware forwarded it - a dropped
@@ -548,7 +572,7 @@ points at something in the repository or at a measurement.
     routes back out the same LAN port, so the sending host counts the frames arriving
     on its own NIC (non-zero means forwarded, 0 means dropped).  Both tricks are in
     BUILD.md "Measuring the packet processor".
-  docs: 01-文档/BUILD-NOTES.md 2026-10-27; 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md; 06-分析与对比/拿原厂运行时表内容-方案-2026-10-27.md
+  docs: 01-文档/BUILD-NOTES.md 2026-10-27; 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md; 06-分析与对比/拿原厂运行时表内容-方案-2026-10-27.md; docs/vendor-cla-extract-index-2026-10-30.md; docs/vendor-v6-entry-format-2026-10-31.md
 - id: PPE-IPV6-TRAP-CPU
   severity: minor
   status: mitigated

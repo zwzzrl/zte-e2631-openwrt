@@ -755,5 +755,89 @@ NPU/hardfast 那一套（`npu_ipv6_l3{tcp,udp}{up,down}_cap`、`npu_drv_create_f
    一个字的偏移、位值完全相同。
 
 **没解掉的**：60 字节条目其余位（`word0[11:0]`/`[31:24]`、`word2`、`word5`、`word6`）语义；
-extract index 1..8 的窗口模板字节级布局；44 字节能力记录的精确位域；`npu_cap_filter`
+44 字节能力记录的精确位域；`npu_cap_filter`
 （FFE 侧 priority −200）在 `vendor-vmlinux.bin` 里的函数体没定位到。
+
+---
+
+## 第十二轮（2026-10-30）：extract index 1..8 的表、写流水与取键侧
+
+新增脚本 **`t_extidx.py`**（不动 `t_hfset.py` / `t_hfsess.py`）。它把 CLA 间接窗口按
+`(ram_id, index)` 建了个最小表模型（读命令搬数据、写命令落表），于是
+`cla_set_extra_index_table` / `cla_set_extra_rule_table` 的**读-改-写是真 RMW**；
+除 `fpga_read_reg` / `fpga_write_reg` / `__memzero` / `memset` / `printk` 外，
+`aclRamInit`、`tm_acl_fast_init`、`aclGetExtIdxRuleRamAddrByPort`、`tm_acl_fast_add_v4v6`
+全部跑真身。
+
+```bash
+KO=/绝对路径/工作文件/03-固件备份/vendor-rootfs-decrypted/kmodule-unsquashfs
+docker run --rm -v "$KO":/ko:ro -v "$PWD":/w -w /w --entrypoint python3 e2631-uni:py312 t_extidx.py <cmd>
+#   map      端口->index 表的原始字节 + 解码
+#   init     aclRamInit 真身（含随后的 tm_acl_fast_init）
+#   init9    只跑 tm_acl_fast_init，用真机 dump 的 9/10 做 RMW 基线
+#   prov     index 1..8 + rule (n<<4)|8 的写入
+#   trace n  单个 index 的逐次物理访问（默认 3）
+#   flow     同一 v6 流只改 inport，看表项 byte16 与选中的槽
+```
+
+坑：`km.py` 不保证 `.bss` 为 0（实测 `g_aclRamInited` 读出来是 `0x7b6`），
+`aclRamInit` 会立刻返回"已初始化"；脚本里显式清零 `.bss` 之后才有 18088 步。
+
+**结论（细节与地址见 `docs/vendor-cla-extract-index-2026-10-30.md`）：**
+
+1. 端口表 `s_aclPortExtIdxTblMap` 在 `.rodata` 0x1cd8（24×{port,idx}）：
+   `0→1, 1→2, 2→3, 3→4, 4→5, 5→8, 0x10..0x17→6, 0x18..0x1f→7`。**编译期常量，运行时无人写它**；
+   端口号来自 DTS `reg`（主线）/ `g_sw_cap`（厂商 vmlinux）。本板：lan3→1、lan2→2、lan1→3、wan→4。
+2. index 1..8 不是"窗口模板"：索引项只是 16 个 field id（index n 就是 `n<<4..n<<4|15`）
+   加 word4（1..8 是 `0x00190000`，ext_mode=2；9/10 是 `0x00150000`，ext_mode=1）。
+   真正的 19 窗口在**规则表**里。`tm_acl_fast_init` 对 1..8 一个字都没写；写它们的是
+   同模块开机的 **`aclRamInit`**（`0x5166c`），我们的内核从不调用它。
+3. 可执行写法：index n 写 5 字 + word4 再加 `BIT(8)`；规则写 `(n<<4)|8`
+   （24/40/56/72/88/104/120/136，共 8 份，同一份 19 窗口 v6 模板）。
+4. 取键按**入端口**决定的 idx，不是表项 byte16：仿真里同一五元组只改 `+0x9e`，
+   byte16 `0x41→0x48`、槽 312→231。表项要在算槽之后才读到，所以 byte16 只能是副本。
+5. 驱动现在的 v6 配置自相矛盾：entry byte16 = `0x4a`（idx 10）而规则写在 153 = `0x99`
+   （属于组 9）；index 10 的 `index_valid=0x0154` 也不含 bit9。v4 那侧（idx 9 + rule 152
+   = `0x98`，valid bit8）自洽，这正是 v4 能工作的原因。
+
+---
+
+## 第十三轮（2026-10-31）：v6 表项逐字 dump —— 原厂 v6 是另一套形状
+
+新增脚本 **`t_v6flowdump.py`**。它让 switch.ko 造 168 B 会话条目（入端口写 `+0x9e`），
+再让 tm.ko 真身跑 `zte_api_fast_l3_session_add`，把这次会话真正写进硬件的 **60 字节
+表项**逐字打出来（`cla_set_hash_table` 的槽 + 数据）。
+
+```bash
+docker run --rm -v "$KO":/ko:ro -v "$PWD":/w -w /w \
+  --entrypoint python3 e2631-uni:py312 t_v6flowdump.py 2      # 入端口 2 = lan1
+```
+
+实测（五元组 `fd99::2:48211 -> fd88::2:9999`，UDP）：
+
+```
+inport 0(lan3) -> slot 312, byte16 0x41
+inport 1(lan2) -> slot  17, byte16 0x42
+inport 2(lan1) -> slot  27, byte16 0x43
+inport 3(wan)  -> slot  67, byte16 0x44
+inport 2 的 60 B 表项:
+  0100004c f513e100 00000608 00000000 11140043 50400300 50800300 0*8
+```
+
+**结论：**
+
+1. 这一次添加**只写 hash 表项**，不写规则表、不写索引表 —— 原厂 v6 快转不依赖
+   `zx_ppe_v6_rule` 那份 19 窗口规则（`t_v6extra.py flow` 里 v6 只读 `CLA+0x90/0x94`，
+   是同一件事的另一面）。
+2. 原厂 v6 表项形状和我们驱动完全不是一套：`w0=0x0100004c`（flow=0、egress 字段 0
+   = PON 侧、多一个 bit3）、`w3=0`、`w1=0xf513e100`、**key 只有 w4..w6 三个字**；
+   驱动写的是 `w0=0x03003044`（flow=1、egress=3=lan1）、`w3=0x80000000`、
+   `w4..w14` = 40 字节 19 窗口 key。两边唯一相同的是 `w2=0x00000608` 和 byte16=`0x43`。
+3. 真机侧：按 `docs/vendor-cla-extract-index-2026-10-30.md` §4.4 原样 provision
+   （index 3 + rule 56 + `v6_key=0x38` + entry `0x43`）后，v6 分类器**确实被唤醒**——
+   但帧被吃掉（回程 0、CPU 不涨），铺满 0..519 槽也一样。读数与解释：
+   `docs/vendor-v6-entry-format-2026-10-31.md`。
+
+坑（别踩第二次）：168 B 会话里的 IPv6 地址是掩码编码（`00 40 03 00 50 ...`），不是
+`fd99...` 原始字节，所以"改地址再 dump 看哪几个字变"在仿真里做不成；`t_extidx.py flow`
+的槽号只能当"idx 参与键"的证据（跨 Unicorn 实例的 sip/dip 指针失效，key 退化）。
