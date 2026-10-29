@@ -74,6 +74,23 @@ $ find /sys -maxdepth 5 -name showfastinfoall
 > 注意：`gclacfg` / `gparsehashkey` / `helpCla` / `desIn` / `desOut` 在**本版本上读出来是空的**
 > （0 字节）。它们不是不存在，而是内容依赖前序操作或该版本没实现填充。
 > `statics` / `showfastrule` 各回 1 字节（基本等于 `0\n`）。
+>
+> 2026-10-30 复测（真机 slot1 原厂，`wc -c < 节点` 逐个确认）：`gclacfg` /
+> `gfastentrynum` / `gparsehashkey` 都是 **0 字节**，`statics` / `showfastrule`
+> 各 **1 字节**；`cat statics` 确实往内核日志里打了东西，但只有四行
+> `CLA0`/`CLA1`/`CLA2`/`CLA3` 加一片空白，计数器没填。**把调试等级从 1 提到 3
+> 也完全不改变**（见下面的调等级方法），所以"读侧是空的"不是等级问题。
+> 结论：这颗 SDK 上真正能用的是**只写那一半**（`calculatehashaddr` 预言机、
+> `ghashtable`/`gextraruletable`/`gextraindextable` 读表），`cat` 那一半别指望。
+>
+> 调调试等级的方法（2026-10-30 实测，`/proc/tm/shell` 本来就能按符号调函数）：
+>
+> ```sh
+> echo "g_tm_debug_level"           > /proc/tm/shell   # 读：sym g_tm_debug_level is 1(0x00000001)
+> echo "-f zte_api_set_debuglevel 3" > /proc/tm/shell  # 写：函数体就是 *g_tm_debug_level = r0
+> ```
+>
+> `zte_api_set_debuglevel`（0x5268c）只有一句 `str r0,[r3]`，所以参数就是等级本身。
 
 ## 3. 哈希预言机：`calculatehashaddr`（实测可用）
 
