@@ -40,6 +40,7 @@ The image is `python:3.12-slim` plus `unicorn` and `pyelftools`.
 | `t_v6slot.py` | checks the ported key/hash/slot against the vendor's own `sbrg_add_ipv6table` over random records |
 | `t_v6plan.py` | `t_v6plan.py <sip> <dip> <vlan> [pt]` prints the hash, slot and 12 entry words the driver will compute |
 | `t_poly.py` | the flow-add path with `cla_get_hash_poly_config` answered as the hardware answers it (ONU register 12 = 0x00e400e4 -> 0,1,0,3,0,1,0,3). Without this the vendor code takes its "invalid parameter" fallback and every type comes out looking like IPv4 |
+| `t_v6extra.py` | `cla_set_extra_rule_table()` 不再当黑盒：只拦 `fpga_*`，让 tm.ko 自己跑完，逐次打印它写到的 phys（结论：CLA ram_id=1，17 字，和驱动写的表项逐字节相同）；另报 v4/v6 流添加路径实际写了哪张表 |
 
 `flowadd.py` grew two hooks for that: `handlers=` replaces any intercepted call (the
 `get_*` stubs were returning zeros, which made every read-modify-write a fiction) and
@@ -681,4 +682,27 @@ NPU/hardfast 那一套（`npu_ipv6_l3{tcp,udp}{up,down}_cap`、`npu_drv_create_f
   `fd99::2:48211 -> fd88::2:9999`；这台不需要对端，是最可靠的那套。
 - 该 iperf3 服务本会话里挂过两次（连不上、SYN 无回），别把它当唯一判据。
 
+---
 
+## 2026-10-30 第十轮：`cla_set_extra_rule_table()` 写到哪里
+
+以前所有脚本都把这个符号放进 `INTERCEPT`，于是 `km.py` 用 stub 换掉它，函数体一次都没跑过。
+`t_v6extra.py` 只拦边界（`fpga_read_reg`/`fpga_write_reg`/`printk`），让
+`cla_set_extra_rule_table -> cla_set_indirect_rw_* -> tmOnuRegWrite -> fpga_*` 整条链跑真身：
+
+* 它写的是 **CLA ram_id 1**（`ZX_CLA_EXTRA_RULE`）第 `rule_id` 项，`rule_id <= 0x9f`；
+  命令字 `0x9238c014 <- rule_id | 1<<22`，数据字 16..0 依次写 `0x9238c01c + 4i`（字 0 最后
+  落表），状态字在 `0x9238c018`。整条路径和驱动 `zx_pp_write(..., ZX_CLA_EXTRA_RULE, ...)`
+  **完全一致**，不需要新的 ioremap、也不需要新的代码。
+* `tm_acl_fast_init` 在同一次调用里写 rule 144/145（IPv4）和 rule 2/3（IPv6），
+  同族两条只差 `w14` 的 bit25（厂商字段名 `mem_ctrl`）。rule 2 的 17 个字与驱动
+  `zx_ppe_v6_rule` 逐字节相同，用厂商自己的解码器读出来就是 19 个窗口 / hash_len 19 /
+  type 3 / winmask0=0xff00。
+* **IPv6 的流添加路径一次都不调它**（IPv4 也不调）；`EN_V6FAST_EXTIDXTBL` 在 tm.ko 里
+  零引用（STB_LOCAL 且不在 ksymtab），是死代码。v6 添加真正多出来的那一步还是
+  `cla_set_external_hash_table()`（普通内存写，不是寄存器），那块窗口真机已探明是启动 ROM。
+* 方法上踩到一个坑：`tmOnuGlbRegValidation` 不能拦，它除了校验还要把描述符地址写回
+  第 2 个实参；拦掉之后 `tmOnuRegWrite/Read` 拿到 NULL 描述符，偏移全变 0。
+
+细节、逐次写流水的表、68 字节规则项的完整位图和下一步真机实验：
+`docs/vendor-cla-extra-rule-2026-10-30.md`。

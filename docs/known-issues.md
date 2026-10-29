@@ -650,6 +650,25 @@ points at something in the repository or at a measurement.
       NPU 能力表按 **(入端口组, 出端口组)** 穷举，IPv6 只给了
       `pon*/eth* → eth*/wlan*` 以及反向这两组，eth↔eth 方向**只有 IPv4 raw**。
       我们的 ACL 移植必须自己定义这张端口组表，不能照抄。
+    * 2026-10-30 第十轮（仿真 + 一次只读真机对照）：`cla_set_extra_rule_table()` **不是**
+      IPv6 缺的那一步，这个候选可以结案。细节与新工具见
+      `docs/vendor-cla-extra-rule-2026-10-30.md`（`tools/vendor-emu/t_v6extra.py`）：
+      - 它写的是 CLA 间接口 `ram_id=1`（驱动里叫 `ZX_CLA_EXTRA_RULE`）第 rule_id 项的
+        17 个字，命令字 `0x9238c014 = 0x00400002`（rule_id=2、ram_id=1），数据字 16..0
+        写 `0x9238c05c..0x9238c01c`、字 0 最后落表 —— 与驱动
+        `zx_pp_write(ZX_CLA_BASE, ZX_CLA_EXTRA_RULE, idx, 17 字)` 等价，不需要新代码；
+      - **只有开机 init 调它**，流添加路径对 IPv6 和 IPv4 都不调；v4 的 144/145 与 v6 的
+        2/3 是同一次 init 写下的，所以"v6 才会写 extra rule"不成立；
+      - 真机只读对照（`dump=1`）：`cla-rule[153]` 读回
+        `e1828406 16284880 01e3868c 94264889 fff0000a ffffffff×8 0fffffff 01300000
+        db6db6db 00db6db6`，与仿真记录的那 17 个字逐字一致 —— 驱动写进去的规则内容
+        确实是对的（厂商自己的解码器也读成 19 个窗口 / winmask0=0xff00 / hash_len 19）；
+      - 另一个发现把候选又砍掉一个：真身跑 `zte_api_fast_l3_session_add`，**IPv6 family
+        对 CLA 窗口 0 次写**（只调 `cla_set_external_hash_table`，那是普通内存写，而那块
+        窗口已探明是启动 ROM），`EN_V6FAST_EXTIDXTBL` 在 tm.ko 里零引用、是死代码。
+      剩下没试过的只有两条（写在该文档 §5）：① `ipv6=1 v6_rule=2 v6_key=0xa0
+      v6_idxw4=0x00150004` 这个组合（第九轮 `v6_key` 一直跟着 `v6_rule` 走，从没显式设
+      0xa0）；② 不要再用 rule 160（`cla_set_extra_rule_table` 自己就拒绝 >0x9f）。
     * Untested with the trap lifted: MLD/multicast IPv6 (the switch has its own MLD
       tables in the vendor design - `drv_add_mld_addr_gpon_sfu` - and our port does not
       program them), and IPv6 over the (unused) WAN.
