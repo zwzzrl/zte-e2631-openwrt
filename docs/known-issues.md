@@ -704,8 +704,21 @@ points at something in the repository or at a measurement.
       无关。所以早先"ipv6=1 让 LAN-to-LAN 从 2,018 次 CPU 发包降到 18 次"这条（当时
       没记端口组合）在本台**复现不出来**，要么那时是 lan1→lan2 两个物理口、要么测的是
       别的路径。在有人用两个物理口重测之前，这条只能记作"未复现"。
+      **同一台子的 A/B 总结（2026-10-30，v12fix，两轮各 128,000 个包）**：
+
+      | 流量 | `ipv6=1` | `ipv6=0` |
+      |---|---|---|
+      | v6 **路由** | +115,407（90.2%） | +117,806（92.0%），`ppe_add_skip=8` |
+      | v6 **桥内** | +53 | +39 |
+      | v4 路由（对照） | +138 | —（驱动无此开关） |
+
+      `ipv6=0` 时驱动会跳过 v6 流（`ppe_add_skip` 涨），但**可测的 CPU 成本没差别**。
+      所以 `ipv6` 这个开关现在**量不出收益**：它做的只是把 v6 表写进硬件、把 v6 陷阱
+      抬掉；既不能当"IPv6 加速已实现"，也没有实测依据说它有害。默认值（当前镜像 = 1）
+      留到 NPU 方案定下来一起改，本轮不动镜像。
     * 于是"IPv6 单播路由加速"在本板上只剩 NPU 一条路，而原厂能力表把这条路也限定死了，
-      见下一条；`ipv6=1` 能被证明的价值仍然只是**桥内（LAN↔LAN）IPv6 快转**。
+      见下一条。至于 `ipv6=1`：上表说明它**目前量不出任何收益**（桥内转发本来就走交换
+      芯片，与它无关），留着它只是因为还没到改默认值的时候。
     * Untested with the trap lifted: MLD/multicast IPv6 (the switch has its own MLD
       tables in the vendor design - `drv_add_mld_addr_gpon_sfu` - and our port does not
       program them), and IPv6 over the (unused) WAN.
