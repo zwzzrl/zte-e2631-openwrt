@@ -1557,21 +1557,86 @@ H_FW_SIZE    = kernel_area + fs_size
 ```
 
 对照：slot0 出厂 `k_size=0x33fdcc` → fs 在 +0x340000；slot1 出厂 `k_size=0x3fffe0`
-→ fs 在 +0x400000。我们这版 `KERNEL_AREA=0x340000`、`FS_OFS_FIELD=0x340214`、
-`H_FW_SIZE=0x1460000`、`fs_size=0x1120000`、serial 62，版本头落在 `0x3760000`。
-先前失败的那几版都是这条算错：fs 摆 +0x400000 而 `k_size` 仍 0x33fdcc，
-cspboot 到 +0x340000 校验对不上 → `validImgNum=1` → 回落 slot0。
+→ fs 在 +0x400000。
+
+**版本头在 flash 的哪个偏移，取决于"那一个包"的 body 长度，不是常量。**
+历史上出现过三个数（0x3740000 / 0x3760000 / 0x3700000），每一个只对当时那一版包成立：
+
+| 包 | kernel 区 | fs_size | body = 头偏移（槽内） | flash 偏移（slot1） |
+|---|---|---|---|---|
+| 原厂 slot1 出厂 / vendor-root-shell | 0x340000 | 0x1120000 | 0x1460000 | 0x3760000 |
+| 更早一版 | 0x340000 | 0x1100000 | 0x1440000 | 0x3740000 |
+| **v12 / v12fix（当前）** | **0x400000** | **0x1000000** | **0x1400000** | **0x3700000** |
+
+现在的包由 `release.mjs` 默认 `--rootfs-at 0x400000 --header-at 0x1400000` 生成，
+所以**当前几何下 slot1 版本头 = 0x3700000**（2026-10-30 03:5x 实测，见下）。
+
+#### 实测取证：slot1 版本头就在 0x3700000（2026-10-30 03:5x，盒子跑 v12 时）
+
+前提：上一轮 03:48 在 U-Boot 里擦的是 `0x3760000`，擦完 `reset`，盒子**照样从 slot1
+起了 v12** —— 说明那个偏移上已经没有头了，头在别处。于是直接在运行中的 v12 上查：
+
+1. **本机 DTS 自证**：`/sys/class/mtd/mtd9/{offset,size,name}` =
+   `0x3700000` / `0x20000` / `slot1-header`；`mtd7 rootfs` = `0x2700000`
+   （= slot1 + 0x400000），`mtd7` 首 4 字节是 `hsqs` → fs 真的从 +0x400000 开始，
+   fs 0x1000000 结束于 0x3700000，与头位置严丝合缝。
+2. **逐字节比对**：读 `mtd9` 前 544 B，与 `e2631-openwrt-v12-ppe-20261030-slot1.bin`
+   的 512 B 版本头（包内偏移 0x14 起）比：
+   - 只有 **+0x1f4（H_SERIAL）** 和 **+0x1fc..+0x1ff（CRC2）** 不同，共 5 字节；
+   - 内魔数 `33 66 99 cc`、版本串 `V1.0.0.8B8.9910`、槽起点 `0x2300000`、
+     槽位标记 `0x2300000`、CRC1 —— 全部一致。
+3. **全窗口只有一个头**：对 `mtd6`（slot1，0x2300000..0x3F00000）按 128 KiB 逐块读、
+   搜版本串 `V1.0.0`：**只有块 160（槽内偏移 0x1400000）命中**，`hits=1`。
+4. 0x3760000 现在是空的（`dd if=/dev/mtd6 bs=131072 skip=163` 全是 `ff`）。
+
+结论：**要逼 cspboot 回落 slot0，擦 0x3700000 0x20000**（= mtd9）。擦 0x3760000
+对当前几何等于擦一片空白，盒子会继续从 slot1 起 —— 这就是 03:48 那次"擦完还在跑
+OpenWrt"的全部原因，不是 cspboot 又挑了 slot1。
+
+#### 顺带实测：原厂 httpd 写头时的三个动作
+
+拿上面那份逐字节比对当证据，`vendor-web.py upload` 成功后，httpd 实际做了：
+
+1. **丢掉包最前面 0x14 字节**（16 B 外魔数 + u32 hdr_ofs），把 512 B 版本头
+   原样写到 `slot 起点 + body 长度`；
+2. **自己重算 H_SERIAL**：包里的 63 被改成 **49**（当时 slot0 = 0x2f = 47，
+   slot1 那个包 = 48，49 = 两槽最大值 + 1）。所以 `retitle_pkg.py --serial`
+   在这条路线里**不决定写哪个槽**，它的作用是让包本身合法、能被 httpd 接收；
+3. 相应地**重算 CRC2**（覆盖 [0:0x1fc]，含 serial）；CRC1 覆盖 [0:0xa4]，不受影响。
+
+写头之外的 body 字节，httpd 是按包内偏移原样落的（fs 落在 slot1+0x400000 这件事
+由包内 body 布局决定，与头位置无关）。
 
 ### 刷机动作（可重复）
 
+**在 OpenWrt 里要切槽，别走这条路：用系统工具** `e2631-fwslot switch` + `reboot`
+（`cmd_switch()` = `retitle_slot(running ^ 1, max_serial() + 1)`，只改另一槽的版本头，
+不碰 firmware 体；详见 `01-文档/路由器当前状态与回滚手册.md` 的"路线 0"）。
+下面的串口流程只在**盒子已经跑着原厂**、拿不到工具时用。
+
 ```
 # 1) U-Boot 里抹掉 slot1 的版本头（逼它回落 slot0 的标准做法；只碰 slot1）
+#    当前几何的头在 0x3700000（0x3760000 是老几何的偏移，兜底一起擦，两块都是空/头）
+=> nand erase 0x3700000 0x20000
 => nand erase 0x3760000 0x20000
 => reset
 # 2) slot0 原厂起来后，用 WebUI 接口把包写进 slot1
-./vendor-web.py upload 02-固件产物/vendor-root-shell/e2631-vendor-slot1-append-up.pkg --yes
+./vendor-web.py upload 02-固件产物/e2631-openwrt-v12fix-ppe-20261030-slot1.bin --yes
 # 3) 盒子自己重启进 slot1（serial 更高的那个）
 ```
+
+工具：`09-工具脚本/ser-flash-prep.py` 把第 1 步做成事件驱动（匹配串到了才发，
+不 sleep）；两个擦除偏移是写死常量，并断言落在 slot1 窗口内。演练不加 `--yes`，
+只走到 `=>` 就停。
+
+> **U-Boot 的行缓冲在命令执行期间会丢输入。** 2026-10-30 把两条 `nand erase` 一次
+> 发过去，第一条跑完、第二条只被吃掉半条（串口停在 `=> nand erase 0x376`），脚本就
+> 一直等不到第二条的 `100% complete`。改成**一条一条发、每条等 `100% complete` + `OK`
+> 再发下一条**（`ser-flash-prep.py` 已按这个改写；本轮实际是手工补发 `reset` 过的）。
+
+U-Boot 顺带报出了 slot0 头块的位置：`zteboot_search_firmware:95 correct header has
+been found @1b60000`。所以 `e2631-fwslot switch` 从 slot1 切回原厂时，写的就是
+0x1b60000 那个擦除块里的 512 字节版本头（整块读-改-写）。
 
 选 WebUI 而不是 U-Boot `nand write`：原厂内核写 NAND 的 ECC/几何与 U-Boot 是否一致
 **从未被验证过**（U-Boot 写的镜像一次都没见它启动成功）。
