@@ -297,7 +297,21 @@ points at something in the repository or at a measurement.
       hash lookup even switched on" bit is not in the low half of the extract-index
       entry's word 4 - sweeping all sixteen values 0x00150050..15f with the entry
       written into all 384 slots forwarded every packet through the CPU and hit nothing;
-      (b) the slot maths, because of that same all-slots run.
+      (b) the slot maths, because of that same all-slots run.  It is also excluded
+      *arithmetically* now (2026-10-30): the driver's `zx_ppe_slots()` is pure
+      arithmetic (little-endian bit-string `zx_ppe_put_bits()` + an MSB-first CRC fed
+      last-byte-first, init 0, no final xor), so "which slot would the driver write"
+      can be recomputed offline.  Feeding the two recorded tuples back in reproduces
+      the slots the hardware was seen to hold, exactly:
+        IPv4 192.168.1.250:41234 -> 10.88.0.1:9999  ->  slots 29 / 38  (bank 1: 260 / 369)
+        IPv6 fd99::2:48211       -> fd88::2:9999    ->  slots 144 / 180 (bank 1: 297 / 268)
+      the same numbers `dump` read back from the hardware, and in the same direction
+      order (the reverse tuple swaps ports *and* addresses).  So the entry really is
+      where the classifier looks; what still does not match is the key inside it.
+      The recomputation lives in the kit's `09-工具脚本/cla_slot.py` (`--selftest`
+      asserts those four slots).  It also shows the v6 key byte matters for the other
+      family's slot (0x99 -> 144, 0x98 -> 16), which is exactly why the all-520-slot
+      shotgun, not a single correct byte, is what ruled the slot side out.
     * 2026-10-29 third round (tools/vendor-emu `t_v6path.py`, `t_v6win.py`,
       `t_v6tbl.py`; README "第三轮"): the 13-vs-19 window question is answered, and
       neither of the two earlier candidates was right.
