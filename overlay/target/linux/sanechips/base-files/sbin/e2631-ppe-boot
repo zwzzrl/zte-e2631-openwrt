@@ -62,6 +62,28 @@ fi
 
 log "引擎已加载；$CONFIRM 秒后若这台机器还活得下来就撤掉 pending 标记"
 
+# 3. IPv6 卸载默认打开。
+#    模块参数本身默认是 off（v9 系列一直如此），这里在加载成功后显式置 1：setter
+#    （zx_ppe_ipv6_set）不只是改个变量，还会把 v6 表基址/offload 位一并配好，所以
+#    必须走 sysfs，不能改模块参数文件。
+#    风险有兜底：置位若把内核搞挂，下面的 pending 标记就撤不掉，下次开机
+#    e2631-ppe-boot 会认定"上次加载未确认"而整轮跳过引擎，机器仍能起来。
+#    临时关掉：touch /etc/e2631-ppe-noipv6，或 ZX_PPE_IPV6=0。
+WANT_V6=${ZX_PPE_IPV6:-1}
+# 模块名里的连字符会被内核规整成下划线，两种写法都试一遍，别把开关建在名字上。
+V6PARAM=$(ls -d /sys/module/zx279128s[-_]ppe/parameters/ipv6 2>/dev/null | head -n 1)
+if [ "$WANT_V6" = 0 ] || [ -e /etc/e2631-ppe-noipv6 ]; then
+	log "IPv6 卸载按要求保持关闭（ZX_PPE_IPV6=$WANT_V6）"
+elif [ -n "$V6PARAM" ] && [ -w "$V6PARAM" ]; then
+	if echo 1 > "$V6PARAM" 2>/dev/null; then
+		log "IPv6 卸载已打开（$V6PARAM）"
+	else
+		log "IPv6 卸载置位失败，IPv6 走软件转发"
+	fi
+else
+	log "找不到 ipv6 参数节点，IPv6 走软件转发"
+fi
+
 # 2. Confirmation window: a hang means this subshell never runs, so the marker
 #    survives into the next boot carrying this boot id - that is what arms the
 #    skip.  Only clear a marker that still belongs to this boot.

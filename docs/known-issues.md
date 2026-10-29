@@ -566,10 +566,16 @@ points at something in the repository or at a measurement.
     and keeps working even when the ethertype trap diverts everything (that is why the
     ping numbers above prove nothing on their own; the TCP and UDP numbers do).
   next: |
-    * Make ipv6=1 the shipped default, but from the boot side rather than from the
-      compiled-in default: a UCI option that the init script applies after the module
-      loads, so a bad default is fixable from failsafe instead of needing a power
-      cycle.  Until then the image stays on ipv6=0 and the switch is a one-liner.
+    * ~~Make ipv6=1 the shipped default, but from the boot side rather than from the
+      compiled-in default~~ **已做（2026-10-30）**：仍不改编进来的默认值，
+      `/sbin/e2631-ppe-boot` 在模块加载成功后写 `ipv6=1`（setter 会顺带配好 v6 表
+      基址和 offload 位，所以只能走 sysfs）。关掉的办法两个：
+      `touch /etc/e2631-ppe-noipv6` 或 `ZX_PPE_IPV6=0`。
+      这一句写在 pending 标记的确认窗口之前，所以置位若把内核搞挂，标记撤不掉，
+      下次开机整轮跳过引擎 —— 不会把机器锁在"必须上电"的状态。
+      同期在驱动里补了原厂那道理所当然的闸门：`table_sel`（reg 29）不是 1/2 时
+      拒绝写 sbrg 表（`sbrg_add_ipv6table+0x178` 就是这么做的），否则条目会落进
+      硬件永远不看的那半张表，外表却像"加速没生效"。
     * **更换引擎：原厂的 IPv6 卸载不在 CLA 哈希里，而在 ACL L3 hardfast 表里。**
       2026-10-30 在原厂系统（slot1）上读到，原厂对 IPv6 的硬件卸载走的是
       `switch.ko` 的 `sw_acl_l3_hardfast_session_add/_del` 和它内部的
@@ -580,6 +586,9 @@ points at something in the repository or at a measurement.
       不是原厂的 v6 快转路径** —— 六种 CLA 实验全负与此自洽。
       下一步应改为移植 ACL 的 L3 hardfast 条目格式（能力矩阵见
       `docs/vendor-ipv6-accel-2026-10-30.md` §4/§7），而不是继续在 CLA 里试窗口/槽号。
+      补充（2026-10-30 晚）：CLA 侧不再是黑盒 —— 哈希与 353 位键布局都已复原
+      （`docs/vendor-cla-hash-recovered-2026-10-30.md`），真要回到 CLA 路线时有据可依；
+      但"硬件调试面 `calculatehashaddr` 不能当全量基准"这一点必须先记住。
     * 同上那份文档 §4 还有一条会限制"任意有线口可作 WAN"的硬事实：原厂的
       NPU 能力表按 **(入端口组, 出端口组)** 穷举，IPv6 只给了
       `pon*/eth* → eth*/wlan*` 以及反向这两组，eth↔eth 方向**只有 IPv4 raw**。

@@ -1784,8 +1784,19 @@ static u16 zx_ppe_sbrg_hash(const u8 *key, int len)
 	return crc & ZX_SBRG_HASH_MASK;
 }
 
-/* sbrg_get_table_sel() returns vendor reg 29; the vendor's index arithmetic
- * only tells "1" apart from everything else.
+/* reg 29 (table_sel) -> slot base, transcribed instruction for instruction
+ * from sbrg_add_ipv6table+0x184 (tm.ko 0xf184..0xf1a0):
+ *
+ *     andeq r2, r0, #127     ; sel == 1: hash & 0x7f
+ *     lsleq r2, r2, #2       ;            << 2     (128 buckets x 4 blocks)
+ *     orreq r2, r2, #512     ;            | 0x200
+ *     lslne r2, r0, #2       ; otherwise: hash << 2
+ *     uxtbne r2, r2          ;            keep 8 bits
+ *     orrne r2, r2, #768     ;            | 0x300
+ *
+ * Both branches stay inside 0x200..0x3ff, i.e. the last 512 of the table's
+ * 0x1000 entries, which is also why sel must be 1 or 2 (see the guard in
+ * zx_ppe_sbrg_adapter).  docs/vendor-cla-hash-recovered-2026-10-30.md §5.
  */
 static u32 zx_ppe_sbrg_slot(u16 hash, u32 sel)
 {
@@ -1888,12 +1899,31 @@ static void zx_ppe_sbrg_adapter(struct zx_eth_adapter *adapter, void *data)
 				 op->table, op->index, op->w[0], op->w[1], op->w[2]);
 		break;
 	default:
+		/* The vendor refuses the whole operation unless table_sel reads 1
+		 * or 2: sbrg_add_ipv6table+0x178 does `cmp #0 / cmpne #3` and
+		 * takes the error path for both, and sbrg_lookup_ipv6table shares
+		 * the check.  Only those two values give a slot base that keeps
+		 * the four blocks inside the table (0x200..0x3ff), so writing
+		 * under any other value would land in a region the hardware never
+		 * looks at -- and would silently look like "acceleration did not
+		 * take".
+		 */
+		if (sel != 1 && sel != 2) {
+			dev_err(adapter->dev,
+				"sbrg: table_sel reads %u (vendor accepts only 1 or 2), refusing to write\n",
+				sel);
+			break;
+		}
 		/* The vendor reads all four tables at the entry's four blocks
 		 * before writing; the values are unused, but the hardware then
 		 * sees the same sequence.  The entry itself goes to table 0.
 		 */
-		if (index + 3 >= 0x1000)
+		if (index + 3 >= 0x1000) {
+			dev_err(adapter->dev,
+				"sbrg: slot %#x + 3 overflows the table, refusing to write\n",
+				index);
 			break;
+		}
 		for (t = 0; t < 4; t++)
 			for (b = 0; b < 4; b++)
 				zx_ppe_sbrg_xfer(adapter, t, index + b, true, v);
