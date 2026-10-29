@@ -403,6 +403,28 @@ points at something in the repository or at a measurement.
       hardware probe: port sbrg_hash (328 bytes) into the driver so the kernel can
       compute the slot itself, and then answer the behavioural question - what a
       table of only vlan + two addresses + pt_mask does to a forwarded v6 flow.
+    * 2026-10-29 eighth round (offline port + board run, tools/vendor-emu README
+      "第八轮"): sbrg_hash is ported and the whole add path runs in the driver.
+      Hooking sbrg_hash's entry in the emulator showed what it hashes - not the
+      52-byte record but a 34-byte key of sip[16] + dip[16] + vlan as u16le,
+      fed backwards through CRC-16/CCITT (init 0, the 256-word table at
+      .rodata:0x108) and masked to 10 bits.  With that, the port matches the
+      vendor function 200/200 on random keys (t_hash run) and t_v6slot.py matches
+      the slot the vendor's own sbrg_add_ipv6table writes 8/8 on random records.
+      The `sbrg` parameter grew `h|a|d <sip32hex> <dip32hex> <vlan> [pt_mask]`
+      (plan / add / delete: vendor's four-table read, then four blocks of table 0)
+      and `r` now uses the vendor's read encoding (start=1, rw=0) instead of the
+      CLA read bit 31.  On the board: plan output == t_v6plan.py word for word
+      (hash 0x3fd, sel 1, slot 0x3f4, twelve words), add+read-back matched for
+      two records (vlan 1 at 0x3f4, vlan 7 at 0x238), delete read back all zero,
+      and the LAN kept forwarding.  The read encoding is now proven too, not just
+      the write side.  One self-inflicted lesson: the first build stored the
+      selector as 0x388184 and added ZX_SBRG_BASE on top, so it read
+      0x92000000+0x710184 (outside the 4 MiB window) and oopsed; panic_on_oops=0
+      spared the reboot, but the oopsing thread died holding ppe_lock, so recovery
+      was module swap + reboot.  Offsets in that bank are relative to
+      ZX_SBRG_BASE only.  Still open: tables 1..3, the SNAT/DNAT bounds, and the
+      behavioural question below.
     * Once the key or the table is right: measure a *TCP* IPv6 flow end to end (the
       bench's only peer filters inbound IPv6, hence UDP above), then decide whether
       ipv6=1 becomes the default.

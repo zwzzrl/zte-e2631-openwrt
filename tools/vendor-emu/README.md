@@ -34,6 +34,10 @@ The image is `python:3.12-slim` plus `unicorn` and `pyelftools`.
 | `t_v6win.py` | block-sweeps the descriptor and reports, for every buffer the run produces (entry, 45-byte key, 60-byte hash rule, external hash), which descriptor offset landed in which output byte |
 | `t_v6path.py` | pokes every acl/fast function entry and prints the order they actually run, per rule type and fast flag |
 | `t_v6tbl.py` | decodes the ONU register descriptors out of the ELF (`regs`) and emulates `sbrg_add_ipv6table()` (`call`) |
+| `t_v6seq.py` | lets the vendor code run with only the register accessors intercepted, so one add prints the exact ONU register sequence (values included) |
+| `t_hash.py` | runs the vendor's own `sbrg_hash()` over random keys and compares it with the driver's port (CRC table read from `.rodata`) |
+| `t_v6slot.py` | checks the ported key/hash/slot against the vendor's own `sbrg_add_ipv6table` over random records |
+| `t_v6plan.py` | `t_v6plan.py <sip> <dip> <vlan> [pt]` prints the hash, slot and 12 entry words the driver will compute |
 | `t_poly.py` | the flow-add path with `cla_get_hash_poly_config` answered as the hardware answers it (ONU register 12 = 0x00e400e4 -> 0,1,0,3,0,1,0,3). Without this the vendor code takes its "invalid parameter" fallback and every type comes out looking like IPv4 |
 
 `flowadd.py` grew two hooks for that: `handlers=` replaces any intercepted call (the
@@ -495,9 +499,98 @@ table_sel == 2:  index = ((hash << 2) & 0xff) | 0x300     #  64 个桶，每桶 
 - **不伤网络**：写完 `ping 192.168.1.250` 正常、`br-lan` 仍在，没有交换机挂死。
 
 至此这三件事从"仿真推出来的"变成"硬件事实"：访问协议、槽号寻址、48 字节表项布局。
-写进去的那条表项仍在表里（dip fd88::2 / sip fd99::2 是压测用的地址，不影响真实流量），
-要清掉就是四条 `w ... 0 0 0`。
 
 下一步不再是硬件探针：把 `sbrg_hash`（328 字节）逆出来搬进驱动，让内核自己算槽号；
 然后才是行为问题——一张只有 vlan + 两个地址 + pt_mask 的表，对一条被转发的 IPv6 流到底
 做什么。
+
+---
+
+## 2026-10-29 第八轮：`sbrg_hash` 逆完并搬进驱动，槽号/表项真机上逐字对上了
+
+第七轮把"我们写进去的字能原样读回"证明了，但槽号是仿真器算的；这一轮把算法本身搬进内核，
+再在真机上把"驱动算的"和"厂商算的"逐字对了一遍。
+
+### 1. `sbrg_hash` 到底对什么取哈希（关键的一步）
+
+反汇编已经给出了三段式长度（`r2=0x3c/0x4c/0x10c` → 8/10/34 字节，倒序、CRC-16/CCITT、init 0、
+取 `& 0x3ff`），但**输入不是那 52 字节记录**。直接按记录算，随机记录一条都对不上（8/8 失败）。
+改成在仿真里拦 `sbrg_hash` 的入口，把 `r0` 指向的缓冲区 64 字节打出来，答案立刻清楚：
+
+```
+记录 52 字节：valid/age/mode/vlan | dip[16] | pt_mask | sip[16]
+哈希输入 34 字节：sip[16] | dip[16] | vlan[u16le]
+```
+
+`r2=0x10c` 时哈希 34 字节，正好是 `sip + dip + vlan(u16)` 这个 key 结构；`0x3c`/`0x4c` 对应
+另外两种短 key。取哈希时这 34 字节被**倒着**喂进 CRC 表。
+
+于是移植只有三步：拼 key → 倒序 CRC-16/CCITT（init 0，表就是 `.rodata:0x108` 那 256 个
+u16，首个 `0x0000/0x1021/0x2042…`）→ `crc & 0x3ff`。
+
+### 2. 两道校验
+
+| 校验 | 做法 | 结果 |
+|---|---|---|
+| 哈希函数 | 仿真里跑厂商 `sbrg_hash`，与 Python 移植比 200 个随机 60 字节 key | **200/200 一致** |
+| 全链（key→hash→槽） | `t_v6slot.py`：随机记录喂 `sbrg_add_ipv6table`，比它写出的首块 index 与预测 | **8/8 一致** |
+
+`t_v6plan.py` 把这些包成一个命令行工具：给 sip/dip/vlan/pt，直接打印 hash、槽号、12 个字。
+
+### 3. 驱动：`sbrg` 参数从"读/写一块"扩成整条 add 路径
+
+`zx279128s-ppe.c` 里新增（相对第七轮）：
+
+- `zx_ppe_sbrg_hash()`：34 字节 key 的倒序 CRC-16/CCITT；
+- `zx_ppe_sbrg_slot()`：`sel==1 → ((h&0x7f)<<2)|0x200`，否则 `((h<<2)&0xff)|0x300`，
+  `sel` 就是 vendor reg 29（`0x388184 & 3`，本板读到 1）；
+- `zx_ppe_sbrg_entry()`：第四轮那张 384 位布局表的内核版；
+- `zx_ppe_sbrg_xfer()`：一次间接访问，读方向用 **`start=1, rw=0`**（厂商 `sbrg_get_indreg_wr_cfg`
+  的编码），写方向 `start=0`、word 0 最后；
+- 参数语法：`r <table> <index>`、`w <table> <index> <w0> <w1> <w2>`、
+  `h|a|d <sip32hex> <dip32hex> <vlan> [pt_mask]`（h=只打印，a=写，d=清零）。
+
+add 的顺序照厂商：先读 4 张 table × 4 块（值不用），再写 table 0 的 4 块。
+
+### 4. 真机结果（v9c slot1，引擎手工 insmod）
+
+计划模式先对了一遍（驱动日志 vs `t_v6plan.py`）：
+
+```
+sbrg: vlan 1 hash 0x3fd sel 1 index 0x3f4 (plan)
+sbrg:   w00 0000000d 00000000 00000100
+sbrg:   w03 0088fdff 00000000 00000000
+sbrg:   w06 00000000 02000000 00000000
+sbrg:   w09 000099fd 00000000 00000000
+```
+
+与 `t_v6plan.py fd99::2 fd88::2 1 0xff` 的输出逐字相同，也与第六轮厂商代码写出的那 12 个字
+逐字相同。然后：
+
+| 动作 | 结果 |
+|---|---|
+| `a …`（vlan 1, fd88::2 / fd99::2） | 写 `0x3f4..0x3f7`，`r 0 0x3f4..0x3f7` 读回逐字相同 |
+| `a …`（vlan 7, fd34::2 / fd12::1, pt 0） | 槽 `0x238`，读回与预测相同 |
+| `d …` 两条 | 四个块读回全 0 |
+| 写完 `ping 192.168.1.1` | 正常，`br-lan` 未受影响 |
+
+这一步同时**反证了读编码**：`r` 用 `start=1` 能读回刚写的字，说明第七轮只验证过的写方向
+之外，读方向的命令字也对了。
+
+### 5. 踩到的坑（记下来）
+
+第一版把 `ZX_SBRG_SEL` 写成了 `0x388184`，代码里又加了一次 `ZX_SBRG_BASE`，实际读
+`0x92000000+0x710184`，落在网口 ioremap 的 `0x400000` 之外 → 真机直接 oops（`ldr r3,[r3,#0x184]`
+页错误）。因为 `panic_on_oops` 当时是 0，盒子没重启，但 oops 的进程握着 `ppe_lock` 死了，
+后续任何取这把锁的操作都会卡住 —— 所以修好偏移后是用"换模块 + 重启"回到干净状态的，
+不是原地 rmmod。教训：**这块窗口的偏移一律相对 `ZX_SBRG_BASE` 写，不和绝对地址混加。**
+
+### 6. 还没做的
+
+1. **table 1..3 的用途**、`g_IPv6_{Snat,Dnat}_Ram_Length` 的边界（只读不写，仍未知）。
+2. **这张表对转发做什么**：表项只有 vlan + 两个地址 + pt_mask，没有端口/五元组。要回答
+   它是不是"IPv6 转发加速"，得让一条真实被路由的 IPv6 流经过盒子，看流量是否被这块表接管
+   （需要重建 v6 双向测试台）。
+3. 引擎开机自启：板上有一个 10 月 13 日残留的 `/etc/e2631-ppe-pending`（不同 boot_id），
+   守卫会判定"上次加载没确认"而跳过；要么删标记再重启验证，要么做进镜像。
+

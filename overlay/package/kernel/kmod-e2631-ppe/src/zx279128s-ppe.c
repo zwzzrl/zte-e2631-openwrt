@@ -7,6 +7,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/etherdevice.h>
+#include <linux/hex.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/ip.h>
@@ -1438,10 +1439,20 @@ MODULE_PARM_DESC(xprobe,
  * reg 29 mask 3 = 1 = the multicast-table gate).  One add is: read the four
  * tables at the entry's four blocks, then write table 0 at the same blocks.
  *
- * This parameter is the primitive for the hardware test of that protocol:
+ * This parameter is the primitive for the hardware test of that protocol, and
+ * carries the whole add path the vendor module uses (tools/vendor-emu README,
+ * "第八轮"):
  *
- *	echo "r <table> <index>" > .../parameters/sbrg
+ *	echo "r <table> <index>" > .../parameters/sbrg          # start-bit read
  *	echo "w <table> <index> <w0> <w1> <w2>" > .../parameters/sbrg
+ *	echo "h <sip32hex> <dip32hex> <vlan> [pt]" > .../parameters/sbrg
+ *	echo "a <sip32hex> <dip32hex> <vlan> [pt]" > .../parameters/sbrg
+ *	echo "d <sip32hex> <dip32hex> <vlan>" > .../parameters/sbrg
+ *
+ * "h" only prints the key hash, the selected table slot and the 48-byte entry
+ * it would write; "a"/"d" program/zero that entry.  The key is sip, dip, vlan;
+ * tm.ko hashes it backwards with CRC-16/CCITT (init 0) and keeps ten bits,
+ * then picks the block from vendor reg 29.
  *
  * The write order is the vendor's: word 0 last, because that is the word the
  * hardware latches the entry on.  Only three data registers are touched - the
@@ -1450,65 +1461,206 @@ MODULE_PARM_DESC(xprobe,
  */
 #define ZX_SBRG_BASE	0x388000
 #define ZX_SBRG_WORDS	3
+#define ZX_SBRG_START	BIT(27)		/* start_stop: 1 = read, 0 = write */
+#define ZX_SBRG_SEL	0x184		/* vendor reg 29, mask 3 (in the bank) */
+#define ZX_SBRG_KEY_LEN	34		/* sip[16] + dip[16] + vlan[2] */
+#define ZX_SBRG_ENTRY_WORDS 12		/* 48 bytes = four blocks of three */
+#define ZX_SBRG_HASH_MASK 0x3ff
+
+enum zx_ppe_sbrg_mode {
+	ZX_SBRG_MODE_READ,	/* one block, through the start bit */
+	ZX_SBRG_MODE_WRITE,	/* one block, verbatim */
+	ZX_SBRG_MODE_ADD,	/* key -> hash -> slot -> 48-byte entry */
+	ZX_SBRG_MODE_DEL,	/* same slot, entry zeroed */
+	ZX_SBRG_MODE_PLAN,	/* ADD without touching the table */
+};
 
 struct zx_ppe_sbrg_op {
+	enum zx_ppe_sbrg_mode mode;
 	u32 table;
 	u32 index;
 	u32 w[ZX_SBRG_WORDS];
-	bool write;
+	u8 sip[16];
+	u8 dip[16];
+	u32 vlan;
+	u32 pt_mask;
 };
+
+/* One indirect access.  A read is "start_stop = 1, rw = 0" and returns the
+ * three data words; a write is "start_stop = 0", word 0 last.  The vendor
+ * polls reg 20 before the data words and for completion afterwards, which is
+ * what zx_pp_wait() and the status poll below do.
+ */
+static int zx_ppe_sbrg_xfer(struct zx_eth_adapter *adapter, u32 table, u32 index,
+			    bool read, u32 *w)
+{
+	void __iomem *blk = adapter->base + ZX_SBRG_BASE;
+	int i, ret;
+
+	ret = zx_pp_wait(adapter, ZX_SBRG_BASE);
+	if (ret)
+		return ret;
+	writel(index | table << 22 | (read ? ZX_SBRG_START : 0),
+	       blk + ZX_PP_IND_CMD);
+	if (!read) {
+		for (i = ZX_SBRG_WORDS - 1; i >= 0; i--)
+			writel(w[i], blk + ZX_PP_IND_DATA + 4 * i);
+	}
+	for (i = 0; i < 64 && (readl(blk + ZX_PP_IND_STATUS) & 1); i++)
+		;
+	ret = zx_pp_wait(adapter, ZX_SBRG_BASE);
+	if (ret)
+		return ret;
+	if (read) {
+		for (i = 0; i < ZX_SBRG_WORDS; i++)
+			w[i] = readl(blk + ZX_PP_IND_DATA + 4 * i);
+	}
+	return 0;
+}
+
+/* tm.ko's sbrg_hash(): copy the key backwards, CRC-16/CCITT with init 0, keep
+ * ten bits.  The key is sip[16] + dip[16] + vlan as u16 little-endian.
+ */
+static u16 zx_ppe_sbrg_hash(const u8 *key, int len)
+{
+	u16 crc = 0;
+	int i;
+
+	while (len--) {
+		crc ^= (u16)key[len] << 8;
+		for (i = 0; i < 8; i++)
+			crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+	}
+	return crc & ZX_SBRG_HASH_MASK;
+}
+
+/* sbrg_get_table_sel() returns vendor reg 29; the vendor's index arithmetic
+ * only tells "1" apart from everything else.
+ */
+static u32 zx_ppe_sbrg_slot(u16 hash, u32 sel)
+{
+	if (sel == 1)
+		return ((hash & 0x7f) << 2) | 0x200;
+	return ((hash << 2) & 0xff) | 0x300;
+}
+
+static u64 zx_ppe_sbrg_le64(const u8 *p)
+{
+	u64 v = 0;
+	int i;
+
+	for (i = 7; i >= 0; i--)
+		v = (v << 8) | p[i];
+	return v;
+}
+
+/* The entry is a 384-bit little-endian bit stream (tools/vendor-emu
+ * t_v6entry.py build(), checked against the vendor code on random records):
+ * bits 0..2 valid/age/mode, 3..14 vlan, 15..78 dip bytes 8..15, 96..103
+ * pt_mask, 104..167 dip bytes 0..7, 192..255 sip bytes 8..15, 288..351 sip
+ * bytes 0..7; words 8 and 11 are always zero.
+ */
+static void zx_ppe_sbrg_entry(const struct zx_ppe_sbrg_op *op,
+			      u32 w[ZX_SBRG_ENTRY_WORDS])
+{
+	u64 dip_hi = zx_ppe_sbrg_le64(op->dip + 8);
+	u64 dip_lo = zx_ppe_sbrg_le64(op->dip);
+	u64 sip_lo = zx_ppe_sbrg_le64(op->sip);
+	u64 sip_hi = zx_ppe_sbrg_le64(op->sip + 8);
+
+	memset(w, 0, ZX_SBRG_ENTRY_WORDS * sizeof(u32));
+	/* valid = 1, age = 0, mode = 1: the flags an entry that should forward
+	 * carries.
+	 */
+	w[0] = 1 | (1 << 2) | ((op->vlan & 0xfff) << 3) |
+	       ((dip_hi & 0x1ffff) << 15);
+	w[1] = (dip_hi >> 17) & 0xffffffff;
+	w[2] = (dip_hi >> 49) & 0x7fff;
+	w[3] = (op->pt_mask & 0xff) | ((dip_lo & 0xffffff) << 8);
+	w[4] = (dip_lo >> 24) & 0xffffffff;
+	w[5] = (dip_lo >> 56) & 0xff;
+	w[6] = sip_hi & 0xffffffff;
+	w[7] = (sip_hi >> 32) & 0xffffffff;
+	w[9] = sip_lo & 0xffffffff;
+	w[10] = (sip_lo >> 32) & 0xffffffff;
+}
 
 static void zx_ppe_sbrg_adapter(struct zx_eth_adapter *adapter, void *data)
 {
 	struct zx_ppe_sbrg_op *op = data;
-	u32 v[ZX_SBRG_WORDS];
-	int i, ret;
+	u32 words[ZX_SBRG_ENTRY_WORDS], v[ZX_SBRG_WORDS] = {};
+	u32 hash = 0, sel = 0, index = op->index;
+	int i, b, t, ret;
 
 	mutex_lock(&adapter->ppe_lock);
-	ret = zx_pp_wait(adapter, ZX_SBRG_BASE);
-	if (ret) {
-		dev_info(adapter->dev, "sbrg: %s table %u index %#x: not ready (%d)\n",
-			 op->write ? "write" : "read", op->table, op->index, ret);
-		goto out;
+	if (op->mode == ZX_SBRG_MODE_ADD || op->mode == ZX_SBRG_MODE_DEL ||
+	    op->mode == ZX_SBRG_MODE_PLAN) {
+		u8 key[ZX_SBRG_KEY_LEN];
+
+		memcpy(key, op->sip, 16);
+		memcpy(key + 16, op->dip, 16);
+		key[32] = op->vlan & 0xff;
+		key[33] = (op->vlan >> 8) & 0xff;
+		hash = zx_ppe_sbrg_hash(key, sizeof(key));
+		sel = readl(adapter->base + ZX_SBRG_BASE + ZX_SBRG_SEL) & 3;
+		index = zx_ppe_sbrg_slot(hash, sel);
+		zx_ppe_sbrg_entry(op, words);
+		if (op->mode == ZX_SBRG_MODE_DEL)
+			memset(words, 0, sizeof(words));
+		dev_info(adapter->dev, "sbrg: vlan %u hash %#x sel %u index %#x%s\n",
+			 op->vlan, hash, sel, index,
+			 op->mode == ZX_SBRG_MODE_DEL ? " (delete)" :
+			 op->mode == ZX_SBRG_MODE_PLAN ? " (plan)" : "");
+		for (i = 0; i < ZX_SBRG_ENTRY_WORDS; i += 3)
+			dev_info(adapter->dev, "sbrg:   w%02d %08x %08x %08x\n",
+				 i, words[i], words[i + 1], words[i + 2]);
 	}
-	if (op->write) {
-		writel(op->index | op->table << 22,
-		       adapter->base + ZX_SBRG_BASE + ZX_PP_IND_CMD);
-		for (i = ZX_SBRG_WORDS - 1; i >= 0; i--)
-			writel(op->w[i], adapter->base + ZX_SBRG_BASE +
-			       ZX_PP_IND_DATA + 4 * i);
-		for (i = 0; i < 64 &&
-		     (readl(adapter->base + ZX_SBRG_BASE + ZX_PP_IND_STATUS) & 1);
-		     i++)
-			;
-		ret = zx_pp_wait(adapter, ZX_SBRG_BASE);
-		if (ret) {
-			dev_info(adapter->dev, "sbrg: write table %u index %#x: no completion (%d)\n",
-				 op->table, op->index, ret);
-			goto out;
-		}
-		dev_info(adapter->dev, "sbrg: wrote table %u index %#x <- %08x %08x %08x\n",
-			 op->table, op->index, op->w[0], op->w[1], op->w[2]);
-	} else {
-		writel(op->index | op->table << 22 | ZX_PP_IND_READ,
-		       adapter->base + ZX_SBRG_BASE + ZX_PP_IND_CMD);
-		for (i = 0; i < 64 &&
-		     (readl(adapter->base + ZX_SBRG_BASE + ZX_PP_IND_STATUS) & 1);
-		     i++)
-			;
-		ret = zx_pp_wait(adapter, ZX_SBRG_BASE);
-		if (ret) {
+
+	switch (op->mode) {
+	case ZX_SBRG_MODE_PLAN:
+		break;
+	case ZX_SBRG_MODE_READ:
+		ret = zx_ppe_sbrg_xfer(adapter, op->table, op->index, true, v);
+		if (ret)
 			dev_info(adapter->dev, "sbrg: read table %u index %#x: no completion (%d)\n",
 				 op->table, op->index, ret);
-			goto out;
+		else
+			dev_info(adapter->dev, "sbrg: table %u index %#x = %08x %08x %08x\n",
+				 op->table, op->index, v[0], v[1], v[2]);
+		break;
+	case ZX_SBRG_MODE_WRITE:
+		ret = zx_ppe_sbrg_xfer(adapter, op->table, op->index, false, op->w);
+		if (ret)
+			dev_info(adapter->dev, "sbrg: write table %u index %#x: no completion (%d)\n",
+				 op->table, op->index, ret);
+		else
+			dev_info(adapter->dev, "sbrg: wrote table %u index %#x <- %08x %08x %08x\n",
+				 op->table, op->index, op->w[0], op->w[1], op->w[2]);
+		break;
+	default:
+		/* The vendor reads all four tables at the entry's four blocks
+		 * before writing; the values are unused, but the hardware then
+		 * sees the same sequence.  The entry itself goes to table 0.
+		 */
+		if (index + 3 >= 0x1000)
+			break;
+		for (t = 0; t < 4; t++)
+			for (b = 0; b < 4; b++)
+				zx_ppe_sbrg_xfer(adapter, t, index + b, true, v);
+		for (b = 0; b < 4; b++) {
+			ret = zx_ppe_sbrg_xfer(adapter, 0, index + b, false,
+					       &words[3 * b]);
+			if (ret) {
+				dev_info(adapter->dev, "sbrg: write index %#x: no completion (%d)\n",
+					 index + b, ret);
+				break;
+			}
 		}
-		for (i = 0; i < ZX_SBRG_WORDS; i++)
-			v[i] = readl(adapter->base + ZX_SBRG_BASE +
-				     ZX_PP_IND_DATA + 4 * i);
-		dev_info(adapter->dev, "sbrg: table %u index %#x = %08x %08x %08x\n",
-			 op->table, op->index, v[0], v[1], v[2]);
+		dev_info(adapter->dev, "sbrg: %s slots %#x..%#x done\n",
+			 op->mode == ZX_SBRG_MODE_DEL ? "delete" : "add",
+			 index, index + 3);
+		break;
 	}
-out:
 	mutex_unlock(&adapter->ppe_lock);
 }
 
@@ -1517,24 +1669,52 @@ static int zx_ppe_sbrg_storage;
 static int zx_ppe_sbrg_set(const char *val, const struct kernel_param *kp)
 {
 	struct zx_ppe_sbrg_op op = {};
-	char how[8];
-	unsigned int table, index, w0 = 0, w1 = 0, w2 = 0;
+	char how[8] = {}, s_sip[33] = {}, s_dip[33] = {};
+	unsigned int table = 0, index = 0, w0 = 0, w1 = 0, w2 = 0;
+	unsigned int vlan = 0, pt = 0xff;
 	int n;
 
 	if (!val)
 		return -EINVAL;
 	n = sscanf(val, "%7s %i %i %x %x %x", how, &table, &index, &w0, &w1, &w2);
+
+	/* a/d/h take the two addresses as 32 hex digits plus the VLAN. */
+	if (!strcmp(how, "a") || !strcmp(how, "add") ||
+	    !strcmp(how, "d") || !strcmp(how, "del") ||
+	    !strcmp(how, "h") || !strcmp(how, "hash")) {
+		n = sscanf(val, "%7s %32s %32s %i %x", how, s_sip, s_dip,
+			   &vlan, &pt);
+		if (n < 4)
+			return -EINVAL;
+		if (hex2bin(op.sip, s_sip, 16) || hex2bin(op.dip, s_dip, 16))
+			return -EINVAL;
+		if (vlan >= 0x1000 || pt > 0xff)
+			return -EINVAL;
+		op.vlan = vlan;
+		op.pt_mask = pt;
+		if (!strcmp(how, "a") || !strcmp(how, "add"))
+			op.mode = ZX_SBRG_MODE_ADD;
+		else if (!strcmp(how, "d") || !strcmp(how, "del"))
+			op.mode = ZX_SBRG_MODE_DEL;
+		else
+			op.mode = ZX_SBRG_MODE_PLAN;
+		zx_eth_for_each_adapter(zx_ppe_sbrg_adapter, &op);
+		return 0;
+	}
+
 	if (n < 3)
+		return -EINVAL;
+	if (table > 4 || index >= 0x1000)
 		return -EINVAL;
 	if (!strcmp(how, "w") || !strcmp(how, "write")) {
 		if (n != 6)
 			return -EINVAL;
-		op.write = true;
-	} else if (strcmp(how, "r") && strcmp(how, "read")) {
+		op.mode = ZX_SBRG_MODE_WRITE;
+	} else if (!strcmp(how, "r") || !strcmp(how, "read")) {
+		op.mode = ZX_SBRG_MODE_READ;
+	} else {
 		return -EINVAL;
 	}
-	if (table > 4 || index >= 0x1000)
-		return -EINVAL;
 	op.table = table;
 	op.index = index;
 	op.w[0] = w0;
@@ -1550,7 +1730,7 @@ static const struct kernel_param_ops zx_ppe_sbrg_ops = {
 };
 module_param_cb(sbrg, &zx_ppe_sbrg_ops, &zx_ppe_sbrg_storage, 0644);
 MODULE_PARM_DESC(sbrg,
-		 "vendor IPv6 table access at 0x388000: \"r <table> <index>\" or \"w <table> <index> <w0> <w1> <w2>\" (hex)");
+		 "vendor IPv6 table at 0x388000: \"r <table> <index>\", \"w <table> <index> <w0> <w1> <w2>\", or \"h|a|d <sip32hex> <dip32hex> <vlan> [pt_mask]\"");
 
 static void zx_ppe_dump_adapter(struct zx_eth_adapter *adapter, void *data)
 {
