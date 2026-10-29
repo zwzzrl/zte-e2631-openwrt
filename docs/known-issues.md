@@ -1330,3 +1330,104 @@ for p in $(ls /etc/config); do msg=$(uci commit "$p" 2>&1); [ -n "$msg" ] && ech
 
 `*.bak-ula` / `*.bak-guard` 这类备份文件报错是正常的（它们本来不是配置），其余任何一条
 报错都说明回灌带进去了坏文件。
+
+## VENDOR-ROOTSH-NO-DEVICE-NODES - 改版原厂系统起不来的根因：341 个 /dev 节点被写成了普通文件（2026-10-30 复盘）
+
+### 现象
+
+把"原厂系统 + root shell"的包刷进 slot1 后：cspboot 两道 CRC 都过
+（`verify kernel success!!`、`verify fs success!!`），内核与原厂逐字节相同
+（`k_crc 0x2edf94cd`，与 slot0 一致），但 `Starting kernel ...` 之后约 10 秒整机复位，
+串口一个字节的内核日志都没有，然后无限循环。slot0 未被动过。
+
+### 先纠正上一轮的两个错误判断
+
+这两个判断当时都被当成结论写进了记录，事后都被真机推翻了：
+
+1. **"bootargs 里的 `console=$(console)` 没被展开，所以内核没有控制台"——错的。**
+   U-Boot 的命令行处理器会展开 `$(...)`。在 U-Boot 里实测：
+
+   ```
+   => echo [$(console)]
+   [ttyAMA0,115200n8]
+   ```
+
+   cspboot 打印的 `cmd=setenv bootargs console=$(console) ...` 是**展开前的命令原文**，
+   不是最终的 bootargs。真正传给内核的是 `console=ttyAMA0,115200n8 root=/dev/mtdblock8
+   ro rootfstype=jffs2 mem=256M`，是对的。
+
+2. **"`Starting kernel ...` 之后静默 = 内核崩了"——错的。**
+   用同样的方式让 cspboot 选 slot0 启动**未改动过的原厂固件**：串口同样一片空白，
+   但系统正常起来——`192.168.5.1` 的 80/443 可达、原厂登录握手成功
+   （`SoftwareVer=V1.0.0.8B8.9201`）、ping 0.7 ms。原厂 4.1.25 内核根本不往 ttyAMA0
+   打内核日志，所以**"静默"什么也证明不了**，能作为"死没死"依据的只有两件事：
+   有没有复位（掉电重启循环）、网络有没有起来。
+
+### 根因
+
+离线把两边镜像的 JFFS2 节点逐个数出来对比：
+
+| inode 类型 | 原厂 slot0 | 旧产物（刷进去的那份） |
+|---|---|---|
+| 目录 | 47 | 47 |
+| 符号链接 | 23 | 23 |
+| **字符设备** | **173** | **0** |
+| **块设备** | **168** | **0** |
+| 普通文件 | 107 | 449 |
+
+原厂 rootfs 的 `/dev` 里**预置了 341 个设备节点**（`console`、`null`、`zero`、
+`mtd0-14`、`mtdblock0-14`、`ttyAMA0`、`FeedDog` 看门狗……），因为 vendor 内核
+**没有 devtmpfs**，整个 `/dev` 就靠这份静态节点。旧产物的打包链路是：
+
+1. `jffs2_tree.py` 解包时把设备节点写成了 `<名字>.chr` / `<名字>.blk` 的**空普通文件**；
+2. 重建目录树时没把它们还原成真节点，`mkfs.jffs2` 就照普通文件写回镜像。
+
+于是启动时：内核挂上 JFFS2、执行 `/sbin/init`，init 去开 `/dev/console` —— 那是一个
+只读文件系统上的空普通文件，打不开 → init 死 → panic（然后被看门狗复位）。这一路
+全在 userspace 早期，正好符合"内核跳进去约 10 秒整机复位、串口无输出"的表现。
+
+设备号在 JFFS2 inode 里存成 **2 字节小端 `(major<<8)|minor`**，已核对：
+`/dev/console`=5:1、`/dev/ttyAMA0`=204:64、`/dev/mtdblock8`=31:8、`/dev/mtd8`=90:16。
+
+顺带说明另外 341 个多余 inode 的来历：`.chr`/`.blk` 占位文件还留在树里，
+所以旧镜像比原厂多出 341 个 inode + 341 个 dirent（约 44 KB）。
+
+### 次要问题：压缩器选错
+
+旧打包命令用了 `-m size`（按压缩率挑压缩器），结果 272 个数据节点用了 `rtime`
+（compr=2，集中在 `etc/wireless/mt7916/*` 的 WiFi 校准/固件文件上）。原厂镜像只有
+`none(0)` 和 `zlib(6)`。vendor 内核里能看到 rtime 压缩器的名字，所以它八成能解，
+但这属于无必要的偏离，改回原厂默认的 `-m priority` 并禁掉 lzma（vendor 内核里
+连 `lzma` 字符串都没有）。
+
+### 修法与验证
+
+`09-工具脚本/build-vendor-rootsh.py`：从原厂镜像读回每个设备节点的
+(类型, mode, uid, gid, major, minor)，用 `os.mknod` 建真节点；删掉 `.chr`/`.blk`
+占位；按 `-m priority -x lzma` 出镜像；版本头整份沿用原厂 slot0 的头，只改
+body 长度 / fs_crc / 槽起点 / serial / H_NEW / 两个 CRC。
+
+产物 `02-固件产物/vendor-root-shell/e2631-vendor-rootsh-slot1-fixed.pkg`
+（21,234,196 B）自检全过：
+
+- inode 类型 `{目录 47, 链接 23, 字符 173, 块 168, 普通 108}`（普通 =107+1，多的是 `/sbin/shd`）
+- 压缩分布 `{none 3930, zlib 1969}`（原厂 `{3930, 1964}`，多的 5 个是 shd）
+- 镜像长度正好 `0x1100000`
+- 解包回来与原厂树只差四处：`etc/init.norm`、`etc/init.debug`、`etc/shadow`、`+sbin/shd`
+- 盒子上 `e2631-fwslot check` → `ok: valid E2631 package for ZXHN E2631 V1.0.0`
+
+### 一条已排除的差异（留档，别再追）
+
+原厂 slot0 的头块（`0x1440000` 那 128 KiB）在 512 字节版本头之后还有约 **127 KiB 高熵
+数据**，用 rootfs 的 AES key 解不开；但原厂 slot1 的头块（`mtd9_slot1-header.bin` 备份）
+只有 512 字节头、没有这块。也就是说原厂自己的升级流程也不写它，判定与启动无关。
+
+### 下一步验收
+
+把 fixed 包刷进 slot1（`e2631-fwslot flash <pkg> --slot 1`），预期：
+
+- 串口**仍然静默**（原厂内核不打日志），所以别拿串口判断死活；
+- 判据换成网络：起来后 LAN 是 `192.168.5.1`，WebUI 80/443 通；
+- 然后 `telnet <IP> 2323` 拿 root shell（`/sbin/shd`，口令见 `shd.c`）；
+- 若依然 10 秒复位，则剩下的唯一变量就是"内容"本身（3 个改动 + shd），按
+  `/etc/init.norm` → `/etc/shadow` → `shd` 的顺序二分。

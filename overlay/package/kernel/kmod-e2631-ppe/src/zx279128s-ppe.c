@@ -1225,6 +1225,62 @@ static u32 zx_ppe_v6_rule[17] = {
 static const u32 zx_ppe_sub[2] = { 0xfc000000, 0x00001fff };
 
 /*
+ * The whole extract-index entry, as five words.  The tenth round found that
+ * the vendor's own tm_acl_fast_init() does not leave index 10 the way the
+ * stock tables have it: it writes { 0, 1, 0, 0, 5 } - only two field ids and
+ * word 4 = 5 - and the same shape shows up for the L2 fast index (index 1 =
+ * { 0, 1, 0, 0, 5 }).  Our driver inherited the stock firmware's entry
+ * (field ids 0..15, word 4 = 0x00150154), so this parameter exists to write
+ * the vendor's version instead and let the hardware say which one it wants.
+ */
+static int zx_ppe_v6_idx_set(const char *val, const struct kernel_param *kp)
+{
+	char buf[128];
+	const char *cur;
+	size_t len;
+	int n = 0;
+
+	if (!val)
+		return -EINVAL;
+	len = strscpy(buf, val, sizeof(buf));
+	if (len < 0)
+		return -EINVAL;
+	while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
+		       buf[len - 1] == ' '))
+		buf[--len] = '\0';
+	for (cur = buf; *cur && n < 5; cur++) {
+		char *end;
+
+		zx_ppe_v6_index[n] = simple_strtoul(cur, &end, 0);
+		if (end == cur)
+			return -EINVAL;
+		n++;
+		cur = end;
+		if (*cur == ',')
+			continue;
+		if (*cur)
+			return -EINVAL;
+		break;
+	}
+	if (n != 5)
+		return -EINVAL;
+	zx_ppe_v6_wins_apply();
+	pr_info("zx279128s-ppe: v6_idx: %08x %08x %08x %08x %08x\n",
+		zx_ppe_v6_index[0], zx_ppe_v6_index[1], zx_ppe_v6_index[2],
+		zx_ppe_v6_index[3], zx_ppe_v6_index[4]);
+	return 0;
+}
+
+static const struct kernel_param_ops zx_ppe_v6_idx_ops = {
+	.set	= zx_ppe_v6_idx_set,
+};
+
+static int zx_ppe_v6_idx_storage;
+module_param_cb(v6_idx, &zx_ppe_v6_idx_ops, &zx_ppe_v6_idx_storage, 0644);
+MODULE_PARM_DESC(v6_idx,
+		 "IPv6 extract index entry as five words, e.g. \"0,1,0,0,5\"");
+
+/*
  * Apply the v6_* overrides to the two tables above.  Bits are patched with
  * the same little-endian bit numbering the tables were encoded with, so a
  * patched table is what the encoder would have produced for that value.
