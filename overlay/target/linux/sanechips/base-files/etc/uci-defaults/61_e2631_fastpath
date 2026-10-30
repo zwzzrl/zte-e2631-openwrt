@@ -1,0 +1,26 @@
+#!/bin/sh
+# Zero-copy fast path, default on (see /etc/init.d/e2631-netune for the
+# measurements behind the default). The driver defaults to on as well, so this
+# section exists to give the LuCI page something to edit and to keep the
+# setting stable across reboots - /etc/config/e2631 is otherwise only created
+# by the online-update tool, i.e. it may not exist on a fresh install.
+#
+# Do NOT create it with "uci set": this uci refuses to open a config package
+# that has no file yet ("uci: Entry not found", rc=1 - verified on the board),
+# so a missing file is written directly. The section is named "fastpath" with
+# the option "zerocopy" => e2631.fastpath.zerocopy.
+if uci -q get e2631.fastpath.zerocopy >/dev/null 2>&1; then
+	exit 0
+fi
+
+if [ -f /etc/config/e2631 ]; then
+	uci -q set e2631.fastpath=fastpath
+	uci -q set e2631.fastpath.zerocopy='1'
+	uci -q commit e2631
+else
+	cat > /etc/config/e2631 <<'EOF'
+config fastpath 'fastpath'
+	option zerocopy '1'
+EOF
+fi
+exit 0

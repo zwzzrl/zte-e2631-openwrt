@@ -10,12 +10,18 @@
 #   check            online update check (e2631-upgrade check output as log)
 #   switch           flip the boot to the OTHER (stock) slot; needs confirm
 #   run              one-click online upgrade, detached; needs confirm
+#   accel            zero-copy state: uci setting, driver state, live counters
+#   accel_set        write the uci setting and apply it to the driver now
 #
 # fwslot lives in /usr/sbin on this layout (package default), not /sbin:
 # resolve instead of assuming, or the board page shows a read failure.
 
 FW="$(command -v e2631-fwslot 2>/dev/null)"
 [ -n "$FW" ] || FW=/usr/sbin/e2631-fwslot
+
+# debugfs knob exported by the driver (see zx_eth_zc_show/_write). Line 1 is
+# the active state, line 2 the counters as "name=value" pairs.
+ZC=/sys/kernel/debug/92000000.ethernet/zc
 
 esc() { # escape a command's output into a JSON string value
 	"$@" 2>&1 | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk '{printf "%s\\n", $0}'
@@ -29,9 +35,31 @@ needs_confirm() { # reads the ubus call params from stdin
 	esac
 }
 
+accel_json() { # $1 = leading ,"ok":true when the caller wants it
+	local uci_val drv line
+	uci_val=$(uci -q get e2631.fastpath.zerocopy 2>/dev/null)
+	[ -n "$uci_val" ] || uci_val=1
+
+	if [ ! -r "$ZC" ]; then
+		printf '{"avail":false%s,"uci":"%s","drv":null,"counters":{}}' \
+			"$1" "$uci_val"
+		return
+	fi
+
+	{
+		read -r drv
+		read -r line
+	} < "$ZC"
+
+	# "rx_ok=1 tx_ok=2 ..." -> {"rx_ok":1,"tx_ok":2,...}
+	printf '{"avail":true%s,"uci":"%s","drv":"%s","counters":{%s},"default":"1"}' \
+		"$1" "$uci_val" "$drv" \
+		"$(printf '%s' "$line" | sed -e 's/\([a-z_]*\)=\(-\{0,1\}[0-9][0-9]*\)/"\1":\2/g' -e 's/ /,/g')"
+}
+
 case "$1" in
 list)
-	printf '{ "slots": {}, "check": {}, "switch": { "confirm": "str" }, "run": { "confirm": "str" } }\n'
+	printf '{ "slots": {}, "check": {}, "switch": { "confirm": "str" }, "run": { "confirm": "str" }, "accel": {}, "accel_set": { "enabled": "str" } }\n'
 	;;
 call)
 	case "$2" in
@@ -59,6 +87,37 @@ call)
 		touch /tmp/e2631-upgrade/.running
 		setsid /sbin/e2631-upgrade run > /tmp/e2631-upgrade/run.log 2>&1 &
 		printf '{"ok":true}'
+		;;
+	accel)
+		accel_json ""
+		;;
+	accel_set)
+		input=$(cat)
+		v=$(printf '%s' "$input" |
+			sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9]*\)"\{0,1\}.*/\1/p')
+		case "$v" in
+		0|1) ;;
+		*) printf '{"ok":false,"error":"enabled must be 0 or 1"}'; exit 0 ;;
+		esac
+		# This uci cannot open a package that has no file yet ("Entry not
+		# found", rc=1 - verified on the board), so create it directly. Only
+		# happens when the section was never seeded, e.g. an upgrade that kept
+		# its settings from a build without the uci-defaults above.
+		if [ ! -f /etc/config/e2631 ]; then
+			cat > /etc/config/e2631 <<'EOT'
+config fastpath 'fastpath'
+	option zerocopy '1'
+EOT
+		fi
+		uci -q set e2631.fastpath=fastpath
+		uci -q set e2631.fastpath.zerocopy="$v"
+		uci -q commit e2631 || {
+			printf '{"ok":false,"error":"uci commit failed"}'
+			exit 0
+		}
+		# single apply path: the init script owns the driver knob and GRO
+		/etc/init.d/e2631-netune reload >/dev/null 2>&1
+		accel_json ',"ok":true'
 		;;
 	esac
 	;;

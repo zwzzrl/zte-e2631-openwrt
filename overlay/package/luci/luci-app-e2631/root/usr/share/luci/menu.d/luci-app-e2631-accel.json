@@ -1,0 +1,13 @@
+{
+	"admin/network/e2631-accel": {
+		"title": "转发加速",
+		"order": 12,
+		"action": {
+			"type": "view",
+			"path": "network/e2631-accel"
+		},
+		"depends": {
+			"acl": [ "luci-app-e2631" ]
+		}
+	}
+}

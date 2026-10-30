@@ -30,8 +30,23 @@
 #    them on everywhere.  Disabling the advertisement costs one renegotiation
 #    at boot and removes a known failure mode of this PHY family.
 #
-#  GRO on - the driver already feeds napi_gro_receive(); this only makes the
-#    intent explicit and survives any future default change.
+#  GRO - the driver feeds napi_gro_receive() unconditionally but the feature
+#    bit decides whether anything is merged, and the *driver* owns that bit
+#    now: zero-copy skbs are the pool slot itself, so GRO has to stay off while
+#    zc is on, and it goes back on when zc is off (both directions written in
+#    zx_eth_probe/zx_zc_set).  This script used to set it with ethtool -K; it
+#    no longer does, because on this kernel `ethtool -K gro off` with GRO
+#    outside hw_features goes through wanted_features and measured up leaving
+#    the bit *on* ("on [fixed]").
+#
+#  zero-copy (uci e2631.fastpath.zerocopy, default 1) - the driver defaults to
+#    on already, but the module parameter cannot be changed on this build (the
+#    driver is builtin), so the debugfs knob is the only runtime switch and the
+#    LuCI page writes uci only.  This script is what makes the setting
+#    authoritative at boot.  Default is on after the 2026-10-30 measurements:
+#    routed UDP 900M single flow 612 -> 741 Mbit/s, 8 TCP streams 565 -> 700
+#    Mbit/s, at the cost of box-as-server throughput (471 -> 218 Mbit/s) - which
+#    is exactly why the knob is exposed instead of hard-wired.
 START=20
 # No USE_PROCD line: rc.common tests [ -n "$USE_PROCD" ], so "USE_PROCD=0" is
 # not "off" - it takes the procd branch and the plain start() below then never
@@ -39,6 +54,25 @@ START=20
 # in its userdata scripts (42daef9); the fix is to leave the variable unset.
 
 PORTS="lan1 lan2 lan3 wan"
+# debugfs knob exported by the driver (zx_eth_zc_show/_write)
+ZC=/sys/kernel/debug/92000000.ethernet/zc
+
+# The wanted zero-copy state: uci wins, and 1 is the default both here and in
+# the driver, so an installation without the config section still boots zc on.
+zc_want() {
+	local v
+	v=$(uci -q get e2631.fastpath.zerocopy 2>/dev/null)
+	[ "$v" = "0" ] && echo 0 || echo 1
+}
+
+# debugfs is mounted by the boot init script, which runs before START=20, but
+# do not depend on it: mount it once if the knob is not there yet.
+apply_zc() {
+	local want=$1
+	[ -e "$ZC" ] || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+	[ -w "$ZC" ] || return 0
+	echo "$want" > "$ZC" 2>/dev/null
+}
 
 tune_port() {
 	local ifn=$1
@@ -48,13 +82,18 @@ tune_port() {
 		echo 1 > "$q/rps_cpus" 2>/dev/null
 		echo 256 > "$q/rps_flow_cnt" 2>/dev/null
 	done
-	if command -v ethtool >/dev/null 2>&1; then
+	command -v ethtool >/dev/null 2>&1 && \
 		ethtool -A "$ifn" rx off tx off 2>/dev/null
-		ethtool -K "$ifn" gro on 2>/dev/null
-	fi
 }
 
 start() {
+	local zc
+	zc=$(zc_want)
+
+	# zc first: it rewrites the GRO feature bit (the driver's business, see
+	# the header), so do not touch that bit anywhere else in this script.
+	apply_zc "$zc"
+
 	# RPS needs the flow table steering entries to have a home
 	[ -w /proc/sys/net/core/rps_sock_flow_entries ] && \
 		echo 1024 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null
@@ -66,4 +105,10 @@ start() {
 	if [ -n "$irq" ] && [ -w "/proc/irq/$irq/smp_affinity" ]; then
 		echo 2 > "/proc/irq/$irq/smp_affinity" 2>/dev/null
 	fi
+}
+
+# The LuCI page / rpcd backend flips the uci value and calls us to apply it
+# without a reboot.
+reload() {
+	start
 }

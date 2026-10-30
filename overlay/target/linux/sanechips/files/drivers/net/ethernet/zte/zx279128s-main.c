@@ -29,6 +29,7 @@
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_net.h>
@@ -39,6 +40,43 @@
 
 #include "zx279128s-eth.h"
 #include "zx279128s-ppe.h"
+
+/*
+ * Map the 4096 x 2048 B DMA buffer pool cacheable (streaming DMA, so every
+ * frame pays a cache invalidate on receive and a clean on transmit) instead of
+ * uncached (the coherent arena, no maintenance at all).  Both costs are
+ * measured per frame in docs/ffe-cacheable-pool-2026-10-30.md, and the zero-copy
+ * path that skips the copy entirely in docs/ffe-zero-copy-2026-10-30.md.
+ */
+static bool pool_cacheable;
+module_param(pool_cacheable, bool, 0644);
+MODULE_PARM_DESC(pool_cacheable, "Map the packet pool cacheable (default: uncached)");
+
+/*
+ * 零拷贝：接收时把 BMU 池里的槽位直接当成 skb 的数据区交给协议栈，发送时把同一个
+ * bp 直接交给硬件，省掉每包两次 payload 搬运。说明见 zx_zc_* 那一节。
+ * 默认开（1）：转发场景实测比拷贝路径快（UDP 900M 单流 612 → 741 Mbit/s、
+ * 8 流 TCP 565 → 700 Mbit/s），代价只有"本机收包"场景的吞吐下降。改法有两个：
+ * 开机默认由 /etc/config/e2631 的 fastpath.zerocopy 决定（e2631-netune 在启动
+ * 时写 debugfs，见该脚本），运行态可以用 debugfs 的 zc 文件或
+ * /sys/module/zx279128s_eth/parameters/zc_rx 切换，便于同一镜像里做 A/B。
+ */
+static bool zc_rx = true;
+module_param(zc_rx, bool, 0644);
+MODULE_PARM_DESC(zc_rx, "Zero-copy RX/TX over the BMU packet pool (default: on)");
+
+/*
+ * 每包阶段计时（接收 5 段、发送 4 段），默认关。一次包要 6 个 ktime_get_ns()
+ * 加 11 次累加，在 1500 B/包 的转发路径上是可测的额外成本（量级 100 ns/包，
+ * 60 万包/秒时约 7 % 一个核），所以发布版本不跑它。做对比实验时打开：
+ *   echo 1 > /sys/module/zx279128s_eth/parameters/timing
+ * 打开后阶段数据出现在 /sys/kernel/debug/92000000.ethernet/dma_state 里。
+ */
+static bool timing;
+module_param(timing, bool, 0644);
+MODULE_PARM_DESC(timing, "Per-packet stage timing (default: off)");
+
+#define ZX_TS()	(unlikely(timing) ? ktime_get_ns() : 0)
 
 /* ---- Packet processor engine (package kmod-e2631-ppe) --------------- */
 
@@ -788,8 +826,8 @@ static int zx_hw_init(struct zx_eth_adapter *adapter)
 	writel((u32)adapter->tab0_dma, base + ZX_TM_TAB0_ADDR);
 	writel((u32)adapter->tab1_dma, base + ZX_TM_TAB1_ADDR);
 	writel(0x08000800, base + ZX_TM_TAB_LIMIT);
-	writel((u32)adapter->buf_pool_dma, base + ZX_TM_BUF_START);
-	writel((u32)adapter->buf_pool_dma + ZX_BUF_POOL_SIZE, base + ZX_TM_BUF_END);
+	writel((u32)adapter->pkt_pool_dma, base + ZX_TM_BUF_START);
+	writel((u32)adapter->pkt_pool_dma + ZX_BUF_POOL_SIZE, base + ZX_TM_BUF_END);
 	writel((u32)adapter->rx_ring_dma, base + ZX_TM_BUF_F0);
 	writel(16, base + ZX_TM_CONFIG_START);
 
@@ -935,8 +973,292 @@ static void zx_tx_reclaim(struct zx_eth_adapter *adapter)
 	}
 }
 
+/* ---- 零拷贝收发（zc）----------------------------------------------- */
+
+/*
+ * BMU 发给 CPU 的帧只能落在池子里：bp 就是"池首 + bp * 2048"，收发两个方向
+ * 都只认这个编号，发送描述符里根本没有物理地址字段。所以常规路径必须搬两次
+ * payload：收包时从槽位搬进 skb，发包时再从 skb 搬进另一个槽位。这颗 SoC 上
+ * 一次 1400 字节的搬运要 5~15 µs（非缓存池实测：收 14.4 µs、发 5.2 µs），两次
+ * 就吃掉了转发包 CPU 时间（29.0 µs）里的 19.6 µs。
+ *
+ * 零拷贝把这条链路砍成 0 次搬运：
+ *   收：build_skb() 把槽位本身当 skb 的数据区（shinfo 落在槽位尾部 1728..2048，
+ *       帧最长 1536+16，不会打架），skb_reserve(16) 后 data 正好是帧首。
+ *   发：发现 skb->head 就是池槽位、data 没动过，就把同一个 bp 写进描述符。
+ *       硬件发完自己把 bp 还回 BMU（bmu_alloc_fail 在 180 万个发送包后仍是 0，
+ *       说明发送缓冲确实由硬件回收），所以这条路上我们不需要管 bp。
+ *
+ * 三个必须处理的例外：
+ *  1. 协议栈丢包（防火墙、无路由、桥过滤）：bp 只能靠 skb->destructor 找回来。
+ *  2. skb_orphan() 会提前调用 destructor（br_netfilter 的 setup_pre_routing、nft
+ *     flowtable 的 xfrm 分支都会），那时 skb 还活着、槽位不能还。所以 destructor
+ *     只把 bp 放进隔离环，隔两个 tick 才真正归还；这期间如果 skb 还是被发出去，
+ *     发送路径会把隔离项摘掉、把 bp 交给硬件。
+ *  3. 释放 head_frag=1 的 skb 会走 page_frag_free()，它对槽位所在的页做
+ *     put_page()。池子来自 dma_alloc_coherent()，是 2048 个独立 order-0 页，
+ *     put_page() 会把其中一页还给 buddy、整块池子出现空洞。所以池页引用计数被
+ *     垫高（ZX_ZC_PARK），每次释放只做一次无害的减一，NAPI 里定期补回。
+ *
+ * 另外 skb 可能被 pskb_expand_head() 换成新的 head（例如要更多 headroom，或者
+ * GRO 合并）。expand 会把 shinfo 连同 destructor_arg 一起抄到新 head，所以我们
+ * 仍然能从这个标记里找回 bp；只是数据已经不在槽位里了，发送时退回拷贝路径。
+ * 这也是开 zc 时必须关掉 GRO 的原因：GRO 合并后 frags 会指向别的槽位，那条 bp
+ * 就没人回收了。
+ */
+#define ZX_ZC_TAG_VAL	0x5ac00000u
+#define ZX_ZC_TAG_MASK	0xffff0000u
+
+#define ZX_ZC_BS_FREE	0	/* 在 BMU 空闲表里 */
+#define ZX_ZC_BS_SKB	1	/* 在协议栈手里 */
+#define ZX_ZC_BS_DROPQ	2	/* skb 已释放，等隔离到期归还 */
+#define ZX_ZC_BS_TX	3	/* 已交给发送硬件，硬件发完自己归还 */
+
+/* SoC 上只有一个以太网控制器；destructor 里没有别的办法拿到 adapter */
+static struct zx_eth_adapter *zx_zc_adapter;
+
+static inline void zx_zc_tag_set(struct sk_buff *skb, u16 bp)
+{
+	skb_shinfo(skb)->destructor_arg =
+		(void *)(unsigned long)(ZX_ZC_TAG_VAL | (u32)bp);
+}
+
+static inline bool zx_zc_tag_get(const struct sk_buff *skb, u16 *bp)
+{
+	unsigned long v = (unsigned long)skb_shinfo(skb)->destructor_arg;
+
+	if ((v & ZX_ZC_TAG_MASK) != ZX_ZC_TAG_VAL)
+		return false;
+	*bp = (u16)(v & 0xffffu);
+	return true;
+}
+
+static inline bool zx_zc_in_pool(struct zx_eth_adapter *adapter,
+				 const void *head, u16 *bp)
+{
+	unsigned long off;
+
+	if (!adapter->pkt_pool || !head)
+		return false;
+	off = (unsigned long)head - (unsigned long)adapter->pkt_pool;
+	if (off >= ZX_BUF_POOL_SIZE || (off & (ZX_BUF_SIZE - 1)))
+		return false;
+	*bp = (u16)(off / ZX_BUF_SIZE);
+	return true;
+}
+
+/*
+ * 有多少个 bp 现在不在 BMU 空闲表里（在协议栈手里、在发送硬件里、在隔离环里）。
+ * 本机收包时 skb 会长期留在 socket 队列里，这个数会一直涨——实测 900 Mbit/s 灌
+ * 本机自己的 UDP 端口时它涨到 3132，池子被吃空，RX 再也拿不到缓冲，盒子直接
+ * 从网络消失。所以收包侧留了一道闸：超过 ZX_ZC_OUT_MAX 就退回拷贝路径，
+ * 保证转发/发送始终有缓冲可用。
+ */
+static inline u64 zx_zc_out(struct zx_eth_adapter *adapter)
+{
+	return adapter->zc_rx_ok - adapter->zc_tx_ok - adapter->zc_free_ok;
+}
+
+/* 池页引用计数垫高：让 page_frag_free() 的 put_page() 只减一、不真的还页 */
+static void zx_zc_park_pages(struct zx_eth_adapter *adapter)
+{
+	u32 i;
+
+	if (!adapter->pkt_pool)
+		return;
+	for (i = 0; i < ZX_BUF_POOL_SIZE; i += PAGE_SIZE) {
+		struct page *page = virt_to_page(adapter->pkt_pool + i);
+
+		if (page_ref_count(page) < ZX_ZC_PARK / 2)
+			page_ref_add(page, ZX_ZC_PARK);
+	}
+}
+
+static void zx_zc_unpark_pages(struct zx_eth_adapter *adapter)
+{
+	u32 i;
+
+	if (!adapter->pkt_pool)
+		return;
+	for (i = 0; i < ZX_BUF_POOL_SIZE; i += PAGE_SIZE)
+		set_page_count(virt_to_page(adapter->pkt_pool + i), 1);
+}
+
+/* 隔离环 / 回收（调用者持 zc_lock） */
+static void zx_zc_q_push(struct zx_eth_adapter *adapter, u16 bp)
+{
+	u32 next = (adapter->zc_q_tail + 1) % ZX_ZC_Q_LEN;
+
+	if (next == adapter->zc_q_head) {
+		/*
+		 * 环满：说明同一瞬间有 128 个包被协议栈丢掉（只在本机收包被灌
+		 * 满、或者 br_netfilter 那种会提前 orphan 的配置下才会发生）。
+		 * 把最老的一项立刻归还——它已经等过至少一次调度，宁可冒一次
+		 * 提前归还的风险，也不能让 bp 永久漏掉（漏掉的 bp 无法回收，
+		 * 只能靠重启）。
+		 */
+		u16 old = adapter->zc_q_bp[adapter->zc_q_head];
+
+		adapter->zc_q_ovf++;
+		adapter->zc_q_head = (adapter->zc_q_head + 1) % ZX_ZC_Q_LEN;
+		if (old != 0xffff && adapter->zc_state[old] == ZX_ZC_BS_DROPQ) {
+			adapter->zc_state[old] = ZX_ZC_BS_FREE;
+			if (zx_bmu_free_bp(adapter, old) == 0)
+				adapter->zc_free_ok++;
+		}
+	}
+	adapter->zc_q_bp[adapter->zc_q_tail] = bp;
+	adapter->zc_q_exp[adapter->zc_q_tail] = jiffies + 2;
+	adapter->zc_q_tail = next;
+}
+
+static void zx_zc_q_remove(struct zx_eth_adapter *adapter, u16 bp)
+{
+	u32 i;
+
+	for (i = adapter->zc_q_head; i != adapter->zc_q_tail;
+	     i = (i + 1) % ZX_ZC_Q_LEN) {
+		if (adapter->zc_q_bp[i] == bp) {
+			adapter->zc_q_bp[i] = 0xffff;
+			return;
+		}
+	}
+}
+
+static void zx_zc_reap(struct zx_eth_adapter *adapter)
+{
+	unsigned long now = jiffies;
+
+	spin_lock_bh(&adapter->zc_lock);
+	while (adapter->zc_q_head != adapter->zc_q_tail) {
+		u16 bp = adapter->zc_q_bp[adapter->zc_q_head];
+
+		if (time_before(now, adapter->zc_q_exp[adapter->zc_q_head]))
+			break;
+		adapter->zc_q_head = (adapter->zc_q_head + 1) % ZX_ZC_Q_LEN;
+		if (bp == 0xffff)
+			continue;
+		if (adapter->zc_state[bp] != ZX_ZC_BS_DROPQ)
+			continue;
+		adapter->zc_state[bp] = ZX_ZC_BS_FREE;
+		if (zx_bmu_free_bp(adapter, bp) == 0)
+			adapter->zc_free_ok++;
+	}
+	spin_unlock_bh(&adapter->zc_lock);
+}
+
+/* skb 走到生命尽头时唯一的信号。可能只是 skb_orphan()，所以只进隔离环 */
+static void zx_zc_destructor(struct sk_buff *skb)
+{
+	struct zx_eth_adapter *adapter = READ_ONCE(zx_zc_adapter);
+	u16 bp;
+
+	if (!adapter || !zx_zc_tag_get(skb, &bp) || bp >= ZX_NUM_BUFFERS)
+		return;
+	spin_lock(&adapter->zc_lock);
+	if (adapter->zc_state[bp] == ZX_ZC_BS_SKB) {
+		adapter->zc_state[bp] = ZX_ZC_BS_DROPQ;
+		zx_zc_q_push(adapter, bp);
+	}
+	spin_unlock(&adapter->zc_lock);
+}
+
+/*
+ * 发送侧：能从槽位直接发就返回 true 并给出 bp。不能发也要保证 bp 有人管：
+ *   - head 已经不在池子里（expand 过）：槽位已被放弃，这里直接归还；
+ *   - head 还在池子里但 data/长度对不上，或者是被克隆的 skb：什么都不做，
+ *     等 destrator 在真正释放时归还。
+ */
+static bool zx_zc_tx_take(struct zx_eth_adapter *adapter, struct sk_buff *skb,
+			  u16 *bpp)
+{
+	u16 bp;
+	u8 *slot;
+
+	if (!adapter->zc_rx || !zx_zc_tag_get(skb, &bp) || bp >= ZX_NUM_BUFFERS)
+		return false;
+	slot = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE;
+	if (skb->head != slot) {
+		/* 数据已经被搬到别处（pskb_expand_head），槽位可以还了 */
+		spin_lock(&adapter->zc_lock);
+		if (adapter->zc_state[bp] == ZX_ZC_BS_SKB) {
+			adapter->zc_state[bp] = ZX_ZC_BS_FREE;
+			spin_unlock(&adapter->zc_lock);
+			zx_bmu_free_bp(adapter, bp);
+			adapter->zc_fallback++;
+			return false;
+		}
+		spin_unlock(&adapter->zc_lock);
+		return false;
+	}
+	if (!skb->head_frag || skb->data != slot + 16 ||
+	    skb_headlen(skb) != skb->len || skb_shared(skb)) {
+		adapter->zc_fallback++;
+		return false;
+	}
+	spin_lock(&adapter->zc_lock);
+	zx_zc_q_remove(adapter, bp);
+	adapter->zc_state[bp] = ZX_ZC_BS_TX;
+	spin_unlock(&adapter->zc_lock);
+	adapter->zc_tx_ok++;
+	*bpp = bp;
+	return true;
+}
+
+/*
+ * GRO 只能这样改。register_netdevice() 在 probe 之后才给每张网卡强加
+ * NETIF_F_SOFT_FEATURES（GSO|GRO|GRO_FRAGLIST）并按它重算 wanted_features，
+ * 所以 probe 里清位会被注册流程盖回去（实测开机后 features 仍是 on）。真正
+ * 生效的时机是 ndo_open 和运行态开关，两处都写 features + wanted_features，
+ * 这样之后任何 netdev_update_features() 都不会把位算回来。
+ * 调用者必须持有 rtnl（ndo_open 和 zx_zc_set 都满足）。
+ */
+static void zx_gro_set(struct net_device *nd, bool on)
+{
+	if (on) {
+		nd->features |= NETIF_F_GRO;
+		nd->wanted_features |= NETIF_F_GRO;
+	} else {
+		nd->features &= ~NETIF_F_GRO;
+		nd->wanted_features &= ~NETIF_F_GRO;
+	}
+}
+
+/* 打开/关闭 zc，同时按需要开关 GRO（见上面第 3 条例外）
+ *
+ * GRO 位只由 zx_gro_set()（即 ndo_open 和这里）写，userspace 别用 ethtool
+ * 去改：把 hw_features 里的位清掉之后，`ethtool -K gro off` 走的是
+ * wanted_features 那条路，实测反而把 features 位留成 on（"on [fixed]"）。
+ */
+static void zx_zc_set(struct zx_eth_adapter *adapter, bool on)
+{
+	int i;
+
+	rtnl_lock();
+	for (i = 0; i < ZX_NUM_PORTS; i++) {
+		struct net_device *nd = adapter->ports[i];
+
+		if (!nd)
+			continue;
+		zx_gro_set(nd, !on);
+	}
+	rtnl_unlock();
+	WRITE_ONCE(adapter->zc_rx, on);
+	if (on) {
+		WRITE_ONCE(zx_zc_adapter, adapter);
+		zx_zc_park_pages(adapter);
+	} else {
+		adapter->zc_off_cnt++;
+	}
+}
+
 /* ---- TX path ------------------------------------------------------- */
 
+/*
+ * 池子的映射属性（缓存 / 非缓存）由 pool_cacheable 决定，两条路径的实测代价见
+ * docs/ffe-cacheable-pool-2026-10-30.md。预取（pld/pldw）在这颗 SoC 上是负收益：实测 1400 B
+ * 帧的接收拷贝 6.67 -> 9.85 us、发送拷贝+同步 15.09 -> 18.57 us，已回退。
+ */
 static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	struct zx_eth_priv *priv = netdev_priv(netdev);
@@ -947,6 +1269,10 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 	u32 tx_idx;
 	u8 *buf_ptr;
 	int bp;
+	u16 zcbp = 0;
+	u64 t_entry, t_reclaim, t_alloc, t_copy, t_start;
+
+	t_entry = ZX_TS();
 
 	if (len > 1536) {
 		dev_kfree_skb_any(skb);
@@ -956,6 +1282,7 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 
 	spin_lock_bh(&adapter->tx_lock);
 	zx_tx_reclaim(adapter);
+	t_reclaim = ZX_TS();
 	/*
 	 * The ports share the ring.  The queues are stopped as soon as it is
 	 * full, but another port's transmit may already be waiting for the
@@ -973,23 +1300,46 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 		return NETDEV_TX_OK;
 	}
 	len = skb->len;
-	bp = zx_bmu_alloc_bp(adapter);
-	if (bp < 0 || bp >= ZX_NUM_BUFFERS) {
-		spin_unlock_bh(&adapter->tx_lock);
-		dev_dstats_tx_dropped(netdev);
-		dev_kfree_skb_any(skb);
-		return NETDEV_TX_OK;
+	if (zx_zc_tx_take(adapter, skb, &zcbp)) {
+		/*
+		 * 零拷贝：帧本来就在这个槽位里，既不申请缓冲也不搬家，
+		 * 硬件发完自己把 bp 还回 BMU。
+		 */
+		bp = zcbp;
+		t_alloc = ZX_TS();
+	} else {
+		bp = zx_bmu_alloc_bp(adapter);
+		if (bp < 0 || bp >= ZX_NUM_BUFFERS) {
+			spin_unlock_bh(&adapter->tx_lock);
+			dev_dstats_tx_dropped(netdev);
+			dev_kfree_skb_any(skb);
+			return NETDEV_TX_OK;
+		}
+
+		t_alloc = ZX_TS();
+		buf_ptr = (u8 *)adapter->pkt_pool +
+			  ((u32)bp * ZX_BUF_SIZE) + 16;
+		if (skb_headlen(skb) >= len) {
+			memcpy(buf_ptr, skb->data, len);
+		} else if (skb_copy_bits(skb, 0, buf_ptr, len)) {
+			zx_bmu_free_bp(adapter, bp);
+			spin_unlock_bh(&adapter->tx_lock);
+			dev_dstats_tx_dropped(netdev);
+			dev_kfree_skb_any(skb);
+			return NETDEV_TX_OK;
+		}
+		/*
+		 * The pool is cacheable: push the frame we just copied out to
+		 * the point of coherence before the BMU reads it.
+		 */
+		if (adapter->pkt_pool_cacheable)
+			dma_sync_single_for_device(adapter->dev,
+						   adapter->pkt_pool_dma +
+						   (u32)bp * ZX_BUF_SIZE,
+						   16 + len, DMA_TO_DEVICE);
 	}
 
-	buf_ptr = (u8 *)adapter->buffer_pool + ((u32)bp * ZX_BUF_SIZE) + 16;
-	if (skb_copy_bits(skb, 0, buf_ptr, len)) {
-		zx_bmu_free_bp(adapter, bp);
-		spin_unlock_bh(&adapter->tx_lock);
-		dev_dstats_tx_dropped(netdev);
-		dev_kfree_skb_any(skb);
-		return NETDEV_TX_OK;
-	}
-
+	t_copy = ZX_TS();
 	tx_idx = adapter->tx_cur_idx % ZX_NUM_TX_DESC;
 	desc = (__le32 *)adapter->tx_ring + tx_idx * (ZX_DESC_SIZE / sizeof(*desc));
 
@@ -1007,6 +1357,15 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 
 	dma_wmb();
 	writel(1, base + ZX_DMA_TX_START);
+	t_start = ZX_TS();
+
+	if (unlikely(timing)) {
+		adapter->tx_stage_ns[0] += t_reclaim - t_entry;
+		adapter->tx_stage_ns[1] += t_alloc - t_reclaim;
+		adapter->tx_stage_ns[2] += t_copy - t_alloc;
+		adapter->tx_stage_ns[3] += t_start - t_copy;
+		adapter->tx_stage_n++;
+	}
 
 	adapter->tx_cur_idx++;
 	adapter->tx_pending++;
@@ -1041,6 +1400,13 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 {
 	int work_done = 0, q;
 
+	if (unlikely(adapter->zc_q_head != READ_ONCE(adapter->zc_q_tail)))
+		zx_zc_reap(adapter);
+	if (unlikely(adapter->zc_rx && time_after(jiffies, adapter->zc_park_at))) {
+		adapter->zc_park_at = jiffies + HZ;
+		zx_zc_park_pages(adapter);
+	}
+
 	for (q = ZX_RX_QUEUES - 1; q >= 0 && work_done < budget; q--) {
 		u32 avail = readl(adapter->base + ZX_DMA_RX_QUEUE_CNT(q)) & 0xffff;
 		u32 rel[2] = { 0, 0 };
@@ -1051,13 +1417,17 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 				       idx * ZX_DESC_SIZE;
 			u16 bp, len;
 			int port;
+			bool zc;
 			struct sk_buff *skb;
 			struct net_device *dest_dev;
+			u64 t0, t1, t2, t3, t4, t5;
 
+			t0 = ZX_TS();
 			dma_rmb();
 			bp = (((u8 *)desc)[7] >> 1) | ((u16)((u8 *)desc)[8] << 7);
 			len = (le32_to_cpu(desc[3]) >> 2) & 0x3fff;
 			port = (((u8 *)desc)[6] >> 3) ? ((((u8 *)desc)[6] >> 3) - 1) : 0;
+			t1 = ZX_TS();
 
 			if (bp >= ZX_NUM_BUFFERS || len < ETH_HLEN || len > 1536) {
 				u32 scan, idx2, found = 0;
@@ -1123,9 +1493,24 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 				continue;
 			}
 
+			/*
+			 * The frame sits in cacheable memory that the BMU wrote
+			 * by DMA: drop the stale cache lines before the CPU
+			 * touches it.  The 16 B header and the frame live in the
+			 * same 32 B aligned slot, so one invalidate covers both
+			 * (and never reaches into the next slot).
+			 */
+			if (adapter->pkt_pool_cacheable)
+				dma_sync_single_for_cpu(adapter->dev,
+							adapter->pkt_pool_dma +
+							(u32)bp * ZX_BUF_SIZE,
+							16 + len,
+							DMA_FROM_DEVICE);
+			t2 = ZX_TS();
+
 			/* Aliasing detector: frames from one of our own addresses */
 			if (len >= ETH_HLEN) {
-				u8 *d = adapter->buffer_pool + bp * ZX_BUF_SIZE + 16;
+				u8 *d = adapter->pkt_pool + bp * ZX_BUF_SIZE + 16;
 
 				if (zx_is_own_addr(adapter, d + ETH_ALEN)) {
 					adapter->rx_alias_cnt++;
@@ -1148,28 +1533,79 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			/* Deliver to the netdev of the ingress port */
 			dest_dev = port < ZX_NUM_PORTS ? adapter->ports[port] : NULL;
 
-			skb = napi_alloc_skb(&adapter->napi, len);
+			/*
+			 * 零拷贝：把槽位本身做成 skb 交给协议栈，bp 先不还。
+			 * 之后由发送路径交给硬件（硬件发完自己归还），或者由
+			 * destructor 在协议栈丢包时放回隔离环。
+			 */
+			zc = false;
+			skb = NULL;
+			if (adapter->zc_rx && dest_dev &&
+			    (dest_dev->flags & IFF_UP) && len >= ZX_ZC_MIN_LEN) {
+				if (zx_zc_out(adapter) >= ZX_ZC_OUT_MAX) {
+					adapter->zc_capped++;
+					if (net_ratelimit())
+						dev_warn_ratelimited(adapter->dev,
+						     "zero-copy paused: %llu buffers outside the BMU\n",
+						     zx_zc_out(adapter));
+					goto zc_skip;
+				}
+				skb = build_skb(adapter->pkt_pool +
+						(u32)bp * ZX_BUF_SIZE,
+						ZX_BUF_SIZE);
+				if (skb) {
+					zx_zc_tag_set(skb, bp);
+					skb->destructor = zx_zc_destructor;
+					adapter->zc_state[bp] = ZX_ZC_BS_SKB;
+					skb_reserve(skb, 16);
+					skb_put(skb, len);
+					zc = true;
+				}
+			}
+zc_skip:
+			if (!zc)
+				skb = napi_alloc_skb(&adapter->napi, len);
 			if (skb && dest_dev && (dest_dev->flags & IFF_UP)) {
-				dma_rmb();
-				memcpy(skb_put(skb, len), adapter->buffer_pool +
-				       bp * ZX_BUF_SIZE + 16, len);
+				if (!zc) {
+					dma_rmb();
+					memcpy(skb_put(skb, len),
+					       adapter->pkt_pool +
+					       bp * ZX_BUF_SIZE + 16, len);
+				} else {
+					adapter->zc_rx_ok++;
+				}
+				t3 = ZX_TS();
 				skb->dev = dest_dev;
 				skb->protocol = eth_type_trans(skb, dest_dev);
 				napi_gro_receive(&adapter->napi, skb);
+				t4 = ZX_TS();
 				dev_dstats_rx_add(dest_dev, len);
 			} else {
 				if (skb)
 					dev_kfree_skb_any(skb);
 				if (dest_dev)
 					dev_dstats_rx_dropped(dest_dev);
+				/*
+				 * zc 的 bp 已经由 destructor 放进隔离环；非 zc
+				 * 的 bp 由下面 !zc 分支归还。
+				 */
 			}
 
 			zx_rx_consume(desc, rel);
 			adapter->rx_cur_idx[q]++;
 			work_done++;
 			avail--;
-			if (zx_bmu_free_bp(adapter, bp))
+			if (!zc && zx_bmu_free_bp(adapter, bp))
 				adapter->bmu_free_fail++;
+			t5 = ZX_TS();
+			if (unlikely(timing)) {
+				adapter->rx_stage_ns[0] += t1 - t0;
+				adapter->rx_stage_ns[1] += t2 - t1;
+				adapter->rx_stage_ns[2] += t3 - t2;
+				adapter->rx_stage_ns[3] += t4 - t3;
+				adapter->rx_stage_ns[4] += t5 - t4;
+				adapter->rx_stage_n++;
+			}
 		}
 		if (rel[0] || rel[1])
 			dma_wmb();
@@ -1235,6 +1671,10 @@ static int zx_eth_open(struct net_device *netdev)
 		writel(~ZX_TM_INT_RX, adapter->base + ZX_TM_INT_MASK);
 	}
 	adapter->open_count++;
+
+	/* 每张网口 open 的时候按当前 zc 状态定 GRO（注册流程会强加 GRO，
+	 * 所以关它的唯一可靠时机在这里，见 zx_gro_set）。 */
+	zx_gro_set(netdev, !READ_ONCE(adapter->zc_rx));
 
 	phylink_start(priv->phylink);
 	netif_start_queue(netdev);
@@ -1501,12 +1941,52 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 	seq_printf(s, "ppe_active=%u ppe_flows=%u ppe_add_skip=%u ppe_add_fail=%u\n",
 		   adapter->ppe_active, adapter->ppe_count,
 		   adapter->ppe_add_skip, adapter->ppe_add_fail);
+	if (adapter->rx_stage_n) {
+		u32 n = adapter->rx_stage_n;
+		int j;
+
+		seq_printf(s, "rx阶段(ns/包) 描述符 %llu 无效化 %llu 分配+拷贝 %llu 上送 %llu 归还 %llu 合计 %llu n=%u\n",
+			   div_u64(adapter->rx_stage_ns[0], n),
+			   div_u64(adapter->rx_stage_ns[1], n),
+			   div_u64(adapter->rx_stage_ns[2], n),
+			   div_u64(adapter->rx_stage_ns[3], n),
+			   div_u64(adapter->rx_stage_ns[4], n),
+			   div_u64(adapter->rx_stage_ns[0] + adapter->rx_stage_ns[1] +
+				   adapter->rx_stage_ns[2] + adapter->rx_stage_ns[3] +
+				   adapter->rx_stage_ns[4], n), n);
+		for (j = 0; j < 5; j++)
+			adapter->rx_stage_ns[j] = 0;
+		adapter->rx_stage_n = 0;
+	}
+	if (adapter->tx_stage_n) {
+		u32 n = adapter->tx_stage_n;
+		int j;
+
+		seq_printf(s, "tx阶段(ns/包) 回收 %llu 申请BMU %llu 拷贝+同步 %llu 启动 %llu 合计 %llu n=%u\n",
+			   div_u64(adapter->tx_stage_ns[0], n),
+			   div_u64(adapter->tx_stage_ns[1], n),
+			   div_u64(adapter->tx_stage_ns[2], n),
+			   div_u64(adapter->tx_stage_ns[3], n),
+			   div_u64(adapter->tx_stage_ns[0] + adapter->tx_stage_ns[1] +
+				   adapter->tx_stage_ns[2] + adapter->tx_stage_ns[3], n), n);
+		for (j = 0; j < 4; j++)
+			adapter->tx_stage_ns[j] = 0;
+		adapter->tx_stage_n = 0;
+	}
 	seq_printf(s, "sw_members=%#x sw_fdb_deleted=%u\n",
 		   adapter->sw_members,
 		   adapter->sw_fdb_deleted);
 	seq_printf(s, "bmu_alloc_fail=%u bmu_alloc_late=%u bmu_free_fail=%u bmu_free_slots=%u\n",
 		   adapter->bmu_alloc_fail, adapter->bmu_alloc_late,
 		   adapter->bmu_free_fail, adapter->bmu_free_slots);
+	seq_printf(s, "zc_rx=%d rx_ok=%llu tx_ok=%llu free_ok=%llu out=%lld fallback=%llu q_ovf=%llu capped=%llu off=%llu\n",
+		   READ_ONCE(adapter->zc_rx), adapter->zc_rx_ok,
+		   adapter->zc_tx_ok, adapter->zc_free_ok,
+		   (long long)adapter->zc_rx_ok -
+			   (long long)adapter->zc_tx_ok -
+			   (long long)adapter->zc_free_ok,
+		   adapter->zc_fallback, adapter->zc_q_ovf,
+		   adapter->zc_capped, adapter->zc_off_cnt);
 
 	for (i = 0; i < 0x100; i += 4)
 		seq_printf(s, "bmu+%03x=%08x\n", i,
@@ -1536,12 +2016,75 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
  * The driver cannot be unbound (suppress_bind_attrs) and has no remove
  * function, so the directory stays until reboot.
  */
+/* "zc": 读当前开关与未归还 bp 计数，写 0/1 切换（同一镜像里做 A/B） */
+static int zx_eth_zc_show(struct seq_file *s, void *data)
+{
+	struct zx_eth_adapter *adapter = s->private;
+	long long out = (long long)adapter->zc_rx_ok -
+			(long long)adapter->zc_tx_ok -
+			(long long)adapter->zc_free_ok;
+
+	seq_printf(s, "%d\n", READ_ONCE(adapter->zc_rx));
+	seq_printf(s, "rx_ok=%llu tx_ok=%llu free_ok=%llu out=%lld fallback=%llu q_ovf=%llu capped=%llu off=%llu\n",
+		   adapter->zc_rx_ok, adapter->zc_tx_ok, adapter->zc_free_ok,
+		   out, adapter->zc_fallback, adapter->zc_q_ovf,
+		   adapter->zc_capped, adapter->zc_off_cnt);
+	return 0;
+}
+
+static int zx_eth_zc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_eth_zc_show, inode->i_private);
+}
+
+static ssize_t zx_eth_zc_write(struct file *file, const char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct zx_eth_adapter *adapter = s->private;
+	char buf[8];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = 0;
+
+	zx_zc_set(adapter, buf[0] == '1');
+	dev_info(adapter->dev, "zero-copy %s\n",
+		 READ_ONCE(adapter->zc_rx) ? "enabled" : "disabled");
+	return count;
+}
+
+static const struct file_operations zx_eth_zc_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_eth_zc_open,
+	.read		= seq_read,
+	.write		= zx_eth_zc_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 {
 	struct dentry *dir = debugfs_create_dir(dev_name(adapter->dev), NULL);
 
 	debugfs_create_devm_seqfile(adapter->dev, "dma_state", dir,
 				    zx_eth_dma_state_show);
+	debugfs_create_file("zc", 0644, dir, adapter, &zx_eth_zc_fops);
+}
+
+static void zx_pkt_pool_free(struct device *dev,
+			     struct zx_eth_adapter *adapter)
+{
+	zx_zc_unpark_pages(adapter);
+	if (!adapter->pkt_pool_cacheable || !adapter->pkt_pool)
+		return;
+	dma_unmap_single(dev, adapter->pkt_pool_dma, ZX_BUF_POOL_SIZE,
+			 DMA_BIDIRECTIONAL);
+	free_pages_exact(adapter->pkt_pool, ZX_BUF_POOL_SIZE);
+	adapter->pkt_pool = NULL;
+	adapter->pkt_pool_cacheable = false;
 }
 
 static int zx_eth_probe(struct platform_device *pdev)
@@ -1612,6 +2155,62 @@ static int zx_eth_probe(struct platform_device *pdev)
 		ret = -ENOMEM;
 		goto err_hashtable;
 	}
+	/*
+	 * Packet buffers: 8 MiB, physically contiguous.  Two mappings are
+	 * possible, and which one is cheaper depends on how expensive this
+	 * SoC's cache maintenance is, measured per frame:
+	 *
+	 *   cacheable (streaming mapping):  1 invalidate per RX frame
+	 *                                   + 1 clean per TX frame
+	 *   uncached  (coherent arena):     no maintenance, but every payload
+	 *                                   byte is read/written uncached
+	 *
+	 * On the ZX279128S one cache-line maintenance op costs about as much
+	 * as a 32 B uncached read (~160 ns), so a 1400 B frame pays 8.4 us of
+	 * invalidate + clean on top of the copies, while the uncached path
+	 * reads 1400 B in 7.4 us and *writes* it in 0.75 us (writes coalesce).
+	 * The uncached mapping therefore wins on transmit by a wide margin;
+	 * pool_cacheable=1 selects the cacheable one for A/B tests.
+	 */
+	if (pool_cacheable) {
+		adapter->pkt_pool = alloc_pages_exact(ZX_BUF_POOL_SIZE,
+						      GFP_KERNEL | __GFP_ZERO);
+		if (adapter->pkt_pool) {
+			adapter->pkt_pool_dma =
+				dma_map_single(dev, adapter->pkt_pool,
+					       ZX_BUF_POOL_SIZE,
+					       DMA_BIDIRECTIONAL);
+			if (dma_mapping_error(dev, adapter->pkt_pool_dma)) {
+				free_pages_exact(adapter->pkt_pool,
+						 ZX_BUF_POOL_SIZE);
+				adapter->pkt_pool = NULL;
+			} else {
+				adapter->pkt_pool_cacheable = true;
+			}
+		}
+	}
+	if (!adapter->pkt_pool) {
+		adapter->pkt_pool = adapter->buffer_pool;
+		adapter->pkt_pool_dma = adapter->buf_pool_dma;
+	}
+
+	/*
+	 * 零拷贝的状态表。zc_rx 打开时把池页引用计数垫高，并把 adapter
+	 * 登记给 skb destructor（SoC 上只有一个以太网控制器）。
+	 */
+	adapter->zc_state = devm_kzalloc(dev, ZX_NUM_BUFFERS, GFP_KERNEL);
+	if (!adapter->zc_state) {
+		ret = -ENOMEM;
+		goto err_dma;
+	}
+	spin_lock_init(&adapter->zc_lock);
+	WRITE_ONCE(adapter->zc_rx, zc_rx);
+	if (zc_rx) {
+		zx_zc_park_pages(adapter);
+		WRITE_ONCE(zx_zc_adapter, adapter);
+		dev_info(dev, "zero-copy RX/TX on the packet pool enabled\n");
+	}
+
 	adapter->tab0 = adapter->buffer_pool + ZX_TAB0_OFFSET;
 	adapter->tab0_dma = adapter->buf_pool_dma + ZX_TAB0_OFFSET;
 	adapter->tab1 = adapter->buffer_pool + ZX_TAB1_OFFSET;
@@ -1660,8 +2259,20 @@ static int zx_eth_probe(struct platform_device *pdev)
 		netdev->pcpu_stat_type = NETDEV_PCPU_STAT_DSTATS;
 		netdev->hw_features |= NETIF_F_HW_TC;
 		netdev->features |= NETIF_F_HW_TC;
+		/*
+		 * 零拷贝的 skb 就是这个槽位本身，GRO 一旦合并，frags 会指向
+		 * 别的槽位，那条 bp 就再也没人回收了（见 zx_zc_* 一节）。
+		 * 但这里不能关：注册流程在这之后才强加 SOFT_FEATURES，
+		 * 关它的是 ndo_open / zx_zc_set 里的 zx_gro_set()。
+		 */
 		netdev->min_mtu    = 68;
 		netdev->max_mtu    = 1500;
+		/*
+		 * 默认 fq_codel 会排 1000 帧，转发器排这么深只会把延迟堆起来；
+		 * 零拷贝时这些排队的 skb 还各占一个池缓冲。64 帧够吸收突发，
+		 * 又能让 bp 尽快回到 BMU。
+		 */
+		netdev->tx_queue_len = 64;
 		priv = netdev_priv(netdev);
 		priv->netdev  = netdev;
 		priv->adapter = adapter;
@@ -1783,6 +2394,7 @@ err_disconnect:
 	}
 err_dma:
 	/* A failed or deferred probe must leave no DMA targeting this arena. */
+	zx_pkt_pool_free(dev, adapter);
 	zx_hw_reset(adapter);
 	dma_free_coherent(dev, ZX_DMA_ARENA_SIZE, adapter->buffer_pool,
 			  adapter->buf_pool_dma);

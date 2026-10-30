@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 include $(TOPDIR)/rules.mk
 
-LUCI_TITLE:=E2631 board page: slots, online update, switch back to stock
+LUCI_TITLE:=E2631 board pages: slots, online update, switch back to stock, fast-path toggle
 LUCI_DEPENDS:=+luci-base +e2631-fwslot
 
 PKG_VERSION:=1.0.0

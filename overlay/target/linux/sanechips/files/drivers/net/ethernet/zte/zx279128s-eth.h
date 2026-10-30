@@ -221,6 +221,16 @@
 #define ZX_BUF_SIZE		2048
 #define ZX_BUF_POOL_SIZE	(ZX_NUM_BUFFERS * ZX_BUF_SIZE)
 
+/* 零拷贝：槽位所有权的隔离环长度、池页引用计数垫高值、未归还 bp 的告警门限 */
+#define ZX_ZC_Q_LEN		512
+#define ZX_ZC_PARK		(1u << 20)
+/*
+ * 留在 BMU 外面的 bp 上限。池子 4096 个，收发环各 1024、qdisc 64、隔离环 512，
+ * 留一半给数据面才不会在拥塞时被自己掐住；本机收包被灌满时靠这道闸兜底。
+ */
+#define ZX_ZC_OUT_MAX		2048
+#define ZX_ZC_MIN_LEN		128
+
 /* Free-index tables (written big-endian u16 per U-Boot convention) */
 #define ZX_TAB0_ENTRIES		ZX_NUM_BUFFERS
 #define ZX_TAB1_ENTRIES		512
@@ -301,6 +311,20 @@ struct zx_eth_adapter {
 	/* DMA arena remains allocated across down/up */
 	void			*buffer_pool;
 	dma_addr_t		buf_pool_dma;
+
+	/*
+	 * Packet buffers live in their own cacheable allocation, mapped with
+	 * the streaming API - not inside the coherent arena above.  The BMU
+	 * writes frames straight into this pool; reading them out of uncached
+	 * memory cost 8.2 us per 1500 B frame (measured with /dev/mem:
+	 * 184 MB/s, against 0.48 us for the same copy in cached memory), which
+	 * was the largest single per-packet cost on the software forwarding
+	 * path.  Every access is bracketed by
+	 * dma_sync_single_for_{cpu,device}() instead.
+	 */
+	void			*pkt_pool;
+	dma_addr_t		pkt_pool_dma;
+	bool			pkt_pool_cacheable;
 	void			*tx_ring;
 	dma_addr_t		tx_ring_dma;
 	void			*rx_ring;
@@ -326,6 +350,38 @@ struct zx_eth_adapter {
 	u32			rx_nobuf_cnt;
 	u32			rx_rel_fail;
 	u32			rx_bad_cnt;
+
+	/*
+	 * 每包耗时分解（临时调试用）。收包五段：解析描述符、缓存无效化、
+	 * memcpy、上送协议栈（napi_gro_receive）、归还 BMU 缓冲；发包四段：
+	 * 回收完成、申请 BMU 缓冲、拷贝+同步、写 TX_START。dma_state 打印
+	 * 平均值，用来定位转发那 20 µs 到底花在哪一步。
+	 */
+	u64			rx_stage_ns[5];
+	u32			rx_stage_n;
+	u64			tx_stage_ns[4];
+	u32			tx_stage_n;
+
+	/*
+	 * 零拷贝。zc_state[bp] 记录一个池缓冲归谁：FREE（在 BMU 空闲表里）、
+	 * SKB（在协议栈手里）、DROPQ（skb 已释放，等隔离到期归还）、TX（已交给
+	 * 发送硬件，硬件发完自己归还）。详见 zx279128s-main.c 里 zx_zc_* 的说明。
+	 */
+	bool			zc_rx;
+	u8			*zc_state;
+	spinlock_t		zc_lock;
+	u32			zc_q_bp[ZX_ZC_Q_LEN];
+	unsigned long		zc_q_exp[ZX_ZC_Q_LEN];
+	u32			zc_q_head;
+	u32			zc_q_tail;
+	u64			zc_rx_ok;
+	u64			zc_tx_ok;
+	u64			zc_free_ok;
+	u64			zc_fallback;
+	u64			zc_q_ovf;
+	u64			zc_capped;
+	u64			zc_off_cnt;
+	unsigned long		zc_park_at;
 
 	/* TX ring, BMU buffer allocation and the TX counters */
 	spinlock_t		tx_lock;
