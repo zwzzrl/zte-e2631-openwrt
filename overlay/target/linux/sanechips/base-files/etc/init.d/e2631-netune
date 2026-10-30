@@ -32,12 +32,15 @@
 #
 #  GRO - the driver feeds napi_gro_receive() unconditionally but the feature
 #    bit decides whether anything is merged, and the *driver* owns that bit
-#    now: zero-copy skbs are the pool slot itself, so GRO has to stay off while
-#    zc is on, and it goes back on when zc is off (both directions written in
-#    zx_eth_probe/zx_zc_set).  This script used to set it with ethtool -K; it
-#    no longer does, because on this kernel `ethtool -K gro off` with GRO
-#    outside hw_features goes through wanted_features and measured up leaving
-#    the bit *on* ("on [fixed]").
+#    now: it goes off while zc is on and back on when zc is off (both
+#    directions written in zx_eth_open/zx_zc_set).  Reason is on the TX side,
+#    not bp accounting: merged aggregates must be segmented for a 1500 B frame
+#    and this driver has no SG/TSO, so segment 2..N are memcpy'd - measured
+#    15.2 -> 28.7 us of sirq per packet and UDP 900M loss 0.95 -> 22 % with GRO
+#    on (docs/ffe-zero-copy-2026-10-30.md §6.6).  This script used to set the
+#    bit with ethtool -K; it no longer does, because on this kernel
+#    `ethtool -K gro off` with GRO outside hw_features goes through
+#    wanted_features and measured up leaving the bit *on* ("on [fixed]").
 #
 #  zero-copy (uci e2631.fastpath.zerocopy, default 1) - the driver defaults to
 #    on already, but the module parameter cannot be changed on this build (the

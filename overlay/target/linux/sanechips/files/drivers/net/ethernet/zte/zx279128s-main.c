@@ -1003,8 +1003,11 @@ static void zx_tx_reclaim(struct zx_eth_adapter *adapter)
  * 另外 skb 可能被 pskb_expand_head() 换成新的 head（例如要更多 headroom，或者
  * GRO 合并）。expand 会把 shinfo 连同 destructor_arg 一起抄到新 head，所以我们
  * 仍然能从这个标记里找回 bp；只是数据已经不在槽位里了，发送时退回拷贝路径。
- * 这也是开 zc 时必须关掉 GRO 的原因：GRO 合并后 frags 会指向别的槽位，那条 bp
- * 就没人回收了。
+ * 这也是开 zc 时必须关掉 GRO 的原因，但**不是**因为 bp 会被漏掉：实测开着 GRO
+ * 时 out 一直平、frag_list 成员的析构会跑（docs/ffe-zero-copy-2026-10-30.md §6.6）。
+ * 真正的原因在发送侧：合并出的聚合体要拆段，而这份驱动的发送描述符里一个 bp 只能
+ * 放一整帧、没有 SG/TSO，拆段的第 2..N 段只能 memcpy 出新 skb，零拷贝的收益被
+ * 抵消一半以上 —— 实测每包软中断 15.2 → 28.7 µs、UDP 900M 丢包 0.95 % → 22 %。
  */
 #define ZX_ZC_TAG_VAL	0x5ac00000u
 #define ZX_ZC_TAG_MASK	0xffff0000u

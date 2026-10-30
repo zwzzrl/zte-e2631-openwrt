@@ -62,12 +62,14 @@
 
 任何一条破了，症状都是"慢慢变卡 / 池被抽干 / 串包"，都不会立刻崩，所以写在这里：
 
-1. **GRO 必须关。** zc 的 skb 就是槽位本身；GRO 一旦把它合并成 `frag_list`，聚合里的
-   后续段指向别的槽位，那条 `bp` 就再也没人回收。GRO 这个 feature 位**只由驱动写**
-   （`zx_eth_open()` 与 `zx_zc_set()` 里的 `zx_gro_set()`），**不要用 ethtool**：
-   实测 `ethtool -K lan1 gro off` 反而把 `features` 位留成 on（`ethtool -k` 显示
-   `on [fixed]`）——`register_netdevice()` 会强加 `NETIF_F_SOFT_FEATURES`（含 GRO），
-   而 ethtool 在特性不在 `hw_features` 时走 `wanted_features` 那条路，正好反着来。
+1. **GRO 必须关。** 理由**不是**"合并会漏 bp"——本轮实测推翻了那条（见 §6.6：`out`
+   一直平，`frag_list` 成员的析构会跑），而是发送侧：合并出来的聚合体要拆段，而发送
+   描述符一个 `bp` 只能放一整帧、没有 SG/TSO，第 2..N 段只能 `memcpy` 出新 skb，零拷贝
+   的收益被抵消一半以上。GRO 这个 feature 位**只由驱动写**（`zx_eth_open()` 与
+   `zx_zc_set()` 里的 `zx_gro_set()`），**不要用 ethtool**：实测 `ethtool -K lan1 gro off`
+   反而把 `features` 位留成 on（`ethtool -k` 显示 `on [fixed]`）——`register_netdevice()`
+   会强加 `NETIF_F_SOFT_FEATURES`（含 GRO），而 ethtool 在特性不在 `hw_features` 时走
+   `wanted_features` 那条路，正好反着来。
 2. **`tx_queue_len = 64`。** qdisc 里排队的 skb 每个占一个池缓冲，默认 1000 会把池抽干。
 3. **`ZX_ZC_OUT_MAX = 2048`。** 栈最多能同时占住 4096 个池缓冲里的一半；超过就整段退回
    拷贝路径（`capped` 计数 + 一条 ratelimited 内核日志）。这个闸门是"池被抽干导致整台
@@ -161,6 +163,31 @@ ssh / HTTP 这类单流只有 20~30 % 损失，所以这是"4 个满速 socket �
 （`uci: Entry not found`，rc=1，实测）。所以 uci-defaults 与 rpcd 里都是**直接写文件**，
 文件已存在时才走 `uci set`/`commit`。
 
+### 6.6 GRO 与 zc：实测不能共存（原先的理由是错的）
+
+第一版写的是"GRO 合并后 frags 指向别的槽位、那条 bp 没人回收"。本轮实测**推翻了这一条**：
+把 GRO 打开再跑转发，`out` 一直在 0–120 之间、`bmu_alloc_fail=0`、`free_ok` 正常增长——
+`frag_list` 成员的析构确实会跑。真正的代价在发送侧。同机同时段 A/B（zc 都开着，只切 GRO）：
+
+| 项目 | GRO 关 | GRO 开 |
+|---|---|---|
+| 8 流 TCP 转发 | **641 Mbit/s** | 473 Mbit/s |
+| UDP 900 M 单流 | **747 Mbit/s（丢 0.95 %）** | 565 Mbit/s（丢 22 %） |
+| 每包软中断（两核合计，同口径 sirq÷收包数） | **15.2 µs** | 28.7 µs |
+
+机制：GRO 把几十个包并成一个聚合体，聚合体在 TX 侧必须拆段才能发（1200–1500 B/帧，驱动
+没有 SG/TSO），`skb_segment()` 的第 1 段复用原来的池 skb（零拷贝仍生效），第 2..N 段因为
+发送描述符一个 `bp` 只能放一整帧，只能 `memcpy` 出新的 skb。等于把每包一次拷贝又要回来
+一半以上；UDP 那 22 % 丢包是 RX 侧来不及收、FIFO 溢出。
+
+**结论（也解释了为什么"用 GRO 摊薄栈成本"这条路走不通）**：发送描述符没有 scatter-gather，
+一个 `bp` = 一整帧，所以"合并"永远要在拆段时付拷贝。zc 想省的东西和 GRO 想省的东西在
+这份硬件上互相抵消。
+
+顺带记一个未复现现象：那一轮刚开始的 8 流 TCP 里盒子重启过一次（计数器与 uptime 归零），
+之后用 syslog 流抓了两轮同样负载都没再复现，也没有任何内核警告。不写进结论，只留档：
+以后真要做 zc + GRO，先解释它。
+
 ### 6.5 `q_ovf` 的含义
 
 隔离环满时挤掉最老条目并**立刻**归还 bp —— 等价于"这条没有隔离窗口"。
@@ -187,6 +214,9 @@ ssh root@<盒子> "uci set e2631.fastpath.zerocopy=0 && uci commit e2631 && /etc
 
 ## 8. 下一步（按收益排序）
 
+0. **（本轮已证伪）靠 GRO 摊薄栈入口**：见 §6.6，发送侧没有 SG，合并必然在拆段时拷贝，
+   实测吞吐与丢包都变差。留在协议栈里的路只剩下面第 1 条那种"少碰字节"的优化，
+   想追平原厂 4.7 µs 只能走驱动内流快路（不进 `netif_receive_skb`）。
 1. **本机终结路径**：§6.2 的水位闸门 + 给 `build_skb` 留 headroom，让协议栈少碰非缓存字节。
 2. **校验和卸载**：`rx-checksumming`/`tx-checksumming` 现在都是 off，本机终结的 TCP 每包
    还要在非缓存内存上算一遍 checksum。
