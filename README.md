@@ -107,6 +107,10 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
    **IPv6 不会被加速**：IPv6 帧仍然上送 CPU（有意的取舍，见 `docs/architecture.md`）。
    容量上限 127 条流（≈60 条双向连接，7 位改写索引的硬件宽度），溢出回落软件路径；
    PPPoE 上行可能不走硬件路径。
+   v6 虽然拿不到硬件快转，nft flowtable 的**软件快转**对它同样有效（2026-10-30 实测：
+   `Ip6OutForwDatagrams` 从逐包 +1 变为 15 s 只 +几百，8 流 392–412 Mbit/s；同时把 RPS
+   从"和网卡中断同一个核"改成分核，+12 %）。数字、判据与复现脚本见
+   [docs/v6-software-fastpath-2026-10-30.md](docs/v6-software-fastpath-2026-10-30.md)。
 2. **Wi-Fi 开机自启（默认开启）**：时序与恢复机制来自 tigaotg 的交接 PR#1（真机验证过双频自动
    广播、改 SSID/密码重启保留）。首次开机配 WPA2-PSK（密码由本机 MAC 派生并打印在 console），
    绝不广播开放网络；上次启动未完成则跳过本次自启。不想要：`touch /etc/e2631-wifi-noautoload`。

@@ -953,6 +953,36 @@ points at something in the repository or at a measurement.
     hairpin, so a genuinely forwarded flow) ran at 934 Mbit/s with ppe_flows=4, ppe_add_skip=0,
     ppe_add_fail=0
   next: none - but note that this counter existed in the built-in driver too, so this was not introduced by the module split, only exposed by it (the reload path was never reachable before)
+- id: V6-SOFT-FASTPATH
+  severity: minor
+  status: mitigated
+  surface: ethernet + ipv6
+  symptom: not a bug - the record of what IPv6 routed forwarding can do on this board (software fastpath only), where it tops out and which defaults are correct
+  verified: |
+    yes - 2026-10-30, slot1 OpenWrt v12fix, routed v6, 8 TCP streams x 15 s:
+    flow_offloading=0 -> 310 Mbit/s and Ip6OutForwDatagrams +338939 (every packet through
+    ip6_forward); flow_offloading=1 -> 392-412 Mbit/s and +~200 (the flowtable carries v6);
+    L2 control lan<->lan 929/942 Mbit/s with 0 % sirq; box terminating 4 streams 451 Mbit/s
+  cause: |
+    There is no hardware fast path for v6 on this SoC (the PPE classifier does not take v6 -
+    docs/ppe-ipv6-external-hash-2026-10-31.md), so the data plane is always driver RX ->
+    stack -> driver TX. The per-packet cost of zx279128s-eth (BMU free with spinlock + MMIO,
+    a 1.5 KB memcpy per RX into napi_alloc_skb, another copy per TX, no checksum offload)
+    puts the saturation point near 400 Mbit/s for 8 streams, with both cores still below
+    100 % - i.e. the ceiling is per-packet cost, not a single pegged core.
+  workaround: |
+    uci firewall.@defaults[0].flow_offloading=1 plus flow_offloading_hw=1 (already the shipped
+    default; hw=1 only matters for IPv4, v6 silently falls back to software), and keep RPS on
+    a different core than the gmac IRQ. That last part was wrong in e2631-netune until
+    2026-10-30: IRQ and RPS were both pinned to CPU1, measured 341-374 Mbit/s with CPU1 at
+    81-89 % sirq; moving RPS to CPU0 gave 392-412 Mbit/s (+12 %). Fixed in
+    etc/init.d/e2631-netune, etc/hotplug.d/iface/20-e2631-netune and sbin/e2631-netune-apply.
+    The XPS writes in those scripts were always no-ops (single TX queue, xps_cpus reads
+    ENOENT) and are gone.
+  next: |
+    single-stream 145 Mbit/s (window vs per-packet cost), the 0.3-0.5 % retransmits on a LAN
+    path with softnet time_squeeze, and the driver per-packet cost if 700 Mbit/s+ is wanted.
+    Numbers and harness: docs/v6-software-fastpath-2026-10-30.md
 ```
 
 ## WIFI-ASSOC-HARD-HANG

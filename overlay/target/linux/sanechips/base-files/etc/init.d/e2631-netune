@@ -1,16 +1,28 @@
 #!/bin/sh /etc/rc.common
 # Dual-core load spreading for the gmac ports, applied every boot (sysfs
-# does not persist).  Three independent knobs, each with its evidence:
+# does not persist).  Four independent knobs, each with its evidence:
 #
-#  RPS/XPS to CPU1 - the gmac has one RX ring and the driver's NAPI lives on
-#    whichever core takes the IRQ (always CPU0 here).  Pushing the per-packet
-#    work to the idle core measured +4.6% before the flow offload existed;
-#    with established flows offloaded to the PPE, what remains is exactly
-#    this first-packet path, so the knob still earns its keep.
+#  RPS on CPU0 with the IRQ on CPU1 - one RX ring shares one IRQ line for
+#    every port, so the driver's NAPI always runs on the IRQ's core.  Leaving
+#    the protocol stack on the *other* core is what keeps a single core from
+#    carrying both halves.  History: the original tuning put the IRQ on CPU0
+#    and RPS on CPU1 (a split) and measured +4.6 %; a later change pinned the
+#    IRQ to CPU1 as well ("keep the softirq local to the IRQ"), which put both
+#    halves back on one core and was never re-measured on a CPU-bound path.
+#    Measured 2026-10-30 on routed IPv6 with software flow offload (the only
+#    v6 fast path this board has), 8 TCP streams x 15 s, several runs each:
+#       IRQ CPU1 + RPS CPU1 (both halves on one core)
+#                                    341-374 Mbit/s, CPU1 sirq 81-89 %
+#       IRQ CPU1 + RPS CPU0 (split)  392-410 Mbit/s, CPU1 sirq 72-77 %,
+#                                    CPU0 32-34 %
+#    i.e. +12 % and neither core permanently pegged.  On the IPv4 PPE path
+#    the data plane bypasses the CPU entirely, so this knob does not matter
+#    there.  XPS is not touched: the single TX queue's xps_cpus exists in
+#    sysfs but reads ENOENT here, so the old XPS=CPU1 write was a no-op.
 #
-#  IRQ affinity of 92000000.ethernet to CPU1 - measured on this board:
-#    pinning alone did not move the rate, but with RPS on the same core the
-#    softirq stays local to the IRQ instead of bouncing.
+#  IRQ affinity of 92000000.ethernet to CPU1 - the complement of the above.
+#    Pinning the IRQ alone, with RPS still on the same core, measured no gain:
+#    what matters is that the two halves sit on different cores.
 #
 #  PAUSE frames off - the sibling ZX279133 port (cnjn, right.com.cn
 #    thread-8486503) traced a hard upload ceiling to flow-control frames
@@ -33,12 +45,8 @@ tune_port() {
 	[ -d "/sys/class/net/$ifn" ] || return 0
 	for q in "/sys/class/net/$ifn/queues/rx-"*; do
 		[ -d "$q" ] || continue
-		echo 2 > "$q/rps_cpus" 2>/dev/null
+		echo 1 > "$q/rps_cpus" 2>/dev/null
 		echo 256 > "$q/rps_flow_cnt" 2>/dev/null
-	done
-	for q in "/sys/class/net/$ifn/queues/tx-"*; do
-		[ -d "$q" ] || continue
-		echo 2 > "$q/xps_cpus" 2>/dev/null
 	done
 	if command -v ethtool >/dev/null 2>&1; then
 		ethtool -A "$ifn" rx off tx off 2>/dev/null

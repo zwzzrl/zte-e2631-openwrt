@@ -1,12 +1,19 @@
 #!/bin/sh
 # Keep the queue tuning applied across link/firewall events. The queue
-# rps/xps settings get reset to the driver default (rps_cpus=1, CPU0) when
+# rps settings get reset to the driver default (rps_cpus=1, CPU0) when
 # the flowtable rebinds - which happens on every firewall reload, and fw4
 # reloads on every ifup (procd interface trigger). The sequence observed on
-# the device: ifup -> this hotplug sets 2 -> fw4 reload resets it to 1, one
-# to three seconds later. So re-apply DELAYED, twice, to be the last writer.
-# The writes are INLINE (not via /etc/init.d, whose rc.common/procd path
-# fails silently in hotplug context).
+# the device: ifup -> this hotplug writes -> fw4 reload resets it to 1, one
+# to three seconds later.
+#
+# Since 2026-10-30 the wanted value *is* the driver default (CPU0 - see
+# /etc/init.d/e2631-netune for the measurements behind the switch from CPU1),
+# so this file no longer fights fw4: it keeps the extra knobs (rps_flow_cnt)
+# and guards against the driver default ever changing. XPS is left alone - the
+# single TX queue exposes no writable xps_cpus on this kernel (read returns
+# ENOENT), and with one queue there is nothing to steer. The writes are
+# INLINE (not via /etc/init.d, whose rc.common/procd path fails silently in
+# hotplug context).
 
 [ "$ACTION" = ifup ] || exit 0
 
@@ -21,12 +28,8 @@ esac
 		[ -d "/sys/class/net/$ifn" ] || continue
 		for q in /sys/class/net/$ifn/queues/rx-*; do
 			[ -d "$q" ] || continue
-			echo 2 > "$q/rps_cpus" 2>/dev/null
+			echo 1 > "$q/rps_cpus" 2>/dev/null
 			echo 256 > "$q/rps_flow_cnt" 2>/dev/null
-		done
-		for q in /sys/class/net/$ifn/queues/tx-*; do
-			[ -d "$q" ] || continue
-			echo 2 > "$q/xps_cpus" 2>/dev/null
 		done
 	done
 	sleep 5
@@ -34,7 +37,7 @@ esac
 		[ -d "/sys/class/net/$ifn" ] || continue
 		for q in /sys/class/net/$ifn/queues/rx-*; do
 			[ -d "$q" ] || continue
-			echo 2 > "$q/rps_cpus" 2>/dev/null
+			echo 1 > "$q/rps_cpus" 2>/dev/null
 		done
 	done
 ) &
