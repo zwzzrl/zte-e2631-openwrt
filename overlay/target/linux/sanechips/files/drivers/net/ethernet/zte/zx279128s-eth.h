@@ -221,12 +221,18 @@
 #define ZX_BUF_SIZE		2048
 #define ZX_BUF_POOL_SIZE	(ZX_NUM_BUFFERS * ZX_BUF_SIZE)
 
-/* 零拷贝：槽位所有权的隔离环长度、池页引用计数垫高值、未归还 bp 的告警门限 */
-#define ZX_ZC_Q_LEN		512
+/* 零拷贝：隔离环长度、池页引用计数垫高值、未归还 bp 的告警门限 */
+/*
+ * 隔离环长度取自池子大小：一个 bp 在同一世代里最多出现在环里一项，池子 4096 个，
+ * 所以 4096 项的环在数学上装不满，也就不需要“环满就强行归还最老一项”那种
+ * 会提前还 bp 的兜底（环满只说明有人漏摘环项，那是 bug，不是常态）。
+ */
+#define ZX_ZC_Q_LEN		ZX_NUM_BUFFERS
 #define ZX_ZC_PARK		(1u << 20)
 /*
- * 留在 BMU 外面的 bp 上限。池子 4096 个，收发环各 1024、qdisc 64、隔离环 512，
- * 留一半给数据面才不会在拥塞时被自己掐住；本机收包被灌满时靠这道闸兜底。
+ * 留在 BMU 外面的 bp 上限。池子 4096 个，光硬件收发环就各占 1024，再算上 qdisc
+ * 和协议栈手里的，只留一半给数据面才不会在拥塞时被自己掐住；本机收包被灌满时
+ * 靠这道闸退回拷贝路径兜底。
  */
 #define ZX_ZC_OUT_MAX		2048
 #define ZX_ZC_MIN_LEN		128
@@ -364,16 +370,20 @@ struct zx_eth_adapter {
 
 	/*
 	 * 零拷贝。zc_state[bp] 记录一个池缓冲归谁：FREE（在 BMU 空闲表里）、
-	 * SKB（在协议栈手里）、DROPQ（skb 已释放，等隔离到期归还）、TX（已交给
-	 * 发送硬件，硬件发完自己归还）。详见 zx279128s-main.c 里 zx_zc_* 的说明。
+	 * SKB（在协议栈手里，还没人 orphan）、SHADOW（我们在 dataref 上拿了一份
+	 * 影子引用，等它掉到 1）、TX（已交给发送硬件，硬件发完自己归还）、
+	 * LOST（数据被 expand 搬走，追不到，永不归还）。zc_skb[bp] 是当前主人，
+	 * 用来识别陈旧 tag。详见 zx279128s-main.c 里 zx_zc_* 的说明。
 	 */
 	bool			zc_rx;
 	u8			*zc_state;
+	struct sk_buff		**zc_skb;
 	spinlock_t		zc_lock;
+	/* 隔离环只存槽位号：影子引用挂在 skb_shared_info->dataref 上，不要 skb */
 	u32			zc_q_bp[ZX_ZC_Q_LEN];
-	unsigned long		zc_q_exp[ZX_ZC_Q_LEN];
 	u32			zc_q_head;
 	u32			zc_q_tail;
+	u32			zc_q_n;
 	u64			zc_rx_ok;
 	u64			zc_tx_ok;
 	u64			zc_free_ok;
@@ -381,6 +391,28 @@ struct zx_eth_adapter {
 	u64			zc_q_ovf;
 	u64			zc_capped;
 	u64			zc_off_cnt;
+	u64			zc_shadow;
+	u64			zc_lost;
+	u64			zc_stale;
+	u64			zc_odd;
+	/* 调试：交付快照与"槽位被改写"/"发送拿到挂着影子的 bp"计数 */
+	u8			*zc_snap;
+	u16			*zc_snap_len;
+	u64			zc_corrupt;
+	u64			zc_tx_dup;
+	u64			zc_notag;
+	u64			zc_rx_dup;	/* 硬件给的 bp 还挂着影子/在协议栈手里 */
+	u64			zc_badfree;	/* 调试：归还了 state 还是 SHADOW/SKB 的 bp */
+	u32			(*zc_free_at)[2];	/* 每个 bp 最近两次归还的调用点 */
+	u8			*zc_free_tog;
+	/* 每个 bp 的事件流水：8 项 × (type, aux, tick) */
+	u32			(*zc_ev)[8];
+	u8			*zc_ev_n;
+	unsigned long		*zc_inring;	/* 位图：这个 bp 现在在环里 */
+	u64			zc_dup_push;
+	u64			zc_dup_reap;
+	u64			zc_badstate;	/* 环项对应的 bp 状态已经不是 SHADOW */
+	u64			zc_rxdrop;	/* 硬件给的 bp 还有人用，整帧丢弃 */
 	unsigned long		zc_park_at;
 
 	/* TX ring, BMU buffer allocation and the TX counters */

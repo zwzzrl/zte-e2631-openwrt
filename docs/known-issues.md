@@ -1866,3 +1866,28 @@ been found @1b60000`。所以 `e2631-fwslot switch` 从 slot1 切回原厂时，
   且 `npufilter` 里单独挂了 `flow_ipv6_nat_filter` 把 NAT 流挡在 NPU 之外；
 - 原厂对 IPv6 的加速形态是**只有 routed 的 v6 TCP/UDP/组播、且必须 WAN↔LAN 方向**；
   `ipv6_raw`（ICMPv6/ESP）与 eth↔eth 的 v6 一律软件。
+
+## ZC-RX-DOUBLE-FREE - 影子引用之后：同一个 bp 被还两次（2026-10-31 夜）
+
+零拷贝 RX（`build_skb` 直接建在 BMU 槽位上）在把 `skb->users` 换成
+`skb_shared_info->dataref` 影子引用之后，skbuff 二次释放的 panic 消失了，但**本机终结
+路径仍会串包**：宿主 20 MB ssh 上传，第 2 轮 md5 就不对。
+
+征象是同一个 bp 被 `zx_zc_reap()` 归还两次：第一次还完硬件立刻又把它发下来（RX DMA
+覆写槽位），两个 skb 共用一个槽位 → 内容互相覆盖。计数三件套同时出现
+`rx_dup` / `dup_push` / `dup_reap`。量级约 1/27k 包，一旦发生就连续坏包。
+
+处置（镜像已构建、待刷机验证）：
+
+- `reap` 里**顺序是不变量**：先看 `dataref`，`!= 1` 就原地 `break`（不清位图、不摘环项）；
+  只有真要归还时才上网道闸 —— 位图仍 set、`state == SHADOW`，否则丢项不还（记
+  `zc_lost`，满 64 自动关 zc）。
+- RX 交付前 `state` 必须是 `FREE`，否则整帧丢弃且**不还 bp**（`rx_dup`/`rxdrop`）。
+- 顺序写反的代价实测过：位图测试放在 `dataref` 之前，0.48 s / 1743 包就误判 67 次
+  "重复环项"、泄漏 68 个缓冲，还带出 `corrupt=9`。
+- `badfree` 抓不到双还（`reap` 先把 state 置 FREE 再调 `zx_bmu_free_bp()`）；
+  改用事件流水：每个 bp 8 条 `type:aux:jiffies`，其中 `type 9` = 把 bp 还给 BMU，
+  同一个 bp 出现两次 9 就是双还的直接证据。`debugfs .../zc_ev` 可以直接读快照。
+
+详见 `docs/zc-rx-lifetime-2026-10-31.md` §6（含判据与下一步：查厂商归还协议、
+退化方案 bp 世代 epoch、长期按 page_pool 重做）。

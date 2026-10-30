@@ -65,6 +65,16 @@ static bool zc_rx = true;
 module_param(zc_rx, bool, 0644);
 MODULE_PARM_DESC(zc_rx, "Zero-copy RX/TX over the BMU packet pool (default: on)");
 
+/* 调试用：给每个 zc 槽位在"交给协议栈"的那一刻存一份前 64 字节快照，等
+ * zx_zc_reap() 归还 bp 时比对。改写了就说明槽位在我们手里被别的路径用了
+ * （BMU 提前发出去、发送拷贝撞进来、……），这正是"数据静默损坏"的直接证据。
+ * 运行态可关：echo 0 > /sys/module/zx279128s_eth/parameters/zc_canary
+ */
+static bool zc_canary = true;
+module_param(zc_canary, bool, 0644);
+MODULE_PARM_DESC(zc_canary, "Snapshot zc slots on delivery and verify them on reap");
+#define ZX_ZC_CANARY	64
+
 /*
  * 每包阶段计时（接收 5 段、发送 4 段），默认关。一次包要 6 个 ktime_get_ns()
  * 加 11 次累加，在 1500 B/包 的转发路径上是可测的额外成本（量级 100 ns/包，
@@ -310,7 +320,20 @@ void zx_eth_for_each_adapter(void (*fn)(struct zx_eth_adapter *adapter,
 }
 EXPORT_SYMBOL_GPL(zx_eth_for_each_adapter);
 
+/* zc 槽位状态（zx_bmu_free_bp 里就要用，所以定义放前面） */
+#define ZX_ZC_BS_FREE	0	/* 在 BMU 空闲表里 */
+#define ZX_ZC_BS_SKB	1	/* 在协议栈手里，还没人 orphan 过 */
+#define ZX_ZC_BS_SHADOW	2	/* 我们在 dataref 上拿了一份，等它掉到 1 */
+#define ZX_ZC_BS_TX	3	/* 已交给发送硬件，硬件发完自己归还 */
+#define ZX_ZC_BS_LOST	4	/* 追不到（数据被 expand 搬走），永不归还 */
+
+/* 追不到的槽位超过这个数就自动关 zc，免得池子被一滴滴吃空 */
+#define ZX_ZC_LOST_MAX	64u
+
 /* ---- BMU helpers --------------------------------------------------- */
+
+/* 事件流水（定义在 zc 段），归还 bp 时也要记一笔 */
+static void zx_zc_ev(struct zx_eth_adapter *adapter, u16 bp, u8 type, u8 aux);
 
 /*
  * Allocate a buffer from the BMU (caller holds tx_lock).  A request that
@@ -358,6 +381,20 @@ static int zx_bmu_free_bp(struct zx_eth_adapter *adapter, u16 bp)
 {
 	u32 val;
 	int ret = 0;
+
+	/* 调试：记下这个 bp 最近两次是谁还的，归还一个还挂着影子的 bp 要计数 */
+	if (unlikely(adapter->zc_free_at) && bp < ZX_NUM_BUFFERS) {
+		adapter->zc_free_at[bp][adapter->zc_free_tog[bp] & 1] = (u32)_RET_IP_;
+		adapter->zc_free_tog[bp]++;
+		if (adapter->zc_state[bp] == ZX_ZC_BS_SHADOW ||
+		    adapter->zc_state[bp] == ZX_ZC_BS_SKB)
+			adapter->zc_badfree++;
+		/* type 9 = 把 bp 还给 BMU；aux 里的 state 说明是谁还的 */
+		zx_zc_ev(adapter, bp, 9,
+			 (u8)(adapter->zc_state[bp] & 0xf) |
+			 (adapter->zc_inring &&
+			  test_bit(bp, adapter->zc_inring) ? 0x10 : 0));
+	}
 
 	spin_lock_bh(&adapter->bmu_free_lock);
 	if (!adapter->bmu_free_slots) {
@@ -991,18 +1028,39 @@ static void zx_tx_reclaim(struct zx_eth_adapter *adapter)
  *
  * 三个必须处理的例外：
  *  1. 协议栈丢包（防火墙、无路由、桥过滤）：bp 只能靠 skb->destructor 找回来。
- *  2. skb_orphan() 会提前调用 destructor（br_netfilter 的 setup_pre_routing、nft
- *     flowtable 的 xfrm 分支都会），那时 skb 还活着、槽位不能还。所以 destructor
- *     只把 bp 放进隔离环，隔两个 tick 才真正归还；这期间如果 skb 还是被发出去，
- *     发送路径会把隔离项摘掉、把 bp 交给硬件。
+ *  2. skb_orphan() 会提前调用 destructor（br_netfilter 的 setup_pre_routing、
+ *     nft flowtable 的 xfrm 分支都会），那时 skb 还活着、槽位不能还。更麻烦的是
+ *     skb_set_owner_r() 把帧交给 socket 时也是先 skb_orphan()、再换成
+ *     sock_rfree：那个 skb 之后躺在 socket 队列里几百毫秒，期间没有任何回调。
+ *     所以 destructor 必须在**数据**上再拿一份引用，等协议栈真正放掉数据。
+ *
+ *     这份引用绝对不能用 skb_get()（skb->users）：__kfree_skb() 根本不过 users，
+ *     它直接 skb_release_all()+kfree_skbmem()。socket 收包走的正是这条路——
+ *     tcp_recvmsg() 消化完一个 skb 调 sk_eat_skb()，而 sk_eat_skb() 就是
+ *     __kfree_skb()：skb 连同 sk_buff 结构体一起被释放，我们那份 users 引用被
+ *     无声吃掉，隔离环里只剩一个悬空指针，之后再 kfree_skb() 它就成了二次释放
+ *     （实测现象：109 s 时 kmem_cache_free(skbuff_cache) 报对象已在空闲链上，
+ *     panic 落在 zx_eth_poll。推导见 docs/zc-rx-lifetime-2026-10-31.md）。
+ *
+ *     改用 skb_shared_info->dataref：内核自己维护的"数据引用数"，所有释放路径
+ *     （kfree_skb()/__kfree_skb()/kfree_skb_partial()/pskb_expand_head()）都经
+ *     skb_release_data()→skb_data_unref()，一分不多一分不少。destructor 里
+ *     atomic_inc(dataref) + skb->cloned=1（等价于克隆一份数据引用，但不真的分配
+ *     sk_buff），数据就一直活到我们放手；NAPI 里看 dataref 掉到 1（只剩我们这份）
+ *     就说明数据没人读了，这时替 head 还掉页引用、再把 bp 还给 BMU。所以隔离环
+ *     里只存 bp，不存 skb 指针。
  *  3. 释放 head_frag=1 的 skb 会走 page_frag_free()，它对槽位所在的页做
  *     put_page()。池子来自 dma_alloc_coherent()，是 2048 个独立 order-0 页，
  *     put_page() 会把其中一页还给 buddy、整块池子出现空洞。所以池页引用计数被
- *     垫高（ZX_ZC_PARK），每次释放只做一次无害的减一，NAPI 里定期补回。
+ *     垫高（ZX_ZC_PARK），每次释放只做一次无害的减一，NAPI 里定期补回；reap 里
+ *     我们替 head 还的那次页引用同理。
  *
  * 另外 skb 可能被 pskb_expand_head() 换成新的 head（例如要更多 headroom，或者
- * GRO 合并）。expand 会把 shinfo 连同 destructor_arg 一起抄到新 head，所以我们
- * 仍然能从这个标记里找回 bp；只是数据已经不在槽位里了，发送时退回拷贝路径。
+ * GRO 合并）。expand 会把 shinfo 连同 destructor_arg 一起抄到新 head，tag 还在，
+ * 但数据已经不在槽位里；这时候槽位还有没有别的 skb 在引用，从这个 skb 上看不出
+ * 来（克隆过的 expand 会把旧 head 留给克隆体）。所以这类槽位**直接扣着不还**并
+ * 记数（zc_lost），超过 ZX_ZC_LOST_MAX 自动关掉 zc：宁可少一个缓冲，也不还一个
+ * 可能还在被读的缓冲。
  * 这也是开 zc 时必须关掉 GRO 的原因，但**不是**因为 bp 会被漏掉：实测开着 GRO
  * 时 out 一直平、frag_list 成员的析构会跑（docs/ffe-zero-copy-2026-10-30.md §6.6）。
  * 真正的原因在发送侧：合并出的聚合体要拆段，而这份驱动的发送描述符里一个 bp 只能
@@ -1012,10 +1070,6 @@ static void zx_tx_reclaim(struct zx_eth_adapter *adapter)
 #define ZX_ZC_TAG_VAL	0x5ac00000u
 #define ZX_ZC_TAG_MASK	0xffff0000u
 
-#define ZX_ZC_BS_FREE	0	/* 在 BMU 空闲表里 */
-#define ZX_ZC_BS_SKB	1	/* 在协议栈手里 */
-#define ZX_ZC_BS_DROPQ	2	/* skb 已释放，等隔离到期归还 */
-#define ZX_ZC_BS_TX	3	/* 已交给发送硬件，硬件发完自己归还 */
 
 /* SoC 上只有一个以太网控制器；destructor 里没有别的办法拿到 adapter */
 static struct zx_eth_adapter *zx_zc_adapter;
@@ -1077,45 +1131,126 @@ static void zx_zc_park_pages(struct zx_eth_adapter *adapter)
 	}
 }
 
+/*
+ * 池子销毁时用（只在设备拆除时走；驱动本身不能被 unbind）。先关 zc、把状态表
+ * 和隔离环清空，再把垫高的页引用抹平：不这样做，free_pages_exact() 会踩到还被
+ * page_frag_free() 记着引用的页。
+ */
 static void zx_zc_unpark_pages(struct zx_eth_adapter *adapter)
 {
 	u32 i;
 
 	if (!adapter->pkt_pool)
 		return;
+	WRITE_ONCE(adapter->zc_rx, false);
+	for (i = 0; i < ZX_NUM_BUFFERS; i++) {
+		adapter->zc_state[i] = ZX_ZC_BS_FREE;
+		adapter->zc_skb[i] = NULL;
+	}
+	for (i = 0; i < ZX_ZC_Q_LEN; i++)
+		adapter->zc_q_bp[i] = 0xffff;
+	adapter->zc_q_head = 0;
+	adapter->zc_q_tail = 0;
+	adapter->zc_q_n = 0;
 	for (i = 0; i < ZX_BUF_POOL_SIZE; i += PAGE_SIZE)
 		set_page_count(virt_to_page(adapter->pkt_pool + i), 1);
 }
 
-/* 隔离环 / 回收（调用者持 zc_lock） */
-static void zx_zc_q_push(struct zx_eth_adapter *adapter, u16 bp)
+/*
+ * 调试：每个 bp 记 8 条事件流水（type:aux），配合 zc_canary 定位"槽位被提前
+ * 归还"的完整时序。type: 1=RX交付(aux=len>>6) 2=影子入环 3=reap归还(aux=refs)
+ * 4=发送申请(aux=当时state) 5=zc发送 6=陈旧tag 7=追不到 9=还bp给BMU
+ * (aux=state|0x10 在环里)。同一个 bp 出现两次 9 就是双还的直接证据。
+ */
+static void zx_zc_ev(struct zx_eth_adapter *adapter, u16 bp, u8 type, u8 aux)
+{
+	u32 *slot;
+	u8 n;
+
+	if (unlikely(!adapter->zc_ev || bp >= ZX_NUM_BUFFERS))
+		return;
+	n = adapter->zc_ev_n[bp]++ & 7;
+	slot = &adapter->zc_ev[bp][n];
+	*slot = (u32)type << 24 | (u32)aux << 16 | (jiffies & 0xffff);
+}
+
+/*
+ * 槽位尾部的 skb_shared_info。build_skb(data, 2048) 把 end 设成
+ * SKB_WITH_OVERHEAD(2048)，shinfo 就落在槽位 + 1728，和 skb_shinfo(skb) 一致。
+ */
+static inline struct skb_shared_info *zx_zc_shinfo(struct zx_eth_adapter *adapter,
+						   u16 bp)
+{
+	return (struct skb_shared_info *)(adapter->pkt_pool +
+		(u32)bp * ZX_BUF_SIZE + SKB_WITH_OVERHEAD(ZX_BUF_SIZE));
+}
+
+/* 数据的引用数；等于 1 表示只剩我们这份影子引用 */
+static inline u32 zx_zc_refs(struct skb_shared_info *sp)
+{
+	return atomic_read(&sp->dataref) & SKB_DATAREF_MASK;
+}
+
+/*
+ * 出异常时把某个 bp 的完整状态 + 最近 8 条事件打进 dmesg。事件编码
+ * type<<24 | aux<<16 | (jiffies & 0xffff)，type 见 zx_zc_ev()。
+ */
+static void zx_zc_ev_dump(struct zx_eth_adapter *adapter, u16 bp,
+			  const char *what)
+{
+	struct skb_shared_info *sp;
+
+	if (bp >= ZX_NUM_BUFFERS || !adapter->zc_ev)
+		return;
+	sp = zx_zc_shinfo(adapter, bp);
+	dev_warn(adapter->dev,
+		 "zc %s: bp=%u state=%u refs=%u tag=%08x skb=%p destructor=%pS q_n=%u inring=%d ev[%u]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		 what, bp, adapter->zc_state[bp], zx_zc_refs(sp),
+		 (u32)(unsigned long)sp->destructor_arg,
+		 adapter->zc_skb[bp],
+		 adapter->zc_skb[bp] ? adapter->zc_skb[bp]->destructor : NULL,
+		 adapter->zc_q_n,
+		 adapter->zc_inring ? test_bit(bp, adapter->zc_inring) : -1,
+		 adapter->zc_ev_n[bp],
+		 adapter->zc_ev[bp][0], adapter->zc_ev[bp][1],
+		 adapter->zc_ev[bp][2], adapter->zc_ev[bp][3],
+		 adapter->zc_ev[bp][4], adapter->zc_ev[bp][5],
+		 adapter->zc_ev[bp][6], adapter->zc_ev[bp][7]);
+}
+
+/*
+ * 隔离环：存“数据还活着、但已经跟不到 skb”的槽位号。环长等于池子容量，
+ * 一个 bp 在一个世代里最多进环一次，所以装不满。
+ */
+static bool zx_zc_q_push(struct zx_eth_adapter *adapter, u16 bp)
 {
 	u32 next = (adapter->zc_q_tail + 1) % ZX_ZC_Q_LEN;
 
 	if (next == adapter->zc_q_head) {
-		/*
-		 * 环满：说明同一瞬间有 128 个包被协议栈丢掉（只在本机收包被灌
-		 * 满、或者 br_netfilter 那种会提前 orphan 的配置下才会发生）。
-		 * 把最老的一项立刻归还——它已经等过至少一次调度，宁可冒一次
-		 * 提前归还的风险，也不能让 bp 永久漏掉（漏掉的 bp 无法回收，
-		 * 只能靠重启）。
-		 */
-		u16 old = adapter->zc_q_bp[adapter->zc_q_head];
-
-		adapter->zc_q_ovf++;
-		adapter->zc_q_head = (adapter->zc_q_head + 1) % ZX_ZC_Q_LEN;
-		if (old != 0xffff && adapter->zc_state[old] == ZX_ZC_BS_DROPQ) {
-			adapter->zc_state[old] = ZX_ZC_BS_FREE;
-			if (zx_bmu_free_bp(adapter, old) == 0)
-				adapter->zc_free_ok++;
+		/* head 上的洞先剔掉再试一次（发送路径摘项会留下洞） */
+		while (adapter->zc_q_head != adapter->zc_q_tail &&
+		       adapter->zc_q_bp[adapter->zc_q_head] == 0xffff)
+			adapter->zc_q_head = (adapter->zc_q_head + 1) %
+					     ZX_ZC_Q_LEN;
+		if (next == adapter->zc_q_head) {
+			adapter->zc_q_ovf++;
+			return false;
 		}
 	}
 	adapter->zc_q_bp[adapter->zc_q_tail] = bp;
-	adapter->zc_q_exp[adapter->zc_q_tail] = jiffies + 2;
 	adapter->zc_q_tail = next;
+	adapter->zc_q_n++;
+	if (adapter->zc_inring && test_and_set_bit(bp, adapter->zc_inring)) {
+		adapter->zc_dup_push++;
+		if (net_ratelimit())
+			zx_zc_ev_dump(adapter, bp, "环里已有一份同一个 bp");
+	}
+	zx_zc_ev(adapter, bp, 2, 0);
+	return true;
 }
 
-static void zx_zc_q_remove(struct zx_eth_adapter *adapter, u16 bp)
+/* 摘掉某个 bp 的环项（发送路径接管槽位时用）。返回是否真的摘到 */
+static bool zx_zc_q_remove(struct zx_eth_adapter *adapter, u16 bp)
 {
 	u32 i;
 
@@ -1123,86 +1258,250 @@ static void zx_zc_q_remove(struct zx_eth_adapter *adapter, u16 bp)
 	     i = (i + 1) % ZX_ZC_Q_LEN) {
 		if (adapter->zc_q_bp[i] == bp) {
 			adapter->zc_q_bp[i] = 0xffff;
-			return;
+			adapter->zc_q_n--;
+			if (adapter->zc_inring)
+				clear_bit(bp, adapter->zc_inring);
+			return true;
 		}
 	}
+	return false;
+}
+
+/*
+ * 摘掉 head 上的环项（含发送路径留下的洞）。只有 reap 用，调用者持 zc_lock。
+ */
+static void zx_zc_q_drop_head(struct zx_eth_adapter *adapter, u32 idx)
+{
+	if (adapter->zc_q_bp[idx] != 0xffff)
+		adapter->zc_q_n--;
+	adapter->zc_q_bp[idx] = 0xffff;
+	adapter->zc_q_head = (idx + 1) % ZX_ZC_Q_LEN;
+}
+
+/*
+ * 有一个槽位再也追不回来了（扣住不还）。累计到 ZX_ZC_LOST_MAX 就自动关掉
+ * zc：宁可退化到拷贝路径，也不让池子被一滴滴吃空。所有"只能扣着"的分支
+ * 都走这里，保证 leak 只有一个计数器、一处自动关闭。
+ */
+static void zx_zc_leak(struct zx_eth_adapter *adapter)
+{
+	adapter->zc_lost++;
+	if (adapter->zc_lost != ZX_ZC_LOST_MAX || !READ_ONCE(adapter->zc_rx))
+		return;
+	WRITE_ONCE(adapter->zc_rx, false);
+	dev_warn(adapter->dev,
+		 "zero-copy RX disabled: %llu buffers leaked\n",
+		 adapter->zc_lost);
 }
 
 static void zx_zc_reap(struct zx_eth_adapter *adapter)
 {
-	unsigned long now = jiffies;
+	u32 budget = 256;
 
 	spin_lock_bh(&adapter->zc_lock);
-	while (adapter->zc_q_head != adapter->zc_q_tail) {
-		u16 bp = adapter->zc_q_bp[adapter->zc_q_head];
+	while (budget-- && adapter->zc_q_head != adapter->zc_q_tail) {
+		u32 idx = adapter->zc_q_head;
+		u16 bp = adapter->zc_q_bp[idx];
+		struct skb_shared_info *sp;
+		u8 *slot;
+		int i;
 
-		if (time_before(now, adapter->zc_q_exp[adapter->zc_q_head]))
+		if (bp == 0xffff) {	/* 发送路径摘走留下的洞 */
+			zx_zc_q_drop_head(adapter, idx);
+			continue;
+		}
+		/*
+		 * dataref 掉到 1 = 只剩我们这份影子引用，协议栈（包括
+		 * __kfree_skb() 那条路）不会再来读这片数据了。环是先进先出的，
+		 * 遇上还活着的就停下 —— 而且**原位不动**：不能在这里摘掉环项或者
+		 * 清位图，否则下一次进来就会把自己这半截动作当成"重复环项"。
+		 */
+		sp = zx_zc_shinfo(adapter, bp);
+		if (zx_zc_refs(sp) != 1)
 			break;
-		adapter->zc_q_head = (adapter->zc_q_head + 1) % ZX_ZC_Q_LEN;
-		if (bp == 0xffff)
+		/*
+		 * 两道闸，保证一个 bp 只被"还"一次：
+		 *  - 同一个 bp 在环里出现第二份：谁先摘走谁负责归还，这里只丢项；
+		 *  - 环项对应的 bp 状态已经不是 SHADOW：槽位已经被别人接管或归还，
+		 *    这一项是陈旧的，碰它就会把别人正在读的槽位还给 BMU。
+		 * 两种都只丢环项（槽位留在 BMU 外面 = 泄漏一个缓冲），宁漏不双还。
+		 */
+		if (adapter->zc_inring &&
+		    test_and_clear_bit(bp, adapter->zc_inring) == 0) {
+			adapter->zc_dup_reap++;
+			zx_zc_leak(adapter);
+			if (net_ratelimit())
+				zx_zc_ev_dump(adapter, bp,
+					      "环项重复，丢项不归还");
+			zx_zc_q_drop_head(adapter, idx);
 			continue;
-		if (adapter->zc_state[bp] != ZX_ZC_BS_DROPQ)
+		}
+		if (unlikely(adapter->zc_state[bp] != ZX_ZC_BS_SHADOW)) {
+			adapter->zc_badstate++;
+			zx_zc_leak(adapter);
+			if (net_ratelimit())
+				zx_zc_ev_dump(adapter, bp,
+					      "环项陈旧，丢项不归还");
+			zx_zc_q_drop_head(adapter, idx);
 			continue;
+		}
+
+		slot = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE;
+		/* 数据里如果挂了 frag/frag_list，替协议栈放掉（正常不会出现） */
+		if (unlikely(sp->nr_frags || sp->frag_list)) {
+			for (i = 0; i < sp->nr_frags; i++)
+				put_page(skb_frag_page(&sp->frags[i]));
+			if (sp->frag_list)
+				kfree_skb_list(sp->frag_list);
+			sp->nr_frags = 0;
+			sp->frag_list = NULL;
+			adapter->zc_odd++;
+		}
+		/* 调试：槽位在我们手里这段时间有没有被写过 */
+		if (unlikely(adapter->zc_snap && adapter->zc_snap_len[bp])) {
+			u16 n = adapter->zc_snap_len[bp];
+
+			adapter->zc_snap_len[bp] = 0;
+			if (memcmp(adapter->zc_snap + (u32)bp * ZX_ZC_CANARY,
+				   slot + 16, n)) {
+				adapter->zc_corrupt++;
+				if (net_ratelimit())
+					zx_zc_ev_dump(adapter, bp,
+						      "canary 被改写");
+			}
+		}
+		zx_zc_ev(adapter, bp, 3, (u8)zx_zc_refs(sp));
 		adapter->zc_state[bp] = ZX_ZC_BS_FREE;
+		adapter->zc_skb[bp] = NULL;
+		zx_zc_q_drop_head(adapter, idx);
+		/* 替 head 还掉那次 page_frag_free()，再把 bp 还给 BMU */
+		put_page(virt_to_head_page(slot));
 		if (zx_bmu_free_bp(adapter, bp) == 0)
 			adapter->zc_free_ok++;
 	}
 	spin_unlock_bh(&adapter->zc_lock);
 }
 
-/* skb 走到生命尽头时唯一的信号。可能只是 skb_orphan()，所以只进隔离环 */
+/*
+ * skb 走到生命尽头（或被人 orphan）时唯一的信号。做法见上面第 2 条例外：
+ * 在 skb_shared_info->dataref 上拿一份影子引用，把槽位挂进隔离环，等 reap
+ * 看到 dataref 掉到 1 再还 bp。这里不做任何分配，也不释放 skb。
+ */
 static void zx_zc_destructor(struct sk_buff *skb)
 {
 	struct zx_eth_adapter *adapter = READ_ONCE(zx_zc_adapter);
-	u16 bp;
+	struct skb_shared_info *sp;
+	u16 bp, poolbp;
 
-	if (!adapter || !zx_zc_tag_get(skb, &bp) || bp >= ZX_NUM_BUFFERS)
+	if (!adapter)
 		return;
-	spin_lock(&adapter->zc_lock);
-	if (adapter->zc_state[bp] == ZX_ZC_BS_SKB) {
-		adapter->zc_state[bp] = ZX_ZC_BS_DROPQ;
-		zx_zc_q_push(adapter, bp);
+	if (!zx_zc_tag_get(skb, &bp) || bp >= ZX_NUM_BUFFERS) {
+		adapter->zc_notag++;	/* 调试：destructor 跑了但 tag 没了 */
+		return;
 	}
-	spin_unlock(&adapter->zc_lock);
+
+	if (unlikely(!zx_zc_in_pool(adapter, skb->head, &poolbp) ||
+		     poolbp != bp)) {
+		/*
+		 * 数据被 pskb_expand_head() 搬出了槽位：槽位还在 BMU 外面，
+		 * 但已经没有任何可靠的引用能告诉我们它什么时候没人读（克隆
+		 * 过的 expand 把旧 head 留给了克隆体）。扣着不还，记数；多到
+		 * 一定量就把 zc 关掉，让池子不再继续漏水。
+		 */
+		zx_zc_leak(adapter);
+		return;
+	}
+	if (unlikely(skb->nohdr)) {
+		/* nohdr 时 skb_data_unref() 的减数不是 1，影子引用会算错 */
+		zx_zc_leak(adapter);
+		return;
+	}
+
+	spin_lock_bh(&adapter->zc_lock);
+	if (likely(adapter->zc_state[bp] == ZX_ZC_BS_SKB &&
+		   adapter->zc_skb[bp] == skb)) {
+		sp = zx_zc_shinfo(adapter, bp);
+		atomic_inc(&sp->dataref);
+		/*
+		 * 等价于 skb_clone() 做的事（让 skb_data_unref() 认这份引用），
+		 * 只是我们不真的分配 sk_buff：影子引用没有结构体，只由环和
+		 * reap 记着。
+		 */
+		skb->cloned = 1;
+		adapter->zc_state[bp] = ZX_ZC_BS_SHADOW;
+		if (likely(zx_zc_q_push(adapter, bp))) {
+			adapter->zc_shadow++;
+			spin_unlock_bh(&adapter->zc_lock);
+			return;
+		}
+		/* 环满：撤掉刚拿的引用，槽位永久扣住（正常到不了） */
+		atomic_dec(&sp->dataref);
+		adapter->zc_state[bp] = ZX_ZC_BS_LOST;
+		zx_zc_leak(adapter);
+	} else {
+		/* 陈旧 tag：这个 bp 已经换了主人，什么都不做 */
+		adapter->zc_stale++;
+	}
+	spin_unlock_bh(&adapter->zc_lock);
 }
 
 /*
- * 发送侧：能从槽位直接发就返回 true 并给出 bp。不能发也要保证 bp 有人管：
- *   - head 已经不在池子里（expand 过）：槽位已被放弃，这里直接归还；
- *   - head 还在池子里但 data/长度对不上，或者是被克隆的 skb：什么都不做，
- *     等 destrator 在真正释放时归还。
+ * 发送侧：能从槽位直接发就返回 true 并给出 bp。
+ * 判断"数据只有这一个 skb 在用"靠 dataref：state==SKB 时只有 skb 自带的那份
+ * （=1），state==SHADOW 时还有我们那份（=2）。多于这个数说明还有克隆体共享
+ * 这份数据，不能把槽位交给硬件（硬件发完会把 bp 还给 BMU，克隆体还在读）。
+ * 退出时不碰 bp：环里那份引用会照常把槽位收回来。
  */
 static bool zx_zc_tx_take(struct zx_eth_adapter *adapter, struct sk_buff *skb,
 			  u16 *bpp)
 {
+	struct skb_shared_info *sp;
 	u16 bp;
 	u8 *slot;
+	u8 st;
+	u32 mine;
 
 	if (!adapter->zc_rx || !zx_zc_tag_get(skb, &bp) || bp >= ZX_NUM_BUFFERS)
 		return false;
 	slot = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE;
-	if (skb->head != slot) {
-		/* 数据已经被搬到别处（pskb_expand_head），槽位可以还了 */
-		spin_lock(&adapter->zc_lock);
-		if (adapter->zc_state[bp] == ZX_ZC_BS_SKB) {
-			adapter->zc_state[bp] = ZX_ZC_BS_FREE;
-			spin_unlock(&adapter->zc_lock);
-			zx_bmu_free_bp(adapter, bp);
-			adapter->zc_fallback++;
-			return false;
-		}
-		spin_unlock(&adapter->zc_lock);
-		return false;
-	}
-	if (!skb->head_frag || skb->data != slot + 16 ||
+	if (!skb->head_frag || skb->head != slot || skb->data != slot + 16 ||
 	    skb_headlen(skb) != skb->len || skb_shared(skb)) {
 		adapter->zc_fallback++;
 		return false;
 	}
-	spin_lock(&adapter->zc_lock);
-	zx_zc_q_remove(adapter, bp);
+
+	spin_lock_bh(&adapter->zc_lock);
+	st = adapter->zc_state[bp];
+	if (adapter->zc_skb[bp] != skb ||
+	    (st != ZX_ZC_BS_SKB && st != ZX_ZC_BS_SHADOW)) {
+		adapter->zc_stale++;
+		spin_unlock_bh(&adapter->zc_lock);
+		return false;
+	}
+	mine = st == ZX_ZC_BS_SHADOW ? 1 : 0;
+	sp = zx_zc_shinfo(adapter, bp);
+	if (zx_zc_refs(sp) != 1 + mine) {
+		adapter->zc_fallback++;
+		spin_unlock_bh(&adapter->zc_lock);
+		return false;
+	}
+	if (mine) {
+		/* 槽位交给硬件以后，环里那份影子引用就没用了 */
+		if (!zx_zc_q_remove(adapter, bp)) {
+			/* 状态说 SHADOW 但环里没有：只能把槽位扣住 */
+			adapter->zc_state[bp] = ZX_ZC_BS_LOST;
+			zx_zc_leak(adapter);
+			spin_unlock_bh(&adapter->zc_lock);
+			return false;
+		}
+		atomic_dec(&sp->dataref);
+	}
 	adapter->zc_state[bp] = ZX_ZC_BS_TX;
-	spin_unlock(&adapter->zc_lock);
+	spin_unlock_bh(&adapter->zc_lock);
+
+	/* 这个 skb 之后被释放时不许再碰槽位（bp 已经归硬件） */
+	skb->destructor = NULL;
+	zx_zc_tag_set(skb, 0xffff);
 	adapter->zc_tx_ok++;
 	*bpp = bp;
 	return true;
@@ -1320,6 +1619,9 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 		}
 
 		t_alloc = ZX_TS();
+		if (unlikely(adapter->zc_state[bp] == ZX_ZC_BS_SHADOW))
+			adapter->zc_tx_dup++;	/* 调试：BMU 把还挂着影子的 bp 给了发送 */
+		zx_zc_ev(adapter, (u16)bp, 4, adapter->zc_state[bp]);
 		buf_ptr = (u8 *)adapter->pkt_pool +
 			  ((u32)bp * ZX_BUF_SIZE) + 16;
 		if (skb_headlen(skb) >= len) {
@@ -1555,15 +1857,48 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 						     zx_zc_out(adapter));
 					goto zc_skip;
 				}
+				/*
+				 * 这个 bp 本该在 BMU 空闲表里（FREE），却还在协议栈、
+				 * 发送硬件或隔离环手里：空闲表里出现了重复项。这一帧
+				 * 不能交付——两个 skb 共用同一个槽位一定读到互相覆盖
+				 * 的内容；也不能把 bp 还回去，那会把别人正在读的槽位
+				 * 交给硬件。整帧丢掉，等真正的属主归还。
+				 */
+				if (unlikely(adapter->zc_state[bp] !=
+					     ZX_ZC_BS_FREE)) {
+					adapter->zc_rx_dup++;
+					adapter->zc_rxdrop++;
+					if (net_ratelimit())
+						zx_zc_ev_dump(adapter, bp,
+							"BMU 把还在用的 bp 又发了下来，丢帧");
+					zx_rx_consume(desc, rel);
+					adapter->rx_cur_idx[q]++;
+					work_done++;
+					avail--;
+					continue;
+				}
 				skb = build_skb(adapter->pkt_pool +
 						(u32)bp * ZX_BUF_SIZE,
 						ZX_BUF_SIZE);
 				if (skb) {
 					zx_zc_tag_set(skb, bp);
 					skb->destructor = zx_zc_destructor;
+					zx_zc_ev(adapter, bp, 1, (u8)(len >> 6));
 					adapter->zc_state[bp] = ZX_ZC_BS_SKB;
+					adapter->zc_skb[bp] = skb;
 					skb_reserve(skb, 16);
 					skb_put(skb, len);
+					if (unlikely(adapter->zc_snap)) {
+						u16 n = min_t(u16, len,
+							      ZX_ZC_CANARY);
+
+						memcpy(adapter->zc_snap +
+						       (u32)bp * ZX_ZC_CANARY,
+						       adapter->pkt_pool +
+						       (u32)bp * ZX_BUF_SIZE + 16,
+						       n);
+						adapter->zc_snap_len[bp] = n;
+					}
 					zc = true;
 				}
 			}
@@ -1992,6 +2327,13 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 			   (long long)adapter->zc_free_ok,
 		   adapter->zc_fallback, adapter->zc_q_ovf,
 		   adapter->zc_capped, adapter->zc_off_cnt);
+	seq_printf(s, "zc_shadow=%llu q_n=%u lost=%llu stale=%llu odd=%llu corrupt=%llu tx_dup=%llu rx_dup=%llu notag=%llu badfree=%llu dup_push=%llu dup_reap=%llu badstate=%llu rxdrop=%llu\n",
+		   adapter->zc_shadow, adapter->zc_q_n, adapter->zc_lost,
+		   adapter->zc_stale, adapter->zc_odd, adapter->zc_corrupt,
+		   adapter->zc_tx_dup, adapter->zc_rx_dup, adapter->zc_notag,
+		   adapter->zc_badfree, adapter->zc_dup_push,
+		   adapter->zc_dup_reap, adapter->zc_badstate,
+		   adapter->zc_rxdrop);
 
 	for (i = 0; i < 0x100; i += 4)
 		seq_printf(s, "bmu+%03x=%08x\n", i,
@@ -2034,6 +2376,13 @@ static int zx_eth_zc_show(struct seq_file *s, void *data)
 		   adapter->zc_rx_ok, adapter->zc_tx_ok, adapter->zc_free_ok,
 		   out, adapter->zc_fallback, adapter->zc_q_ovf,
 		   adapter->zc_capped, adapter->zc_off_cnt);
+	seq_printf(s, "shadow=%llu q_n=%u lost=%llu stale=%llu odd=%llu corrupt=%llu tx_dup=%llu rx_dup=%llu notag=%llu badfree=%llu dup_push=%llu dup_reap=%llu badstate=%llu rxdrop=%llu\n",
+		   adapter->zc_shadow, adapter->zc_q_n, adapter->zc_lost,
+		   adapter->zc_stale, adapter->zc_odd, adapter->zc_corrupt,
+		   adapter->zc_tx_dup, adapter->zc_rx_dup, adapter->zc_notag,
+		   adapter->zc_badfree, adapter->zc_dup_push,
+		   adapter->zc_dup_reap, adapter->zc_badstate,
+		   adapter->zc_rxdrop);
 	return 0;
 }
 
@@ -2041,6 +2390,50 @@ static int zx_eth_zc_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, zx_eth_zc_show, inode->i_private);
 }
+
+/*
+ * "zc_ev": 把所有"不在 BMU 空闲表里"或者还挂在隔离环上的槽位连同最近 8 条
+ * 事件流水打出来。定位泄漏/双还时不用重启，读一次就是一张快照。
+ */
+static int zx_eth_zc_ev_show(struct seq_file *s, void *data)
+{
+	struct zx_eth_adapter *adapter = s->private;
+	u32 bp;
+
+	for (bp = 0; bp < ZX_NUM_BUFFERS; bp++) {
+		struct skb_shared_info *sp;
+		u8 st = adapter->zc_state[bp];
+		int inring = adapter->zc_inring ?
+			     test_bit(bp, adapter->zc_inring) : -1;
+
+		if (st == ZX_ZC_BS_FREE && inring <= 0)
+			continue;
+		sp = zx_zc_shinfo(adapter, bp);
+		seq_printf(s, "bp=%u state=%u refs=%u tag=%08x skb=%p inring=%d n=%u ev=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+			   bp, st, zx_zc_refs(sp),
+			   (u32)(unsigned long)sp->destructor_arg,
+			   adapter->zc_skb[bp], inring,
+			   adapter->zc_ev_n[bp],
+			   adapter->zc_ev[bp][0], adapter->zc_ev[bp][1],
+			   adapter->zc_ev[bp][2], adapter->zc_ev[bp][3],
+			   adapter->zc_ev[bp][4], adapter->zc_ev[bp][5],
+			   adapter->zc_ev[bp][6], adapter->zc_ev[bp][7]);
+	}
+	return 0;
+}
+
+static int zx_eth_zc_ev_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_eth_zc_ev_show, inode->i_private);
+}
+
+static const struct file_operations zx_eth_zc_ev_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_eth_zc_ev_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
 
 static ssize_t zx_eth_zc_write(struct file *file, const char __user *ubuf,
 			       size_t count, loff_t *ppos)
@@ -2070,6 +2463,206 @@ static const struct file_operations zx_eth_zc_fops = {
 	.release	= single_release,
 };
 
+/*
+ * 实验入口：TX 描述符只有 16 字节，帧的位置由 byte7/byte8 里的 bp 给出，长度字段
+ * 14 位（最大 0x3fff）。发送路径因此一直假设"一个描述符 = 一个槽位里的整帧"，
+ * 并且把超过 1536 字节的帧直接丢掉。这个假设没被验证过，而它决定了 GRO 合并出来
+ * 的大帧（以及任何 SG/TSO 方案）能不能发出去。这里绕过协议栈，手工拼描述符和池里
+ * 的帧内容，用宿主上的 tcpdump 判读。
+ *
+ * 用法：echo "<len> <which> <off2> <seglen>" > txtest
+ *   len    整帧字节数（默认 1600）
+ *   which  0 = 只用单个描述符；bit0 = 链式两描述符并置第一个的 byte7 bit0；
+ *          bit1 = 第二个的 byte7 bit0 也置
+ *   off2   链式时第二个描述符的数据从槽位内哪个偏移开始（默认 16，也可试 0）
+ *   seglen 0 = 每个描述符写自己那段的长度；1 = 两个都写整帧总长
+ *   dev    只在这个端口上发（如 lan2）；不给则所有有链路的端口都发一份
+ *
+ * 帧内容：广播目的 + 本口 MAC + ethertype 0x88b5，从帧偏移 14 起是小端 32 位序号
+ * （0x5a5a0000 | k），十六进制就是 00 00 5a 5a, 01 00 5a 5a, …，能看出对端收到的
+ * 字节连不连续、第二段从哪儿接上来。每个有链路的端口各发一份，省得猜宿主接在哪。
+ */
+static ssize_t zx_eth_txtest_write(struct file *file, const char __user *ubuf,
+				   size_t count, loff_t *ppos)
+{
+	struct zx_eth_adapter *adapter = file->private_data;
+	unsigned int len = 1600, which = 0, off2 = 16, seglen = 0;
+	char buf[48], dev[IFNAMSIZ] = "";
+	u8 *frame;
+	int i, p, sent = 0;
+	u16 first_bp = 0, last_bp = 0;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = 0;
+	if (sscanf(buf, "%u %u %u %u %15s", &len, &which, &off2, &seglen,
+		   dev) < 1)
+		return -EINVAL;
+	if (len < ETH_ZLEN || len > 0x3fff)
+		return -EINVAL;
+	/* 第二段必须整段落在自己的槽位里，否则会写坏池里别的槽位 */
+	if (off2 > ZX_BUF_SIZE || off2 + (len - len / 2) > ZX_BUF_SIZE)
+		return -EINVAL;
+
+	frame = kmalloc(len, GFP_KERNEL);
+	if (!frame)
+		return -ENOMEM;
+	memset(frame, 0xff, 6);
+	memset(frame + 6, 0, 6);
+	frame[12] = 0x88;
+	frame[13] = 0xb5;
+	for (i = 14; i + 4 <= (int)len; i += 4) {
+		u32 k = (i - 14) >> 2;
+
+		frame[i] = k & 0xff;
+		frame[i + 1] = (k >> 8) & 0xff;
+		frame[i + 2] = 0x5a;
+		frame[i + 3] = 0x5a;
+	}
+	while (i < (int)len)
+		frame[i++] = 0;
+
+	/*
+	 * 打印发送前的 MAC 计数器：硬件到底把这个帧算没算进 tx_octets，
+	 * 是"MAC 拒发"和"宿主没收到"之间的分水岭。计数器是硬件绝对值，
+	 * 下一次调用打印的就是这一轮传完后的值。
+	 */
+	for (p = 0; p < ZX_NUM_PORTS; p++) {
+		struct net_device *nd = adapter->ports[p];
+		struct zx_eth_priv *pv;
+		void __iomem *mb;
+
+		if (!nd || !netif_running(nd))
+			continue;
+		if (dev[0] && strcmp(nd->name, dev))
+			continue;
+		pv = netdev_priv(nd);
+		mb = adapter->base + ZX_MAC_PORT(pv->port);
+		dev_info(adapter->dev,
+			 "txtest: %s 发送前 MIB tx_octets=%u tx_frames=%u\n",
+			 nd->name, readl(mb + ZX_MAC_TX_OCTETS),
+			 readl(mb + ZX_MAC_TX_FRAMES));
+	}
+
+	spin_lock_bh(&adapter->tx_lock);
+	zx_tx_reclaim(adapter);
+	for (p = 0; p < ZX_NUM_PORTS; p++) {
+		struct net_device *nd = adapter->ports[p];
+		struct zx_eth_priv *priv;
+		unsigned int ndesc, nslots, seg[2], cut;
+		u16 bp[9] = { 0 };
+		int k, ok = 1;
+
+		if (!nd || !netif_running(nd))
+			continue;
+		if (dev[0] && strcmp(nd->name, dev))
+			continue;
+		priv = netdev_priv(nd);
+		ndesc = (which & 0x3) ? 2 : 1;
+		/* 一个描述符要读出槽位时，后面的槽位得是相邻的才有意义 */
+		nslots = (len + 16 + ZX_BUF_SIZE - 1) / ZX_BUF_SIZE;
+		if (ndesc == 2)
+			nslots = 2;
+		if (adapter->tx_pending + ndesc > ZX_TX_QUEUE_LIMIT)
+			break;
+
+		for (k = 0; k < (int)nslots; k++) {
+			bp[k] = zx_bmu_alloc_bp(adapter);
+			if (bp[k] < 0 || bp[k] >= ZX_NUM_BUFFERS) {
+				ok = 0;
+				break;
+			}
+		}
+		if (!ok) {
+			while (k-- > 0)
+				zx_bmu_free_bp(adapter, bp[k]);
+			break;
+		}
+		if (ndesc == 1) {
+			for (k = 1; k < (int)nslots; k++)
+				if (bp[k] != bp[0] + k) {
+					dev_warn(adapter->dev,
+						 "txtest: 槽位不相邻 bp=%u %u\n",
+						 bp[0], bp[k]);
+					ok = 0;
+				}
+			if (!ok) {
+				for (k = 0; k < (int)nslots; k++)
+					zx_bmu_free_bp(adapter, bp[k]);
+				break;
+			}
+		}
+
+		cut = len / 2;
+		if (ndesc == 1) {
+			memcpy((u8 *)adapter->pkt_pool +
+			       (u32)bp[0] * ZX_BUF_SIZE + 16, frame, len);
+			seg[0] = len;
+		} else {
+			/* 第二段放 +off2，之后靠 tcpdump 看硬件从哪里开始读 */
+			memcpy((u8 *)adapter->pkt_pool +
+			       (u32)bp[0] * ZX_BUF_SIZE + 16, frame, cut);
+			memcpy((u8 *)adapter->pkt_pool +
+			       (u32)bp[1] * ZX_BUF_SIZE + off2, frame + cut,
+			       len - cut);
+			seg[0] = seglen ? len : cut;
+			seg[1] = seglen ? len : len - cut;
+		}
+		if (adapter->pkt_pool_cacheable)
+			dma_sync_single_for_device(adapter->dev,
+						   adapter->pkt_pool_dma +
+						   (u32)bp[0] * ZX_BUF_SIZE,
+						   16 + len, DMA_TO_DEVICE);
+
+		for (k = 0; k < (int)ndesc; k++) {
+			u32 idx = (adapter->tx_cur_idx + k) % ZX_NUM_TX_DESC;
+			__le32 *d = (__le32 *)adapter->tx_ring +
+				    idx * (ZX_DESC_SIZE / sizeof(*d));
+
+			d[0] = cpu_to_le32(0x80 |
+					   (ZX_PORT_TX_QUEUE(priv->port) << 20));
+			d[3] = cpu_to_le32(0x3 | ((seg[k] & 0x3fff) << 2));
+			d[1] = cpu_to_le32(0x10000);
+			d[2] = cpu_to_le32(0x21000000 |
+					   ((seg[k] & 0x3fff) << 9));
+			((u8 *)d)[7] = (u8)((bp[k] & 0x7f) << 1) |
+				       ((which & (1u << k)) ? 1 : 0);
+			((u8 *)d)[8] = (u8)(bp[k] >> 7);
+			/*
+			 * 一次门铃只启动一个描述符：正常发送也是这么写的。
+			 * 上一轮把 4 个描述符攒起来只敲一次门铃，硬件只吃掉一个，
+			 * 其余卡在 ring 里，整条发送路径随后慢到 3 秒一个包
+			 * （tx_pending 留了 3，重启才清）。
+			 */
+			dma_wmb();
+			writel(1, adapter->base + ZX_DMA_TX_START);
+		}
+		adapter->tx_cur_idx += ndesc;
+		adapter->tx_pending += ndesc;
+		if (!sent)
+			first_bp = bp[0];
+		last_bp = bp[ndesc - 1];
+		sent++;
+	}
+	spin_unlock_bh(&adapter->tx_lock);
+	kfree(frame);
+	if (!sent)
+		return -EAGAIN;
+	dev_info(adapter->dev,
+		 "txtest: len=%u which=%u off2=%u seglen=%u dev=%s 端口 %d 个，bp=%u..%u，tx_pending=%u\n",
+		 len, which, off2, seglen, dev[0] ? dev : "(全部)", sent,
+		 first_bp, last_bp, adapter->tx_pending);
+	return count;
+}
+
+static const struct file_operations zx_eth_txtest_fops = {
+	.owner		= THIS_MODULE,
+	.open		= simple_open,
+	.write		= zx_eth_txtest_write,
+};
+
 static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 {
 	struct dentry *dir = debugfs_create_dir(dev_name(adapter->dev), NULL);
@@ -2077,6 +2670,8 @@ static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 	debugfs_create_devm_seqfile(adapter->dev, "dma_state", dir,
 				    zx_eth_dma_state_show);
 	debugfs_create_file("zc", 0644, dir, adapter, &zx_eth_zc_fops);
+	debugfs_create_file("zc_ev", 0444, dir, adapter, &zx_eth_zc_ev_fops);
+	debugfs_create_file("txtest", 0200, dir, adapter, &zx_eth_txtest_fops);
 }
 
 static void zx_pkt_pool_free(struct device *dev,
@@ -2204,10 +2799,30 @@ static int zx_eth_probe(struct platform_device *pdev)
 	 * 登记给 skb destructor（SoC 上只有一个以太网控制器）。
 	 */
 	adapter->zc_state = devm_kzalloc(dev, ZX_NUM_BUFFERS, GFP_KERNEL);
-	if (!adapter->zc_state) {
+	adapter->zc_skb = devm_kzalloc(dev, ZX_NUM_BUFFERS *
+				       sizeof(*adapter->zc_skb), GFP_KERNEL);
+	adapter->zc_snap = devm_kzalloc(dev, (size_t)ZX_NUM_BUFFERS * ZX_ZC_CANARY,
+					GFP_KERNEL);
+	adapter->zc_snap_len = devm_kzalloc(dev, ZX_NUM_BUFFERS *
+					    sizeof(*adapter->zc_snap_len),
+					    GFP_KERNEL);
+	adapter->zc_free_at = devm_kzalloc(dev, ZX_NUM_BUFFERS *
+					   sizeof(*adapter->zc_free_at), GFP_KERNEL);
+	adapter->zc_free_tog = devm_kzalloc(dev, ZX_NUM_BUFFERS, GFP_KERNEL);
+	adapter->zc_ev = devm_kzalloc(dev, ZX_NUM_BUFFERS *
+				      sizeof(*adapter->zc_ev), GFP_KERNEL);
+	adapter->zc_ev_n = devm_kzalloc(dev, ZX_NUM_BUFFERS, GFP_KERNEL);
+	adapter->zc_inring = devm_kzalloc(dev, BITS_TO_LONGS(ZX_NUM_BUFFERS) *
+					  sizeof(unsigned long), GFP_KERNEL);
+	if (!adapter->zc_state || !adapter->zc_skb || !adapter->zc_snap ||
+	    !adapter->zc_snap_len || !adapter->zc_free_at ||
+	    !adapter->zc_free_tog || !adapter->zc_ev || !adapter->zc_ev_n ||
+	    !adapter->zc_inring) {
 		ret = -ENOMEM;
 		goto err_dma;
 	}
+	for (i = 0; i < ZX_ZC_Q_LEN; i++)
+		adapter->zc_q_bp[i] = 0xffff;
 	spin_lock_init(&adapter->zc_lock);
 	WRITE_ONCE(adapter->zc_rx, zc_rx);
 	if (zc_rx) {
