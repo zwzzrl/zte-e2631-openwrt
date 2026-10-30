@@ -1328,16 +1328,18 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 			dev_kfree_skb_any(skb);
 			return NETDEV_TX_OK;
 		}
-		/*
-		 * The pool is cacheable: push the frame we just copied out to
-		 * the point of coherence before the BMU reads it.
-		 */
-		if (adapter->pkt_pool_cacheable)
-			dma_sync_single_for_device(adapter->dev,
-						   adapter->pkt_pool_dma +
-						   (u32)bp * ZX_BUF_SIZE,
-						   16 + len, DMA_TO_DEVICE);
 	}
+	/*
+	 * 池是可缓存映射时，帧必须在 BMU 读之前推到一致性点。零拷贝这一支同样
+	 * 需要：帧是硬件 DMA 进来的，读之前失效过，但协议栈（转发时的 L2 重写、
+	 * NAT66、flowtable 的改头）可能已经把它改脏在 cache 里，不 clean 就等于
+	 * 把旧内容发出去。默认映射是非缓存，所以这段平时不执行。
+	 */
+	if (adapter->pkt_pool_cacheable)
+		dma_sync_single_for_device(adapter->dev,
+					   adapter->pkt_pool_dma +
+					   (u32)bp * ZX_BUF_SIZE,
+					   16 + len, DMA_TO_DEVICE);
 
 	t_copy = ZX_TS();
 	tx_idx = adapter->tx_cur_idx % ZX_NUM_TX_DESC;
