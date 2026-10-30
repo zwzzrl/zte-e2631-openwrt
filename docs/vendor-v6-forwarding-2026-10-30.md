@@ -12,13 +12,18 @@
 | 路径 | 实测 | 谁在转 |
 |---|---|---|
 | **网桥/扩展器路径**（eth ↔ Wi-Fi 上行，L2） | iperf3 over `fe80::` **899–932 Mbit/s**，4 并发 910–919，反向 928；537 MB 流量期间盒子 **CPU 侧端口计数只增 789 B** | **交换芯片硬件转发**（线速） |
-| **路由路径**（`ip6_forward`，本机进本机出） | 263 Mbit/s 突发 500/500 全转；373 Mbit/s 突发 20000 包只转 7672（≈**143 Mbit/s**），CPU 打满；`ffeinfo` 里 `curr:0 / ipv6_udp:0 / npu:0` | **纯 CPU 软件转发**，FFE / NPU 都没参与 |
+| **路由路径**（`ip6_forward`，本机进本机出，出 br0） | 263 Mbit/s 突发 500/500 全转；373 Mbit/s 突发 20000 包只转 7672（≈**143 Mbit/s**），CPU 打满；`ffeinfo` 里 `curr:0 / ipv6_udp:0 / npu:0` | **纯 CPU 软件转发**，连 FFE 都没进 |
+| **WAN↔LAN 真路由**（eth1 进 eth2 出，§8 补测） | iperf3 v6 TCP **918–928 Mbit/s**（60 s 6.41 GB）；UDP 716 Mbit/s@67 kpps；`ipv6_tcp:5 npu:1`、`npu_flows:1`、`cmd:[tcp_skip]->[ipv6_set]->[eth_set]` | **NPU 表项装上了、但硬件没命中（`hit:0`），包仍是 CPU 走 FFE 软快转**（≈4.7 µs/包） |
 | 出厂默认的路由转发 | `net.ipv6.conf.br0.forwarding = 0`（`all=1`），即**默认不转发** | — |
 
-所以"原厂的 IPv6 转发"在这台机器上真实存在的只有两种：**硬件二层转发（线速）** 与
-**CPU 三层转发（百兆级）**。这跟 `npu_cap` 矩阵完全对得上：v6 只支持
-`pon*/gpon*/ptm0 ↔ eth*/wlan*` 的 tcp/udp/mc，`eth* → eth0` 只有 `ipv4_raw`，
-所以 eth↔eth 的 v6 永远落不到 NPU 上。
+所以"原厂的 IPv6 转发"在这台机器上真实存在的是三种形态：**硬件二层转发（线速、CPU 零参与）**、
+**br0 出方向的 CPU 三层转发（百兆级、FFE 都没进）**，以及 §8 补测的 **WAN↔LAN 形态：
+NPU 表项确实装得上，但数据面仍由 CPU 的 FFE 软快转承担（~900 Mbit/s / 0.4 核）**。
+
+> 修正：本文第一版据此写过"eth↔eth 的 v6 永远落不到 NPU 上 / v6 NPU 在这块板上不可能"——
+> **这条已被 §8 的实测推翻**。能力表 `index[1]`（rxdev `eth*` → txdev `eth*`）里确实带
+> `ipv6_tcp`/`ipv6_udp`，原厂真会把 v6 流写进 NPU 表（`ipv6_set`+`eth_set` 命令链、真实端口/MAC），
+> 只是那张表在硬件侧不生效（`hit` 恒 0，`createfail` 一路涨）。
 
 ---
 
@@ -216,3 +221,138 @@ ip6tables -t filter -D FORWARD -j ACCEPT ; iptables -t filter -D FORWARD -j ACCE
    回落 slot0，再从 slot0 的 WebUI 把 `e2631-openwrt-v12fix-…-slot1.bin` 写进 slot1。
 3. 原厂这套 `br0.forwarding=0` 的做法值得对照我们的 OpenWrt：我们是不是也该在
    `flow_offloading` 关掉时把 v6 转发收在网桥口之外，避免 v6 走 CPU。
+4. **（§8 之后新增，优先级最高）** 照原厂 `switch.ko` 的 `ipv6_set` 命令块对齐 v6 的 NPU 表项写法，
+   并查清 `hit` 恒 0 的原因：到底是表项没真正落到 ASIC（外部 16 K 槽表缺存储），还是我们的测试
+   拓扑（eth1/eth2 拆出 br0、不走交换芯片的 VLAN/PVID）让 ACL 匹配不到。这两种原因的下一步
+   完全不同——前者要绕过外部表，后者只要把端口放回交换芯片的 VLAN 里再测一次。
+5. 若走"搬 FFE"路线：原厂 FFE 编在内核里（`vendor-vmlinux.bin` 里能查到 `npu_flows`/`retry_left`/
+   `activepps` 等格式串，`switch.ko` 只负责把表项写进硬件），要移植的是内核侧那块，不是 `switch.ko`。
+
+---
+
+## 8. 补测（同日晚）：WAN↔LAN 真路由流，NPU 的 v6 表项真的装上了，但数据面没交给硬件
+
+§3/§4 测的是"本机进本机出、出 br0"的形态，`ffeinfo` 全 0。这一轮换成**原厂当路由器、两侧都是真实
+以太口**的形态（能力表 `index[1]`：`rxdev: eth*` → `txdev: eth*`，条目里明确带 `ipv6_tcp/udp`）：
+
+```
+          (WAN 侧)                                    (LAN 侧)
+本机 ens34 ── eth1 [原厂盒子] eth2 ── desktop-a5a2tk2
+ fd00:aa::2      fd00:aa::1/64   fd00:1::1/64      fd00:1::b4b4:411a:cbff:1c8
+                (br0 里只留 eth3/nbif0/wlan0/apcli5g0，管理走 Wi-Fi 上联 192.168.43.119:2323 + 串口)
+```
+
+- `brctl delif br0 eth1/eth2` 把两口拆成三层口；桥 FDB 先验证过归属：主机 MAC 学在 port1=eth1，
+  desktop MAC 学在 port2=eth2（所以 WAN 侧=eth1、LAN 侧=eth2 是实测出来的，不是猜的）。
+- 两口拆出后原来的链路本地地址会消失（桥端口状态下 addrconf 收掉了），要手工补：
+  `ip -6 addr add fe80::e660:4dff:fe86:71ef/64 dev eth1`（eth2 同）。
+- 顺手把 `eth1` 的 MAC 改成 `02:11:22:33:44:55`（原来 eth0..eth3 共用 `e4:60:4d:86:71:ef`，
+  两口同 L2 会 MAC 抖动），这一步对结果没影响但让邻居表干净。
+- 主机侧：`ens34: fd00:aa::2/64` + `ip -6 route add fd00:1::/64 via fe80::e660:4dff:fe86:71ef dev ens34`。
+  desktop 的防火墙只放行 `192.168/16`、`fe80::/10`、`fc00::/8`，所以源地址用 ULA（`fd00:aa::2`）。
+
+### 8.1 desktop 的可路由地址怎么来的（Windows 不会自编地址）
+
+原厂 `/bin/dnsmasq` 在这台机器上一执行就卡死（连 `dnsmasq --version` 都不返回，被 ZTE 改过），
+所以自己写了一个 33 KB 的静态 ARM 小程序 `ra6`：在指定网卡上每 3 s 发一个 RA（前缀 `fd00:1::/64`、
+A=L=1、路由寿命 1800 s），同时用 `AF_PACKET` 抓该口的 IPv6 帧打印收发地址。
+
+- 源码/构建：`.scratch/ra6.c`，工具链复用 `工作文件/08-源码与构建树/openwrt/staging_dir/toolchain-arm_cortex-a9_gcc-14.4.0_musl_eabi/bin/arm-openwrt-linux-muslgnueabi-gcc -static -Os -s`
+- 上机方式：箱子**出不了 TCP**（`wget` 打任何非 127.0.0.1 的地址都 rc=5，`tftp` 超时，没有 `nc`），
+  所以用 `printf '\xNN…' >> /tmp/ra6.x` 分 38 块灌进去（`md5sum` 对过），`setsid /tmp/ra6 eth2 fd00:1:: 64 &` 跑起来。
+- 结果（抓包原文，`/tmp/ra6.log`）：
+
+```
+RX :: -> ff02::1:ff31:3714 icmp6=135 target=fd00:1::c27c:7eb6:c931:3714     <- Windows 对自己新地址做 DAD
+RX :: -> ff02::1:ffff:1c8  icmp6=135 target=fd00:1::b4b4:411a:cbff:1c8
+RX fd00:1::b4b4:411a:cbff:1c8 -> ff02::1 icmp6=136 target=fd00:1::b4b4:...  <- 无请求 NA，地址生效
+RX 2408:8459:1630:2fd3:b4b4:411a:cbff:1c8 -> ff02::1:ff00:c3 ...             <- 它还留着桥接时代办公室路由发的全球地址
+```
+
+即 desktop 自动拿到 `fd00:1::b4b4:411a:cbff:1c8`（另有一个临时地址 `fd00:1::c27c:…:3714`），
+默认路由指向盒子 eth2 的 LL——**两侧都通了**：`ping -6 -I fd00:aa::2 fd00:1::b4b4:…` 3/3 回。
+
+### 8.2 吞吐（全网都是这条真路由流）
+
+| 协议 | 参数 | 结果 |
+|---|---|---|
+| TCP | `-t 10` | **928 Mbit/s** sender / 925 receiver，1.08 GB |
+| TCP | `-t 45` | 907 / 906 Mbit/s，4.75 GB，237 retr |
+| TCP | `-t 60` | 918 / 918 Mbit/s，6.41 GB，297 retr |
+| UDP | `-b 900M -t 20` | **716 Mbit/s @ 67.1 kpps**，0/1 336 469 丢 |
+| UDP | `-b 900M -t 15` | 682 Mbit/s @ 63.8 kpps |
+| UDP | `-b 50M -t 16` | 50 Mbit/s @ 4.66 kpps |
+
+### 8.3 流表原文（这是本轮最关键的一张纸）
+
+```
+ipv6_tcp:5 npu:1   curr:5  pps:90260  kbps:979332  npuflowcnt:1  createfail:16
+name:ipv6_tcp, enable:2, flows:5, npu_flows:1, slot_size:1024
+==flow[   0]: layer:3, npu:1 1, attr:0003, last_used:321026,
+   rx:(2779708:3891591200), tx:(2779708:3930507112), pps:86371, bps:977028752,
+   lc:0, thresh:0, hit:0, processor:cpu0, rps:cpu0
+  src_key:/ eth1/[02:11:22:33:44:55]:[00:0c:29:4b:59:2a]/[fd00:aa::2]:[fd00:1::b4b4:411a:cbff:1c8]:T  0:P  6]/[34637: 5201]
+  dst_key:/ eth2/[d8:43:ae:68:18:28]:[e4:60:4d:86:71:ef]/[fd00:aa::2]:[fd00:1::b4b4:411a:cbff:1c8]:T  0:P  6]/[34637: 5201]
+  cmd:[tcp_skip+0x0/0x3c]->[ipv6_set+0x0/0x1a0]->[eth_set+0x0/0x6c]->
+  passed dev:[eth1]->[eth2]-> mtu[1500], ll_rs[32] gw[fd00:1::b4b4:411a:cbff:1c8],
+  npu activepps[20] retry_left[0]
+  ct@c55ceee0: l3[ipv6] l4[tcp] timeout[7499] [--REPLIED] [--ASSURED] [ORIGI DIR]
+```
+
+UDP 同样（`ipv6_udp:3 npu:2`，`P 17`，`pps:66241`，`src_key …/[34955: 5201]`，
+`npu_flows:2`），`cmd` 链同族。
+
+**所以：v6 的 NPU 表项在这块板上装得上**，而且是拿我们逆出来的那套 ACL 命令族
+（`ipv6_set` + `eth_set`，`hf_set_l3_entry`/`aclBuildHashAndAclRule`）写进去的，端口/MAC/五元组
+都是真实值。**上一版"v6 落不到 NPU / 这块板不可能"的结论错了。**
+
+### 8.4 但数据面没交给硬件（四条独立证据）
+
+1. **CPU 是逐包在处理**：空闲基线 `sirq 0.3%`；流量中 `sirq 30–44%`；而且 CPU 占用随包速率线性缩放
+   ——4.66 kpps→3.6%、63.8 kpps→29.5~34.6%、86 kpps→39.8~44%（≈4.7–7.7 µs/包）。固定开销不会这样。
+2. **反向没有 ACK 的 UDP 也一样**（63.8 kpps→30% sirq），排除了"CPU 只是在处理回程 ACK"。
+3. **CPU 侧端口计数 1:1 跟着流量走**：60 s TCP 期间 `eth2` 的 tx 字节按 1.04 / 1.01 / 0.93 Gbit/s
+   每段增长（32 位回绕已折算）；而 §3 的纯交换流量下这些计数几乎不动（537 MB 只增 789 B），
+   说明它们是 **CPU 侧计数、不是交换芯片 MIB**——即 CPU 把每一帧都发了一遍。
+4. **流表里 `hit:0`**：整条流 3.9 GB / 278 万包走完，硬件命中计数还是 0。
+
+配套的另一个信号：`createfail` 一路涨——`0 → 4 → 10 → 13 → 15 → 16 → 20 → 21 → 25 → 27 → 30 → 31 → 49`，
+每建一条流都要失败好几次才成功一次。这跟上一轮 RE 的结论（v6 表项要写外部 16 K 槽表，而那块地址
+在这颗芯片上是启动 ROM，写就 imprecise abort）吻合：**驱动侧装上了，硬件侧没生效**。
+
+### 8.5 对项目的直接意义
+
+原厂这套 v6"加速"= **NPU ACL 分类打标（`tcp_skip`+`ipv6_set`+`eth_set`）+ 内核 FFE 五元组软快转**，
+CPU 不退出数据面；它把 v6 转发压到 ~4.7 µs/包（900 Mbit/s 用 0.4 核），功劳在 FFE，不在 ASIC。
+
+于是我们要做 v6 加速只有两条路：
+
+1. **把 FFE 这套软快转搬过来**（纯软件，靠 ACL 把流标出来让包走近路）：确定能做，天花板 ≈ 900 Mbit/s / 0.4 核；
+2. **把 ASIC 的 v6 L3 转发真正打通**：先照着原厂 `switch.ko` 里 `hf_set_l3_entry`/`aclBuildHashAndAclRule`
+   的 `ipv6_set` 命令块逐字节对齐（这是原厂自己写过的、有真实 v6 流的样本），再看它到底把表项放哪、
+   为什么 `hit` 恒 0——原厂自己都没打通，`createfail` 风暴 + `hit:0` 就是证据。
+
+### 8.6 本轮临时改动（盒子现在就是这个测试拓扑，全部运行态、没写 flash）
+
+```sh
+# 已做：
+brctl delif br0 eth1 ; brctl delif br0 eth2
+ip link set eth1 address 02:11:22:33:44:55
+ip -6 addr add fd00:aa::1/64 dev eth1 ; ip -6 addr add fd00:1::1/64 dev eth2
+ip -6 addr add fe80::e660:4dff:fe86:71ef/64 dev eth1  # eth2 同
+ip addr add 10.99.0.1/24 dev eth1 ; ip addr add 10.99.1.1/24 dev eth2
+ip addr add 10.200.0.1/24 dev pon ; ip -6 addr add fd00:ff::1/64 dev pon ; ifconfig pon up
+for f in /proc/sys/net/ipv6/conf/*/forwarding; do echo 1 > $f; done
+ip6tables -I FORWARD 1 -j ACCEPT
+setsid /tmp/ra6 eth2 fd00:1:: 64 > /tmp/ra6.log 2>&1 &
+# 还原：
+killall ra6
+ip6tables -D FORWARD -j ACCEPT
+brctl addif br0 eth1 ; brctl addif br0 eth2
+ip addr del 10.99.0.1/24 dev eth1 ; ip addr del 10.99.1.1/24 dev eth2
+ip -6 addr del fd00:aa::1/64 dev eth1 ; ip -6 addr del fd00:1::1/64 dev eth2
+ip link set eth1 address e4:60:4d:86:71:ef   # 回到原 MAC
+# 管理通道：192.168.43.119:2323（走 Wi-Fi 上联，这是把 eth1/eth2 拆出 br0 后唯一的网络入口）或串口
+```
+
+主机侧临时：`ens34` 加了 `10.99.0.2/24`、`fd00:aa::2/64`、`ip -6 route add fd00:1::/64 via fe80::e660:4dff:fe86:71ef dev ens34`。
