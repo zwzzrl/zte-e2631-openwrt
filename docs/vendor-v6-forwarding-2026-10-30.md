@@ -330,7 +330,11 @@ CPU 不退出数据面；它把 v6 转发压到 ~4.7 µs/包（900 Mbit/s 用 0.
 1. **把 FFE 这套软快转搬过来**（纯软件，靠 ACL 把流标出来让包走近路）：确定能做，天花板 ≈ 900 Mbit/s / 0.4 核；
 2. **把 ASIC 的 v6 L3 转发真正打通**：先照着原厂 `switch.ko` 里 `hf_set_l3_entry`/`aclBuildHashAndAclRule`
    的 `ipv6_set` 命令块逐字节对齐（这是原厂自己写过的、有真实 v6 流的样本），再看它到底把表项放哪、
-   为什么 `hit` 恒 0——原厂自己都没打通，`createfail` 风暴 + `hit:0` 就是证据。
+   为什么 `hit` 恒 0。
+
+> **更正（同晚）**：这里原先写的是"原厂自己都没打通，`createfail` 风暴就是证据"——那句是错的。
+> `createfail` 的成因已经追到底，见 §8.7：它是 tm.ko 里"按源 MAC 查子网 ID"查不到时返回的 `-12`，
+> 触发条件是我测试时把 eth1 的 MAC 改成 `02:11:22:33:44:55`，跟硬件表项、跟外部哈希表都无关。
 
 ### 8.6 本轮临时改动（盒子现在就是这个测试拓扑，全部运行态、没写 flash）
 
@@ -356,3 +360,83 @@ ip link set eth1 address e4:60:4d:86:71:ef   # 回到原 MAC
 ```
 
 主机侧临时：`ens34` 加了 `10.99.0.2/24`、`fd00:aa::2/64`、`ip -6 route add fd00:1::/64 via fe80::e660:4dff:fe86:71ef dev ens34`。
+
+> 状态：`eth1` 的 MAC 已按 §9.4 改回原厂 `e4:60:4d:86:71:ef`（地址、转发开关都还在），其余临时改动仍在。
+
+## 9. createfail 一路上涨到底是怎么回事（把 §8.5 那句"原厂没打通"收回）
+
+**一句话**：`createfail` 数的是 FFE 向 ACL/NPU 装表项的**失败返回次数**；这次的 `-12`(ENOMEM) 来自
+tm.ko 里"按源 MAC 查子网 ID"这一步——**这条流的源 MAC 不在那张 16 项的 ONU MAC 表里**。
+这是软件在 ACL/哈希表编程**之前**的干净返回，一次硬件写都没发生；而那个查不到的 MAC 正是我测试时手工改的。
+
+### 9.1 计数器 == 日志行数，1:1（同一时刻实测，两次）
+
+`timeout -t 6 cat /dev/logger_main > /tmp/lg.txt`（6485 行，完整落盘后再数，别用 `cat|grep -c` 边读边数，
+环形日志读得慢会被 `timeout` 截断成假数）：
+
+| 观测时刻 | `createfail` | `hardfast_session_add failed` 行 | `hf_set_l3_entry FAIL` 行 | `invalid source mac addr` 行 |
+|---|---|---|---|---|
+| 第一轮（首批失败） | 51 | 51 | 51 | 51 |
+| 追查后（A/B 之后） | 57 | 57 | 57 | 57（全部是 `02:11:22:33:44:55`） |
+
+也就是说 `createfail` 没有别的来源：每失败一次，`switch.ko` 打两行、tm.ko 打一行，计数器 +1。
+
+### 9.2 `-12` 的产生位置与调用链（地址均来自 tm.ko 反汇编）
+
+```
+FFE(内核 ffe_*)
+ └ switch.ko: sw_acl_l3_hardfast_session_add (0x28e0)
+    └ tm.ko: zte_api_fast_l3_session_add (0x5ce74)
+       └ tm_add_acl_flow_rule (0x51a30)
+          ├ 第一步: addFlowOperInfo (0x4fe70, 调用点 0x51a9c)
+          │   └ findSubnetIdBySrcMac (0x4fdd8, 调用点 0x50438)
+          │      └ 用 pp_pm_get_onu_mac_ram_info 取 0..15 共 16 项 MAC，memcmp 6 字节
+          │         └ 找不到: printk("invalid source mac addr %02x:...")(串@0x271e8)
+          │                     然后 mvn r0,#11 (=0xFFFFFFF4=-12) 返回 (0x4fe58)
+          ├ 失败即解锁返回 r4，不打印 (0x51aa0 subs / 0x51ab0 mov r0,r4)
+          │
+          ├ 只有 addFlowOperInfo 返回 0 才会走到:
+          │   addAclRule (0x4f3a8, 调用点 0x51aec) 或 tm_acl_fast_add (0x51964, 0x51b18)
+          │     └ tm_acl_fast_add_v4v6 → cla_set_hash_table / cla_set_external_hash_table
+          └ 返回 -12
+       └ 0x5d184 `subs sl,r0,#0; bne 0x5d3fc` → 解锁、`mov r0,sl` 原样返回 -12（不打印）
+ └ switch.ko: 打印 "[sw_acl_l3_hardfast_session_add] zte_api_fast_l3_session_add failed -12"
+ └ hf_set_l3_entry: 打印 "[hf_set_l3_entry] FAIL"，返回 0
+ └ FFE: createfail++，按 retry_left 稍后重试
+```
+
+关键：失败发生在 `addFlowOperInfo`，**比任何 ACL/哈希表编程都早**（`addAclRule`/`tm_acl_fast_add` 是它成功之后才走的）。
+
+### 9.3 为什么"写外部 16K 槽表 = 写启动 ROM"这个推断是错的
+
+- 失败点在 `addFlowOperInfo` 阶段，`cla_set_hash_table`/`cla_set_external_hash_table` 根本没被调到；
+- 日志里没有任何 Oops / data abort / bus error，只有 9.1 那三行正常 printk；
+- `cat /sys/devices/platform/tm/ppCla/showaclinfoall` 打出的 ACL 哈希表只有 **12 项**在用（上限 16000，`This rule mode is full`），离满得很远；
+- 真是"写启动 ROM"的话，现象应是总线异常/挂死，而不是一个带返回码的 `-12`。
+
+### 9.4 A/B 实测：改 MAC → 涨；改回原厂 MAC → 停
+
+同一拓扑、同一条 10 s 的 v6 路由流（host → desktop iperf3）：
+
+| eth1 MAC | 10 s 吞吐 | createfail 增量 | `invalid source mac` 增量 | NPU 表项 |
+|---|---|---|---|---|
+| `02:11:22:33:44:55`（我手工改的） | 918 Mbit/s | **+4** | +6（含前一次探测的 2） | 装不上 |
+| `e4:60:4d:86:71:ef`（原厂） | 927 Mbit/s | **0** | **0** | `ipv6_tcp:4 npu:2`，`npuflowcnt:2` |
+
+改回原厂 MAC 后 createfail 立刻停涨（57 不动），同时 NPU 表项正常装上——这一条同时否掉了
+"v6 表项装不上"和"表项写硬件就异常"两种说法。
+
+### 9.5 "每建一条流要失败好几次才成功一次"要这么读
+
+计数器数的是**尝试次数**，不是流的条数：
+
+- 源 MAC 认不出来的流（就是我改出来的那个口）**每次重试都失败**，失败是确定的，于是同一条流会不断 +1；
+- 同一时间源 MAC 能被认出来的流（eth2 / 原厂口）**一次就装上**，不产生 createfail。
+
+所以 0→4→10→13→…→49→51 是这批"坏 MAC"流被反复重试的累计，不是"同一条流试了几次终于成功"。
+
+### 9.6 还剩的真问题（`hit:0`，与 createfail 无关）
+
+B 组里表项装上了（`ipv6_tcp:4 npu:2`）而数据面仍然走 CPU（§8.4 四条证据不变）。下一轮要查的是
+ACL 在端口/VLAN 维度上是否真的匹配：测试拓扑把 eth1/eth2 拆出了 br0，端口 PVID/成员关系跟原厂不一样，
+这一层不匹配同样会让 `hit` 掉到 0。
