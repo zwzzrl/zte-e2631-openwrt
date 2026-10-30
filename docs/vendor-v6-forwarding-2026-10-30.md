@@ -165,6 +165,11 @@ ULA 在 4.1 的 `ipv6_addr_scope()` 里与链路本地同档，路由器按规�
 
 ## 5. ⚠ 本轮发现：slot0 已经不是出厂镜像
 
+> **后续（2026-10-30 18:17，已处理）**：按用户要求把 slot0 写回了 10-27 的出厂备份
+> `mtd5_slot0.bin`（V1.0.0.8B8.8000，头在 0x1B40000，serial 52），slot1 原样保留，
+> 盒子现在从 slot0 起、跑纯原厂 8000。完整步骤与证据见
+> `docs/slot0-restore-factory-2026-10-30.md`；本节以下保留当时的发现记录。
+
 `e2631-fwslot switch` 要先把 slot0 的版本头 `slot_verify()` 一遍（kernel/fs 两段都算
 CRC），它通过了；而它读到的是 `header@0x1460000 serial=48 version="V1.0.0.8B8.9900"`，
 头里 `body=0x1460000`、`fs_size=0x1120000`、`fs_crc=0xe84708cf`。
