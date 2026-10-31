@@ -1813,6 +1813,10 @@ static bool zx_ffe_egress_switch_usable(struct zx_eth_adapter *adapter, u16 id)
  * 现在恒 n == 1（design §5 第 1 条的批量预留）：一批一帧，与 P2 的提交段**逐字节
  * 等价**——同一个描述符内容、同一次 TX_START、同样的失败返回。将来的批量提交
  * （一次取锁/一次记账）只改这个函数内部，分层与调用方不变。
+ *
+ * TOCTOU：flow->egress_id 可被进程上下文（ffe_add 同 key 更新 / learn_dup）
+ * 原地改写，所以本函数只在入口取一次快照；快照与之前 usable() 之间仍有窗口
+ * （判过的口到提交时可能已不可用），属可接受的一帧级误差。
  */
 static int zx_ffe_egress_switch_submit(struct zx_eth_adapter *adapter,
 				       struct zx_ffe_pkt **pkts, int n,
@@ -1820,24 +1824,28 @@ static int zx_ffe_egress_switch_submit(struct zx_eth_adapter *adapter,
 {
 	struct zx_ffe_pkt *pkt = pkts[0];
 	struct net_device *nd;
+	u16 eid = READ_ONCE(flow->egress_id);
 	u16 bp = (u16)(uintptr_t)pkt->token;
 
 	/* 现在恒 n == 1；批量提交见 design/extensibility.md §5 第 1 条 */
 	(void)n;
 
-	if (!zx_tx_submit_bp(adapter, flow->egress_id, bp, pkt->len)) {
+	if (eid >= ZX_NUM_PORTS)	/* 与 #14 同源守卫；今天不可达 */
+		return -EINVAL;
+
+	if (!zx_tx_submit_bp(adapter, eid, bp, pkt->len)) {
 		dev_warn_ratelimited(adapter->dev,
 			"ffe: TX ring full right after the capacity check (pending=%u), dropping a rewritten frame for eport %u\n",
-			adapter->tx_pending, flow->egress_id);
+			adapter->tx_pending, eid);
 		return -ENOSPC;
 	}
 	/*
 	 * 出口侧 /proc/net/dev 记账（慢路径在 zx_eth_xmit() 里记，快路在这里记）。
-	 * 端口号在 usable() 里刚判过；ports[] 只在 probe 里写一次、没有 remove
-	 * 路径，所以直接取同一个 netdev，不再走一次 running/carrier 判定——帧已经
-	 * 发出去了，统计必须落在拍板时那个出口上。
+	 * 端口号是上面的入口快照（不再重读 flow->egress_id）；ports[] 只在 probe
+	 * 里写一次、没有 remove 路径，所以直接取同一个 netdev，不再走一次
+	 * running/carrier 判定——帧已经发出去了，统计必须落在拍板时那个出口上。
 	 */
-	nd = READ_ONCE(adapter->ports[flow->egress_id]);
+	nd = READ_ONCE(adapter->ports[eid]);
 	dev_dstats_tx_add(nd, pkt->len);
 	return 0;
 }
