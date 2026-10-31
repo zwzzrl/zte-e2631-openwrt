@@ -57,12 +57,15 @@ MODULE_PARM_DESC(pool_cacheable, "Map the packet pool cacheable (default: uncach
  * bp 直接交给硬件，省掉每包两次 payload 搬运。说明见 zx_zc_* 那一节。
  * 默认关（0）：这条路径的收益全在转发（UDP 900M 单流 612 → 741 Mbit/s、8 流
  * TCP 565 → 700 Mbit/s），代价是本机收包吞吐下降。公开版本把软件加速搁置，
- * 默认交给 PPE 硬件流表（accel_v4=hw），代码保留、参数保留，要 A/B 时开机
- * 用 zc_rx=1，或运行态写 debugfs 的 zc / accel_ipv4 / accel_ipv6。
+ * 默认交给 PPE 硬件流表（accel_v4=hw），代码保留、参数保留。
+ *
+ * P0 之后 zc 归加速框架按族记账（accel_ipv4 / accel_ipv6 = zc，见
+ * zx279128s-accel.c 与 accel->zc_mask），这个参数只剩兼容作用：zc_rx=1 等价于
+ * 开机把两族都置成 zc（它从前的全局语义）。不要再拿它当第二套开关。
  */
 static bool zc_rx;
 module_param(zc_rx, bool, 0644);
-MODULE_PARM_DESC(zc_rx, "Zero-copy RX/TX over the BMU packet pool (default: off)");
+MODULE_PARM_DESC(zc_rx, "Zero-copy RX/TX over the BMU packet pool: legacy alias for accel_v4=3 accel_v6=3 (default: off)");
 
 /*
  * 加速路径的默认值，每条协议族各自独立（设计 §1.1）：
@@ -1877,28 +1880,37 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			 * P0 只判不发——ffe 模式下记一次 miss（lookup/miss
 			 * 各加一），帧照旧走协议栈。P2 在这里换成真转发：命中
 			 * 就把同一个 bp 写进 TX 描述符并 continue。
+			 *
+			 * 协议族在 quiesce 判断之前算好：零拷贝那一段也要用它
+			 * （zc 按族生效，见下）。两者都在 goto 之前初始化，所以
+			 * 跳过去也拿得到值。
 			 */
+			__be16 h_proto = *(__be16 *)((u8 *)adapter->pkt_pool +
+				(u32)bp * ZX_BUF_SIZE + 16 + 2 * ETH_ALEN);
+			int fam = zx_eth_family(h_proto);
+
 			if (unlikely(READ_ONCE(adapter->accel.quiesce)))
 				goto accel_slow;
-			{
-				__be16 h_proto = *(__be16 *)((u8 *)adapter->pkt_pool +
-					(u32)bp * ZX_BUF_SIZE + 16 + 2 * ETH_ALEN);
-				int fam = zx_eth_family(h_proto);
-
-				if (fam >= 0 &&
-				    zx_accel_cur_mode(&adapter->accel, fam) ==
-					    ZX_ACC_FFE)
-					zx_accel_count_miss(adapter, fam);
-			}
+			if (fam >= 0 &&
+			    zx_accel_cur_mode(&adapter->accel, fam) == ZX_ACC_FFE)
+				zx_accel_count_miss(adapter, fam);
 accel_slow:
 			/*
 			 * 零拷贝：把槽位本身做成 skb 交给协议栈，bp 先不还。
 			 * 之后由发送路径交给硬件（硬件发完自己归还），或者由
 			 * destructor 在协议栈丢包时放回隔离环。
+			 *
+			 * zc 的底层开关是全局的（adapter->zc_rx），但按族生效：
+			 * 只有该族的 zc_mask 位开了（zx279128s-accel.c 在切进/切出
+			 * zc 时维护）才把槽位交出去，否则这一族就算“模式=zc”也
+			 * 只走拷贝路径。不是 IP 的帧（ARP/PPPoE/VLAN 外层）没有
+			 * 协议族可言，只要还有任何一族在 zc 里就照旧交给 zc。
 			 */
 			zc = false;
 			skb = NULL;
-			if (adapter->zc_rx && dest_dev &&
+			if (adapter->zc_rx &&
+			    (fam < 0 || (READ_ONCE(adapter->accel.zc_mask) & BIT(fam))) &&
+			    dest_dev &&
 			    (dest_dev->flags & IFF_UP) && len >= ZX_ZC_MIN_LEN) {
 				if (zx_zc_out(adapter) >= ZX_ZC_OUT_MAX) {
 					adapter->zc_capped++;
@@ -2494,12 +2506,21 @@ static const struct file_operations zx_eth_zc_ev_fops = {
 	.release	= single_release,
 };
 
+/*
+ * "zc" 的兼容写入口。它以前直接调 zx_zc_set()，那在 P0 之后是错的：zc 现在
+ * 按协议族记账（accel->zc_mask），绕过 zx_accel_set() 会留下"zc_rx 为真、
+ * mask 为 0"或"某族模式=hw 但 zc 开着"的半状态——正是 accel 框架要消灭的那种
+ * 双主人记账。所以写 1 = 两族都切到 zc（依次过 S0-S7），写 0 = 把还在 zc 的族
+ * 切回 stack；框架拒绝时（典型是 IPv4 的 PPE 还绑着 flowtable，-EBUSY）写失败
+ * 并保持原状。读侧（zx_eth_zc_show）不变，还是给实验和巡检看的计数。
+ */
 static ssize_t zx_eth_zc_write(struct file *file, const char __user *ubuf,
 			       size_t count, loff_t *ppos)
 {
 	struct seq_file *s = file->private_data;
 	struct zx_eth_adapter *adapter = s->private;
 	char buf[8];
+	int family, ret = 0;
 
 	if (count >= sizeof(buf))
 		return -EINVAL;
@@ -2507,9 +2528,23 @@ static ssize_t zx_eth_zc_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	buf[count] = 0;
 
-	zx_zc_set(adapter, buf[0] == '1');
-	dev_info(adapter->dev, "zero-copy %s\n",
-		 READ_ONCE(adapter->zc_rx) ? "enabled" : "disabled");
+	for (family = 0; family < 2; family++) {
+		u8 want = buf[0] == '1' ? ZX_ACC_ZC : ZX_ACC_STACK;
+
+		/* 关的时候只碰真的在 zc 里的族，别的模式（hw/ffe）不动 */
+		if (want == ZX_ACC_STACK &&
+		    zx_accel_cur_mode(&adapter->accel, family) != ZX_ACC_ZC)
+			continue;
+		ret = zx_accel_set(adapter, family, want);
+		if (ret)
+			break;
+	}
+	if (ret)
+		return ret;
+
+	dev_info(adapter->dev, "zero-copy %s (zc_mask=%u)\n",
+		 READ_ONCE(adapter->zc_rx) ? "enabled" : "disabled",
+		 READ_ONCE(adapter->accel.zc_mask));
 	return count;
 }
 
@@ -2761,6 +2796,7 @@ static int zx_eth_probe(struct platform_device *pdev)
 	struct zx_eth_adapter *adapter;
 	struct device_node *np;
 	u8 addrs[ZX_NUM_PORTS][ETH_ALEN];
+	u8 zc_mask;
 	unsigned long have_addr = 0;
 	int i, ret;
 
@@ -2841,6 +2877,22 @@ static int zx_eth_probe(struct platform_device *pdev)
 		adapter->accel.v6_mode = ZX_ACC_STACK;
 	}
 	adapter->accel.autofallback = accel_autofallback;
+	/*
+	 * zc 现在按协议族记账（accel->zc_mask，见 zx279128s-eth.h）。开机参数
+	 * 直接写 mode 字段、不走 zx_accel_set()，所以这里必须把 mask 与 zc_rx
+	 * 一起补齐，否则 accel_v4=3 会得到"模式写着 zc、数据面却没有一个族允许
+	 * 走 zc"的半状态。老的 zc_rx=1 按它从前的全局语义处理：两族都算 zc。
+	 */
+	if (zc_rx) {
+		adapter->accel.v4_mode = ZX_ACC_ZC;
+		adapter->accel.v6_mode = ZX_ACC_ZC;
+	}
+	zc_mask = 0;
+	if (adapter->accel.v4_mode == ZX_ACC_ZC)
+		zc_mask |= BIT(0);
+	if (adapter->accel.v6_mode == ZX_ACC_ZC)
+		zc_mask |= BIT(1);
+	WRITE_ONCE(adapter->accel.zc_mask, zc_mask);
 	dev_info(dev, "accel: v4=%s v6=%s autofallback=%u\n",
 		 zx_accel_mode_name(adapter->accel.v4_mode),
 		 zx_accel_mode_name(adapter->accel.v6_mode),
@@ -2921,11 +2973,13 @@ static int zx_eth_probe(struct platform_device *pdev)
 	for (i = 0; i < ZX_ZC_Q_LEN; i++)
 		adapter->zc_q_bp[i] = 0xffff;
 	spin_lock_init(&adapter->zc_lock);
-	WRITE_ONCE(adapter->zc_rx, zc_rx);
-	if (zc_rx) {
+	/* 不变式：zc_rx 为真 <=> 至少一族在 zc 模式（accel->zc_mask 非零） */
+	WRITE_ONCE(adapter->zc_rx, zc_mask != 0);
+	if (zc_mask) {
 		zx_zc_park_pages(adapter);
 		WRITE_ONCE(zx_zc_adapter, adapter);
-		dev_info(dev, "zero-copy RX/TX on the packet pool enabled\n");
+		dev_info(dev, "zero-copy RX/TX on the packet pool enabled (zc_mask=%u)\n",
+			 zc_mask);
 	}
 
 	adapter->tab0 = adapter->buffer_pool + ZX_TAB0_OFFSET;

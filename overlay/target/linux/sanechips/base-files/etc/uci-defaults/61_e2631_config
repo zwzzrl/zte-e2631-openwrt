@@ -1,0 +1,20 @@
+#!/bin/sh
+# Make /etc/config/e2631 exist, so that "uci set e2631.<...>" works from a shell
+# or from the upgrade tool: this uci refuses to open a config package that has
+# no file yet ("uci: Entry not found", rc=1 - verified on the board). Verified
+# on the board too, and the reason the fastpath seed used to write the file
+# directly instead of with "uci set".
+#
+# It ships no settings on purpose. The acceleration mode is not configured by
+# uci any more: the driver's accel framework owns it (debugfs accel_ipv4 /
+# accel_ipv6 / accel_autofallback, defaults accel_ipv4=hw, accel_ipv6=stack,
+# zc off), and the old e2631.fastpath.zerocopy key is deprecated - nothing
+# reads it. /etc/init.d/e2631-netune no longer applies it either, which is the
+# point: a boot-time writer behind the framework's back left accel_ipv4=hw
+# while zc was on, and broke the hw/zc exclusion.
+[ -f /etc/config/e2631 ] || cat > /etc/config/e2631 <<'EOF'
+# /etc/config/e2631: board-level settings (e.g. e2631.upd.mirror).
+# The acceleration path is NOT configured here; see
+# /sys/kernel/debug/92000000.ethernet/accel_ipv4 and accel_ipv6.
+EOF
+exit 0

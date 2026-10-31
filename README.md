@@ -113,11 +113,14 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
    `Ip6OutForwDatagrams` 从逐包 +1 变为 15 s 只 +几百，8 流 392–412 Mbit/s；同时把 RPS
    从"和网卡中断同一个核"改成分核，+12 %）。数字、判据与复现脚本见
    [docs/v6-software-fastpath-2026-10-30.md](docs/v6-software-fastpath-2026-10-30.md)。
-   **零拷贝直通（默认开）**：收包把这个 BMU 池缓冲直接 `build_skb()` 成 skb、发包把同一个
+   **零拷贝直通（默认关，按协议族打开）**：收包把这个 BMU 池缓冲直接 `build_skb()` 成 skb、发包把同一个
    `bp` 交回硬件，省掉每包两次 payload 搬运 —— 驱动内 RX 17.5 → 5.1 µs、TX 8.1 → 1.7 µs，
    转发 8 流 TCP 385–472 → 598–722 Mbit/s、UDP 900M 单流 606–628 → 716–756 Mbit/s。
-   代价是本机终结的流量慢 20–30 %（ssh 收 20 MB 113–124 → 84–88 Mbit/s），所以它是个开关：
-   **网络 → 转发加速**（uci `e2631.fastpath.zerocopy`，`/etc/init.d/e2631-netune` 开机应用）。
+   代价是本机终结的流量慢 20–30 %（ssh 收 20 MB 113–124 → 84–88 Mbit/s），所以它是个开关，
+   而开关现在归驱动的加速框架（`zx279128s-accel.c`）：每族各自选路，默认 IPv4=hw、
+   IPv6=stack、zc 关；要零拷贝就把那一族切到 `zc`
+   （`echo zc > /sys/kernel/debug/92000000.ethernet/accel_ipv4`，v6 同理用 `accel_ipv6`）。
+   uci `e2631.fastpath.zerocopy` 已废弃、开机不再应用它，**网络 → 转发加速**页只读显示状态。
    设计、三条硬约束（GRO 必须关、`tx_queue_len` 必须小、池上有 `ZX_ZC_OUT_MAX` 闸门）
    与全部实测见
    [docs/ffe-zero-copy-2026-10-30.md](docs/ffe-zero-copy-2026-10-30.md)。

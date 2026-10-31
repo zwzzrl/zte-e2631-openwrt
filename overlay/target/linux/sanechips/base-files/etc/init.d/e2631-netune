@@ -1,6 +1,6 @@
 #!/bin/sh /etc/rc.common
 # Dual-core load spreading for the gmac ports, applied every boot (sysfs
-# does not persist).  Four independent knobs, each with its evidence:
+# does not persist).  Three independent knobs, each with its evidence:
 #
 #  RPS on CPU0 with the IRQ on CPU1 - one RX ring shares one IRQ line for
 #    every port, so the driver's NAPI always runs on the IRQ's core.  Leaving
@@ -30,26 +30,29 @@
 #    them on everywhere.  Disabling the advertisement costs one renegotiation
 #    at boot and removes a known failure mode of this PHY family.
 #
-#  GRO - the driver feeds napi_gro_receive() unconditionally but the feature
-#    bit decides whether anything is merged, and the *driver* owns that bit
-#    now: it goes off while zc is on and back on when zc is off (both
-#    directions written in zx_eth_open/zx_zc_set).  Reason is on the TX side,
-#    not bp accounting: merged aggregates must be segmented for a 1500 B frame
-#    and this driver has no SG/TSO, so segment 2..N are memcpy'd - measured
-#    15.2 -> 28.7 us of sirq per packet and UDP 900M loss 0.95 -> 22 % with GRO
-#    on (docs/ffe-zero-copy-2026-10-30.md §6.6).  This script used to set the
-#    bit with ethtool -K; it no longer does, because on this kernel
-#    `ethtool -K gro off` with GRO outside hw_features goes through
-#    wanted_features and measured up leaving the bit *on* ("on [fixed]").
-#
-#  zero-copy (uci e2631.fastpath.zerocopy, default 1) - the driver defaults to
-#    on already, but the module parameter cannot be changed on this build (the
-#    driver is builtin), so the debugfs knob is the only runtime switch and the
-#    LuCI page writes uci only.  This script is what makes the setting
-#    authoritative at boot.  Default is on after the 2026-10-30 measurements:
-#    routed UDP 900M single flow 612 -> 741 Mbit/s, 8 TCP streams 565 -> 700
-#    Mbit/s, at the cost of box-as-server throughput (471 -> 218 Mbit/s) - which
-#    is exactly why the knob is exposed instead of hard-wired.
+# This script no longer touches the GRO bit, and it no longer touches
+# zerocopy at all.  Both now belong to the driver's acceleration-path
+# framework (zx279128s-accel.c, P0):
+#   - zerocopy is a per-protocol-family mode now ("zc" next to stack/ffe/hw),
+#     chosen with the driver's own debugfs knobs accel_ipv4 / accel_ipv6
+#     under /sys/kernel/debug/92000000.ethernet/.  The framework is the only
+#     writer of that state: it calls zx_zc_set() on the way in and out of the
+#     zc mode, keeps the per-family bookkeeping and the PPE mutual exclusion.
+#     A boot-time write of the old boolean knob behind the framework's back
+#     left accel_ipv4=hw while zc was on - two owners of one state, and the
+#     hw/zc exclusion broken.  The uci setting that fed that write
+#     (e2631.fastpath.zerocopy) is therefore deprecated and ignored; the
+#     defaults are accel_ipv4=hw, accel_ipv6=stack, zc off.
+#   - the GRO bit follows the zc mode inside the driver: it is cleared on the
+#     way into zc and restored on the way out (zx_eth_open() and zx_zc_set()
+#     are the only writers).  Reason is on the TX side, not bp accounting:
+#     merged aggregates must be segmented for a 1500 B frame and this driver
+#     has no SG/TSO, so segment 2..N are memcpy'd - measured 15.2 -> 28.7 us
+#     of sirq per packet and UDP 900M loss 0.95 -> 22 % with GRO on
+#     (docs/ffe-zero-copy-2026-10-30.md §6.6).  This script used to set the
+#     bit with ethtool -K; it no longer does, because on this kernel
+#     `ethtool -K gro off` with GRO outside hw_features goes through
+#     wanted_features and measured up leaving the bit *on* ("on [fixed]").
 START=20
 # No USE_PROCD line: rc.common tests [ -n "$USE_PROCD" ], so "USE_PROCD=0" is
 # not "off" - it takes the procd branch and the plain start() below then never
@@ -57,25 +60,6 @@ START=20
 # in its userdata scripts (42daef9); the fix is to leave the variable unset.
 
 PORTS="lan1 lan2 lan3 wan"
-# debugfs knob exported by the driver (zx_eth_zc_show/_write)
-ZC=/sys/kernel/debug/92000000.ethernet/zc
-
-# The wanted zero-copy state: uci wins, and 1 is the default both here and in
-# the driver, so an installation without the config section still boots zc on.
-zc_want() {
-	local v
-	v=$(uci -q get e2631.fastpath.zerocopy 2>/dev/null)
-	[ "$v" = "0" ] && echo 0 || echo 1
-}
-
-# debugfs is mounted by the boot init script, which runs before START=20, but
-# do not depend on it: mount it once if the knob is not there yet.
-apply_zc() {
-	local want=$1
-	[ -e "$ZC" ] || mount -t debugfs none /sys/kernel/debug 2>/dev/null
-	[ -w "$ZC" ] || return 0
-	echo "$want" > "$ZC" 2>/dev/null
-}
 
 tune_port() {
 	local ifn=$1
@@ -90,13 +74,6 @@ tune_port() {
 }
 
 start() {
-	local zc
-	zc=$(zc_want)
-
-	# zc first: it rewrites the GRO feature bit (the driver's business, see
-	# the header), so do not touch that bit anywhere else in this script.
-	apply_zc "$zc"
-
 	# RPS needs the flow table steering entries to have a home
 	[ -w /proc/sys/net/core/rps_sock_flow_entries ] && \
 		echo 1024 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null
@@ -110,8 +87,9 @@ start() {
 	fi
 }
 
-# The LuCI page / rpcd backend flips the uci value and calls us to apply it
-# without a reboot.
+# Kept for anyone who calls "/etc/init.d/e2631-netune reload" by hand:
+# re-applying the queue tuning is all this does now (the zc apply step that
+# used to live here was removed, see the header).
 reload() {
 	start
 }

@@ -7,7 +7,14 @@
  *   stack  纯标准栈，驱动什么都不做
  *   ffe    驱动内零拷贝快路（docs/ffe-fastpath-design-2026-11-01.md）
  *   hw     PPE 硬件流表，只有 IPv4 有；驱动侧只表示"放行 PPE 接管"
- *   zc     既有零拷贝（zx279128s-main.c 的 zx_zc_* 一节），搁置但保留
+ *   zc     既有零拷贝（zx279128s-main.c 的 zx_zc_* 一节）
+ *
+ * zc 的底层状态是全局的（一套池页、一个 adapter->zc_rx、一个 GRO 位），但它是
+ * **按族生效**的：模式为 zc 的族在 accel->zc_mask 里占一位，只有这些族的帧才走
+ * 零拷贝（zx279128s-main.c 的 zx_eth_rx()）。不变式：zc_rx 为真时 zc_mask 必然
+ * 非零、且等于"两族里模式为 zc 的那些族的集合"——本文件是这两个字段唯一的
+ * 作者，别的地方（开机脚本、debugfs 的 zc 兼容口、模块参数）都只能经
+ * zx_accel_set() 或 probe 里的等价初始化来改。
  *
  * P0 阶段这里只搭框架：流表建起来但永远为空（没有插入路径），ffe 模式不产生
  * 任何转发——数据面只多一条"quiesce / 模式是不是 ffe"的判断并记一次 miss。
@@ -220,6 +227,7 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 	u64 t0;
 	u8 *slot;
 	u8 old_mode;
+	u8 mask;
 	bool bound;
 	int ret = 0;
 
@@ -257,20 +265,35 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 		if (!bound)
 			dev_info(adapter->dev,
 				 "accel: IPv%d hw set, but no flowtable is bound to this adapter yet (ppe_bound=0)\n",
-				 family + 4);
+				 family ? 6 : 4);
 		break;
 	case ZX_ACC_FFE:
 		if (bound) {
-			dev_info(adapter->dev,
+			/* 拒绝会随每次 echo 触发，限速：200 次实验不该冲掉 dmesg */
+			dev_info_ratelimited(adapter->dev,
 				 "accel: refusing IPv%d ffe: the PPE owns the flows (remove the flowtable or set flow_offloading_hw=0)\n",
-				 family + 4);
+				 family ? 6 : 4);
 			ret = -EBUSY;
 			goto unlock;
 		}
 		if (!adapter->pkt_pool) {
-			dev_info(adapter->dev,
+			dev_info_ratelimited(adapter->dev,
 				 "accel: refusing IPv%d ffe: the packet pool is not available\n",
-				 family + 4);
+				 family ? 6 : 4);
+			ret = -EBUSY;
+			goto unlock;
+		}
+		break;
+	case ZX_ACC_ZC:
+		/*
+		 * zc 与 hw 在同一族内互斥（设计 §5）：PPE 接管这一族时再把同一个族
+		 * 的帧交给零拷贝，等于两条路径改写同一批 bp，所有权不可证明。v6 没有
+		 * hw 路径，所以只检查 IPv4。
+		 */
+		if (bound && family == 0) {
+			dev_info_ratelimited(adapter->dev,
+				 "accel: refusing IPv%d zc: the PPE owns the flows (remove the flowtable or set flow_offloading_hw=0)\n",
+				 family ? 6 : 4);
 			ret = -EBUSY;
 			goto unlock;
 		}
@@ -307,7 +330,7 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 		/* 排不空就回滚：数据面照旧，模式一个字节都不动 */
 		dev_info(adapter->dev,
 			 "accel: IPv%d %s->%s aborted: tx_pending=%u did not drain in %u ms\n",
-			 family + 4, zx_accel_mode_name(old_mode),
+			 family ? 6 : 4, zx_accel_mode_name(old_mode),
 			 zx_accel_mode_name(new_mode), adapter->tx_pending,
 			 ZX_FFE_DRAIN_MS);
 		zx_accel_quiesce_leave(adapter);
@@ -316,16 +339,30 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 		goto unlock;
 	}
 
-	/* S4 清表与隔离：切表=全清；任何离开 zc 的切换先关 zc */
+	/* S4 清表与隔离：切表=全清；zc 的 mask 位按目标模式维护。
+	 *
+	 * mask 与 zc_rx 的先后顺序是不变式要求的：先改本族那一位，位清零后如果
+	 * 没有任何族再用 zc，才真正关掉全局开关（zc_rx 为真时 mask 必然非零）。
+	 * 另一族还在 zc 里时不能关：那会把它的收包路径换掉，而它的模式仍写着 zc。
+	 */
 	zx_ffe_flush(adapter, family);
-	if (new_mode != ZX_ACC_ZC && READ_ONCE(adapter->zc_rx))
+	mask = READ_ONCE(accel->zc_mask);
+	if (new_mode == ZX_ACC_ZC)
+		mask |= BIT(family);
+	else
+		mask &= ~BIT(family);
+	WRITE_ONCE(accel->zc_mask, mask);
+	if (!mask && READ_ONCE(adapter->zc_rx))
 		zx_zc_set(adapter, false);
 
 	/* S5 切点：单字节写，数据面只会看到旧模式或新模式 */
 	WRITE_ONCE(*slot, new_mode);
 
-	/* S6 目标 zc 打开零拷贝，然后恢复数据面 */
-	if (new_mode == ZX_ACC_ZC)
+	/* S6 目标 zc 打开零拷贝，然后恢复数据面。全局开关只在 0->非0 时开一次
+	 * （mask 已置位，所以 zc_rx 打开时不变式立刻成立），另一族本来就在 zc
+	 * 里时不用再调一遍 zx_zc_set()。
+	 */
+	if (mask && !READ_ONCE(adapter->zc_rx))
 		zx_zc_set(adapter, true);
 	zx_accel_quiesce_leave(adapter);
 
@@ -334,7 +371,7 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 	accel->sw_out++;
 	dev_info(adapter->dev,
 		 "accel: IPv%d %s -> %s (%llu ms, %u frames drained)\n",
-		 family + 4, zx_accel_mode_name(old_mode),
+		 family ? 6 : 4, zx_accel_mode_name(old_mode),
 		 zx_accel_mode_name(new_mode), accel->drain_ms, drained);
 
 unlock:
@@ -390,7 +427,7 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
 
 		dev_info(adapter->dev,
 			 "accel: IPv%d fell back to stack: %llu drop, %llu fallback of %llu lookups\n",
-			 family + 4,
+			 family ? 6 : 4,
 			 READ_ONCE(accel->cnt[family].drop_noport) +
 				 READ_ONCE(accel->cnt[family].drop_local),
 			 READ_ONCE(accel->cnt[family].fallback),
@@ -422,6 +459,7 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	mutex_init(&accel->lock);
 	accel->v4_mode = ZX_ACC_STACK;
 	accel->v6_mode = ZX_ACC_STACK;
+	accel->zc_mask = 0;
 	WRITE_ONCE(accel->quiesce, false);
 	memset(accel->cnt, 0, sizeof(accel->cnt));
 	accel->sw_in = 0;
@@ -489,10 +527,18 @@ static void zx_accel_show(struct seq_file *s, int family)
 		   c->lookup, c->hit, c->miss, c->fwd, c->fallback,
 		   c->fallback_qfull, c->drop_noport, c->drop_local,
 		   c->csum_err, c->ttl_err, c->bytes, c->qlen_peak);
-	seq_printf(s, "ppe_bound=%u sw_in=%llu sw_out=%llu drain_ms=%llu drain_frames=%llu autofallback=%u\n",
+	/*
+	 * 第 3 行是给人和脚本看的状态行。hint 是"下一步该做什么"的机器可读
+	 * 提示：PPE 绑着 flowtable 时切 ffe/zc 会被 S1 拒绝，用户态得先关掉
+	 * 硬件 offload（uci firewall.@defaults[0].flow_offloading_hw=0 + reload），
+	 * 所以给一个不含空格的单 token，不会被按空格切字段的读侧打散。
+	 */
+	seq_printf(s, "ppe_bound=%u sw_in=%llu sw_out=%llu drain_ms=%llu drain_frames=%llu autofallback=%u zc_mask=%u hint=%s\n",
 		   bound ? 1u : 0u, accel->sw_in,
 		   accel->sw_out, accel->drain_ms, accel->drain_frames,
-		   READ_ONCE(accel->autofallback) ? 1u : 0u);
+		   READ_ONCE(accel->autofallback) ? 1u : 0u,
+		   READ_ONCE(accel->zc_mask),
+		   bound ? "disable_flow_offloading_hw_to_use_ffe" : "none");
 }
 
 static int zx_accel_v4_show(struct seq_file *s, void *data)

@@ -1,6 +1,6 @@
 {
 	"luci-app-e2631": {
-		"description": "Grant access to E2631 board operations (slot info, online update, switch back to stock, fast path toggle)",
+		"description": "Grant access to E2631 board operations (slot info, online update, switch back to stock, acceleration path switch)",
 		"read": {
 			"ubus": {
 				"e2631": [ "slots", "check", "accel" ],

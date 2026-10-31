@@ -6,16 +6,16 @@
 'require ui';
 
 /*
- * 转发加速：零拷贝直通的开关键。
+ * 转发加速：显示每族的加速路径，并给一个受框架保护的切换入口。
  *
- * 这一页只做三件事：读驱动当前状态、改 uci 里的意图、把 uci 立刻落到驱动上
- * （/etc/init.d/e2631-netune reload）。所有真正的写入都在那个初始化脚本里，
- * 页面不直接写 debugfs，免得开机与"网页点一下"两条路径各写一套。
+ * 状态只有驱动里的 accel 框架（zx279128s-accel.c）能改，页面写的是驱动自己的
+ * debugfs 旋钮（经 rpcd 的 accel_set）。之所以不直接 echo：IPv4 的 ffe/zc 与
+ * PPE 硬件 offload 互斥，框架会以 -EBUSY 拒绝；把硬件 offload 关掉再 reload
+ * 防火墙是**策略决定**，只能由用户态做。rpcd 里那一步是复合动作：改 uci
+ * （flow_offloading_hw）、reload fw4、等 ppe_bound 落到目标值、再写模式，
+ * 任一步失败回滚。切回 hw 是对称的（重新打开 offload 再写 hw）。
  *
- * 默认开：2026-10-30 的实测显示转发场景收益明显（路由 UDP 900M 单流
- * 612 -> 741 Mbit/s，8 流 TCP 565 -> 700 Mbit/s），代价是本机收包场景
- * 吞吐下降（本机作为服务端 471 -> 218 Mbit/s），所以把它做成用户可选项而
- * 不是写死。
+ * 默认 v4=hw、v6=stack、zc 关；命令行的等价写法见页面下方提示。
  */
 
 var callAccel = rpc.declare({
@@ -27,7 +27,7 @@ var callAccel = rpc.declare({
 var callAccelSet = rpc.declare({
 	object: 'e2631',
 	method: 'accel_set',
-	params: [ 'enabled' ],
+	params: [ 'family', 'mode' ],
 	expect: { '': {} }
 });
 
@@ -41,6 +41,16 @@ function counter(c, k) {
 	return (typeof v === 'number') ? String(v) : '0';
 }
 
+var MODE_DESC = {
+	stack: '标准协议栈',
+	ffe: '驱动内快路（P0 只有骨架）',
+	hw: 'PPE 硬件流表（仅 IPv4）',
+	zc: '零拷贝直通'
+};
+
+var V4_MODES = [ 'stack', 'hw', 'ffe', 'zc' ];
+var V6_MODES = [ 'stack', 'ffe', 'zc' ];
+
 return view.extend({
 	load: function() {
 		return callAccel();
@@ -49,17 +59,36 @@ return view.extend({
 	renderStatus: function(node, s) {
 		var c = s && s.counters ? s.counters : {};
 		var avail = s && s.avail === true;
-		var on = s && s.drv === '1';
+		var v4 = (s && s.v4) || '?';
+		var v6 = (s && s.v6) || '?';
+		var bound = s && (s.ppe_bound === 1 || s.ppe_bound === '1');
 		var lines = [];
 
 		lines.push(E('p', {}, [
-			'当前模式：',
-			avail
-				? (on ? badge('零拷贝直通', 'success') : badge('驱动内拷贝', 'warning'))
-				: badge('无法读取驱动状态', 'warning'),
-			'  ',
-			'配置值：', E('code', {}, (s && s.uci) || '1')
+			'IPv4：', avail ? badge(v4 + '（' + (MODE_DESC[v4] || '未知模式') + '）',
+				v4 === 'hw' ? 'success' : (v4 === 'zc' ? 'warning' : '')) : badge('无法读取', 'warning'),
+			'   ',
+			'IPv6：', avail ? badge(v6 + '（' + (MODE_DESC[v6] || '未知模式') + '）',
+				v6 === 'zc' ? 'warning' : '') : badge('无法读取', 'warning')
 		]));
+
+		if (avail) {
+			lines.push(E('p', {}, [
+				'PPE 流表：', badge(bound ? '已绑定（flow_offloading_hw 开）' : '未绑定',
+					bound ? 'success' : ''),
+				'   ',
+				'自动降级：', badge(s.autofallback === 1 || s.autofallback === '1' ? '开' : '关', ''),
+				'   ',
+				'硬件 offload：', E('code', {}, 'flow_offloading_hw=' + (s.flow_hw === undefined ? '?' : s.flow_hw)),
+				'   ',
+				'zc 族掩码：', E('code', {}, 'zc_mask=' + (s.zc_mask === undefined ? '?' : s.zc_mask))
+			]));
+
+			if (bound)
+				lines.push(E('p', { 'class': 'cbi-section-descr' },
+					'PPE 正绑着 flowtable：此时切 IPv4 到 ffe 或 zc 会被驱动拒绝（EBUSY）。' +
+					'下面的切换动作会先把 flow_offloading_hw 关掉、重载防火墙，等 PPE 解绑后再切。'));
+		}
 
 		lines.push(E('table', { 'class': 'table' }, [
 			E('tr', { 'class': 'tr table-titles' }, [
@@ -86,38 +115,39 @@ return view.extend({
 
 		if (!avail)
 			lines.push(E('p', { 'class': 'cbi-section-descr' },
-				'驱动没有给出 /sys/kernel/debug/92000000.ethernet/zc。若 debugfs 没挂载属正常：开机时由 /etc/init.d/e2631-netune 挂载并应用这里的设置。'));
+				'读不到 /sys/kernel/debug/92000000.ethernet/accel_ipv4。debugfs 没挂载时属正常：' +
+				'mount -t debugfs none /sys/kernel/debug 之后再回来看。'));
 
 		dom.content(node, lines);
 	},
 
-	render: function(s) {
+	/* 一个族的模式选择 + 应用按钮 */
+	renderFamily: function(box, s, family, modes, label) {
 		var self = this;
-		var box = E('div', { 'class': 'cbi-section' });
+		var cur = (s && (family === 'v4' ? s.v4 : s.v6)) || 'stack';
 
-		this.renderStatus(box, s);
-
-		var sel = E('select', { 'class': 'cbi-input-select' }, [
-			E('option', { 'value': '1', 'selected': (s && s.drv === '1') ? '' : null }, '开启（默认）'),
-			E('option', { 'value': '0', 'selected': (s && s.drv === '0') ? '' : null }, '关闭')
-		]);
+		var sel = E('select', { 'class': 'cbi-input-select' },
+			modes.map(function(m) {
+				return E('option', { 'value': m, 'selected': m === cur ? '' : null },
+					m + '（' + (MODE_DESC[m] || '?') + '）');
+			}));
 
 		var btn = E('button', {
 			'class': 'btn cbi-button cbi-button-apply',
 			'click': ui.createHandlerFn(self, function(ev) {
-				var v = sel.value;
+				var mode = sel.value;
+
 				ev.target.disabled = true;
-				return callAccelSet(v).then(function(res) {
-					if (res && res.avail === true) {
+				return callAccelSet(family, mode).then(function(res) {
+					if (res && res.ok === true) {
 						ui.addNotification(null, E('p', {},
-							v === '1' ? '零拷贝已开启，立即生效（无需重启）。'
-							          : '零拷贝已关闭，立即生效（无需重启），GRO 同时恢复。'), 'info');
+							label + ' 已切到 ' + mode + '，立即生效（无需重启）。'), 'info');
 					} else if (res && res.ok === false) {
 						ui.addNotification(null, E('p', {},
-							'设置失败：' + (res.error || '?')), 'danger');
+							label + ' 切换失败：' + (res.error || '?')), 'danger');
 					} else {
 						ui.addNotification(null, E('p', {},
-							'已保存到 /etc/config/e2631，但驱动现在不可写（debugfs 未挂载？）。重启后由 e2631-netune 应用。'), 'warning');
+							label + ' 切换结果不明：驱动没有回应。'), 'warning');
 					}
 					return callAccel().then(function(r2) {
 						self.renderStatus(box, r2);
@@ -125,6 +155,17 @@ return view.extend({
 				}).finally(function() { ev.target.disabled = false; });
 			})
 		}, '应用');
+
+		return E('div', { 'style': 'display:flex;gap:.6em;align-items:center;flex-wrap:wrap;margin:.4em 0' }, [
+			E('span', {}, label + '：'), sel, btn
+		]);
+	},
+
+	render: function(s) {
+		var self = this;
+		var box = E('div', { 'class': 'cbi-section' });
+
+		this.renderStatus(box, s);
 
 		poll.add(function() {
 			return callAccel().then(function(res) {
@@ -135,16 +176,19 @@ return view.extend({
 		return E('div', {}, [
 			E('h2', {}, '转发加速'),
 			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, '零拷贝直通'),
+				E('h3', {}, '每族加速路径'),
 				E('p', { 'class': 'cbi-section-descr' },
-					'开启后，收包时网卡 DMA 池里的缓冲直接当成内核 skb 的数据区交给协议栈，发包时把同一个缓冲直接交回硬件，省掉每包两次内存搬运（接收拷入、发送拷出）。' +
-					'代价是本机自己消费数据的场景（SMB/FTP 到本机、本机做大流量服务端）吞吐会下降，而这正是它做成开关的原因。'),
-				E('div', { 'style': 'display:flex;gap:.6em;align-items:center;flex-wrap:wrap' }, [
-					E('span', {}, '零拷贝：'), sel, btn
-				]),
+					'每种协议族各自选一条路径：标准栈、驱动内快路（ffe）、PPE 硬件流表（仅 IPv4）、' +
+					'或零拷贝直通（zc）。状态只由驱动里的 accel 框架维护，页面经它的 debugfs 旋钮切换。'),
+				this.renderFamily(box, s, 'v4', V4_MODES, 'IPv4'),
+				this.renderFamily(box, s, 'v6', V6_MODES, 'IPv6'),
 				E('p', { 'class': 'cbi-section-descr' },
-					'转发（路由/桥接经过本机）场景实测：UDP 900M 单流 612 → 741 Mbit/s，8 流 TCP 565 → 700 Mbit/s。' +
-					'关闭后行为与旧版一致。两种状态都不影响原厂槽，也不影响 IPv4/IPv6 硬件快转。')
+					'注意：IPv4 切到 ffe 或 zc 会先关掉硬件 offload（flow_offloading_hw=0 并重载防火墙），' +
+					'因为 PPE 与这两条路径在同一族内互斥；切回 hw 会重新打开它。任一步失败会回滚 uci，' +
+					'盒子上不会留下"ffe + PPE 还绑着"的组合。'),
+				E('p', { 'class': 'cbi-section-descr' },
+					'命令行等价写法：ubus call e2631 accel_set \'{"family":"v4","mode":"ffe"}\'；' +
+					'只想直接看/写驱动旋钮也可以：cat /sys/kernel/debug/92000000.ethernet/accel_ipv4 。')
 			]),
 			box
 		]);

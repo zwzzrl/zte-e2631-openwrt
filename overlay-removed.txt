@@ -13,3 +13,7 @@ target/linux/sanechips/base-files/usr/share/e2631-wanport/nop.script
 # v1.5：PPE 引擎从内核树搬到 package/kernel/kmod-e2631-ppe/src，
 # 老树里那份会被内核构建继续带进去，所以要删掉。
 target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128s-ppe.c
+# 加速路径 P0：zc 归驱动的 accel 框架所有，开机不再写 debugfs。
+# 老的 fastpath uci-defaults（种 e2631.fastpath.zerocopy=1）换成只保证
+# /etc/config/e2631 存在的 61_e2631_config；老文件留着会继续种一个没人读的键。
+target/linux/sanechips/base-files/etc/uci-defaults/61_e2631_fastpath

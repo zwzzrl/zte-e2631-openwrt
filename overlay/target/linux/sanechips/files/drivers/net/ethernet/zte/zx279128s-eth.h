@@ -277,9 +277,13 @@
  *   stack  纯标准栈（默认，驱动什么都不做）
  *   ffe    驱动内零拷贝快路（本设计；P0 只有骨架，不转发）
  *   hw     PPE 硬件流表，只有 IPv4 有；驱动侧只表示"放行 PPE 接管"
- *   zc     既有零拷贝（搁置，参数保留）
+ *   zc     既有零拷贝直通：底层是全局机制（一套池页、一个 GRO 位、一个
+ *          zx279128s-main.c 的 zc_rx 开关），但**按族生效**——模式为 zc 的
+ *          族把自己那一位记进 zc_mask，数据面只把这些族的帧交给零拷贝
+ *          路径（见 struct zx_accel.zc_mask 与 zx_eth_rx()）
  * 同一族内 ffe 与 hw 互斥（硬件命中后帧根本不上 CPU，两层改写叠加不可证明），
- * ffe 与 zc 也互斥（两者对同一个 bp 的所有权模型冲突），见设计 §5。
+ * 同一族内 hw 与 zc 也互斥（PPE 与 zc 改写同一族），ffe 与 zc 也互斥（两者
+ * 对同一个 bp 的所有权模型冲突），见设计 §5。
  */
 enum zx_accel_mode {
 	ZX_ACC_STACK = 0,
@@ -307,6 +311,14 @@ struct zx_ffe_cnt {
 struct zx_accel {
 	u8			v4_mode;	/* enum zx_accel_mode */
 	u8			v6_mode;	/* enum zx_accel_mode */
+	/*
+	 * 哪些族的帧可以走零拷贝：bit0=IPv4，bit1=IPv6。zc 的底层状态
+	 * （adapter->zc_rx、池页、GRO 位）是全局的，但只有 mask 里置了位的族
+	 * 才能用；不变式：zc_rx 为真时 zc_mask 必然非零（否则关了 zc 又留着
+	 * 位，或开了 zc 却谁也不许用）。只由 zx_accel_set() 在 S4/S5 里改，
+	 * 数据面用 READ_ONCE() 读。
+	 */
+	u8			zc_mask;
 	bool			quiesce;	/* 切换中：数据面一律走栈 */
 	struct mutex		lock;		/* 串行化模式切换（S0） */
 	struct rhashtable	flows;		/* 单表，family 在键里 */

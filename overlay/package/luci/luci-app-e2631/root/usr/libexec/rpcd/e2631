@@ -10,8 +10,24 @@
 #   check            online update check (e2631-upgrade check output as log)
 #   switch           flip the boot to the OTHER (stock) slot; needs confirm
 #   run              one-click online upgrade, detached; needs confirm
-#   accel            zero-copy state: uci setting, driver state, live counters
-#   accel_set        write the uci setting and apply it to the driver now
+#   accel            read-only acceleration state: per-family mode, PPE/auto
+#                    fallback flags, zero-copy counters, the hint the driver
+#                    prints for a refused switch
+#   accel_set        switch ONE family's path: {"family":"v4|v6","mode":"..."}
+#
+# The driver's accel framework (zx279128s-accel.c) is the only owner of the
+# per-family mode; the debugfs knobs under /sys/kernel/debug/92000000.ethernet/
+# are its only interface. This script writes nothing else - but two of the
+# modes are gated by the kernel on purpose:
+#
+#   ffe / zc on IPv4  -EBUSY while the PPE owns the flows (ppe_bound=1). The
+#   kernel refuses instead of silently tearing down the firewall, so the
+#   userspace action does the part that is a *policy* decision: turn
+#   firewall.@defaults[0].flow_offloading_hw off, reload fw4, wait for
+#   ppe_bound to drop (<=3 s), then write the mode. hw is the mirror image:
+#   turn hardware offload back on first, wait for ppe_bound=1, then write hw.
+#   Any step failing rolls the uci value back, so the box never ends up with
+#   ffe + a bound PPE (the combination the framework exists to prevent).
 #
 # fwslot lives in /usr/sbin on this layout (package default), not /sbin:
 # resolve instead of assuming, or the board page shows a read failure.
@@ -19,9 +35,14 @@
 FW="$(command -v e2631-fwslot 2>/dev/null)"
 [ -n "$FW" ] || FW=/usr/sbin/e2631-fwslot
 
-# debugfs knob exported by the driver (see zx_eth_zc_show/_write). Line 1 is
-# the active state, line 2 the counters as "name=value" pairs.
-ZC=/sys/kernel/debug/92000000.ethernet/zc
+# Driver debugfs interface. accel_ipv4/accel_ipv6 line 1 is the current mode
+# name; line 3 carries ppe_bound/.../zc_mask/hint. The legacy "zc" file is read
+# for its counters only - writes go through the framework (accel_ipv4|v6), or
+# the per-family bookkeeping is bypassed.
+DBG=/sys/kernel/debug/92000000.ethernet
+ACCEL_V4=$DBG/accel_ipv4
+ACCEL_V6=$DBG/accel_ipv6
+ZC=$DBG/zc
 
 esc() { # escape a command's output into a JSON string value
 	"$@" 2>&1 | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk '{printf "%s\\n", $0}'
@@ -35,31 +56,66 @@ needs_confirm() { # reads the ubus call params from stdin
 	esac
 }
 
-accel_json() { # $1 = leading ,"ok":true when the caller wants it
-	local uci_val drv line
-	uci_val=$(uci -q get e2631.fastpath.zerocopy 2>/dev/null)
-	[ -n "$uci_val" ] || uci_val=1
+accel_dev() { # $1 = v4|v6 -> the debugfs file of that family
+	case "$1" in
+	v4) echo "$ACCEL_V4" ;;
+	v6) echo "$ACCEL_V6" ;;
+	*) return 1 ;;
+	esac
+}
 
-	if [ ! -r "$ZC" ]; then
-		printf '{"avail":false%s,"uci":"%s","drv":null,"counters":{}}' \
-			"$1" "$uci_val"
+ppe_bound() { # the driver's view: 1 when a flowtable is bound to this adapter
+	sed -n 3p "$ACCEL_V4" 2>/dev/null |
+		sed -n 's/.*ppe_bound=\([0-9]\{1,\}\).*/\1/p'
+}
+
+flow_hw() { uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null; }
+
+flow_hw_set() { # $1 = 0|1: turn hardware offload off/on and re-apply fw4
+	uci -q set firewall.@defaults[0].flow_offloading_hw="$1" || return 1
+	uci -q commit firewall || return 1
+	/etc/init.d/firewall reload >/dev/null 2>&1 || return 1
+	return 0
+}
+
+wait_bound() { # $1 = wanted 0|1; fw4 reload is synchronous, so this is a net
+	local i=0
+	while [ "$i" -lt 15 ]; do
+		[ "$(ppe_bound)" = "$1" ] && return 0
+		sleep 0.2
+		i=$((i + 1))
+	done
+	return 1
+}
+
+accel_json() { # $1 = leading ,"ok":true when the caller wants it
+	local v4 v6 l3 ppe af zm hint cnt fh
+
+	v4=$(head -n 1 "$ACCEL_V4" 2>/dev/null)
+	v6=$(head -n 1 "$ACCEL_V6" 2>/dev/null)
+	if [ -z "$v4" ] && [ -z "$v6" ]; then
+		printf '{"avail":false%s}' "$1"
 		return
 	fi
 
-	{
-		read -r drv
-		read -r line
-	} < "$ZC"
+	l3=$(sed -n 3p "$ACCEL_V4" 2>/dev/null)
+	ppe=$(printf '%s' "$l3" | sed -n 's/.*ppe_bound=\([0-9]*\).*/\1/p')
+	af=$(printf '%s' "$l3" | sed -n 's/.*autofallback=\([0-9]*\).*/\1/p')
+	zm=$(printf '%s' "$l3" | sed -n 's/.*zc_mask=\([0-9]*\).*/\1/p')
+	hint=$(printf '%s' "$l3" | sed -n 's/.*hint=\([a-z_]*\).*/\1/p')
+	fh=$(flow_hw)
+	# "rx_ok=1 tx_ok=2 ..." -> "rx_ok":1,"tx_ok":2,...
+	cnt=$(sed -n 2p "$ZC" 2>/dev/null |
+		sed -e 's/\([a-z_]*\)=\(-\{0,1\}[0-9][0-9]*\)/"\1":\2/g' -e 's/ /,/g')
 
-	# "rx_ok=1 tx_ok=2 ..." -> {"rx_ok":1,"tx_ok":2,...}
-	printf '{"avail":true%s,"uci":"%s","drv":"%s","counters":{%s},"default":"1"}' \
-		"$1" "$uci_val" "$drv" \
-		"$(printf '%s' "$line" | sed -e 's/\([a-z_]*\)=\(-\{0,1\}[0-9][0-9]*\)/"\1":\2/g' -e 's/ /,/g')"
+	printf '{"avail":true%s,"v4":"%s","v6":"%s","ppe_bound":%s,"autofallback":%s,"zc_mask":%s,"flow_hw":"%s","hint":"%s","counters":{%s}}' \
+		"$1" "$v4" "$v6" "${ppe:-0}" "${af:-0}" "${zm:-0}" "$fh" \
+		"${hint:-none}" "$cnt"
 }
 
 case "$1" in
 list)
-	printf '{ "slots": {}, "check": {}, "switch": { "confirm": "str" }, "run": { "confirm": "str" }, "accel": {}, "accel_set": { "enabled": "str" } }\n'
+	printf '{ "slots": {}, "check": {}, "switch": { "confirm": "str" }, "run": { "confirm": "str" }, "accel": {}, "accel_set": { "family": "str", "mode": "str" } }\n'
 	;;
 call)
 	case "$2" in
@@ -93,30 +149,73 @@ call)
 		;;
 	accel_set)
 		input=$(cat)
-		v=$(printf '%s' "$input" |
-			sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9]*\)"\{0,1\}.*/\1/p')
-		case "$v" in
-		0|1) ;;
-		*) printf '{"ok":false,"error":"enabled must be 0 or 1"}'; exit 0 ;;
+		fam=$(printf '%s' "$input" |
+			sed -n 's/.*"family"[[:space:]]*:[[:space:]]*"\{0,1\}\([a-z0-9]*\)"\{0,1\}.*/\1/p')
+		mode=$(printf '%s' "$input" |
+			sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\{0,1\}\([a-z]*\)"\{0,1\}.*/\1/p')
+		case "$fam" in
+		v4|v6) ;;
+		*) printf '{"ok":false,"error":"family must be v4 or v6"}'; exit 0 ;;
 		esac
-		# This uci cannot open a package that has no file yet ("Entry not
-		# found", rc=1 - verified on the board), so create it directly. Only
-		# happens when the section was never seeded, e.g. an upgrade that kept
-		# its settings from a build without the uci-defaults above.
-		if [ ! -f /etc/config/e2631 ]; then
-			cat > /etc/config/e2631 <<'EOT'
-config fastpath 'fastpath'
-	option zerocopy '1'
-EOT
+		case "$mode" in
+		stack|ffe|hw|zc) ;;
+		*) printf '{"ok":false,"error":"mode must be stack, ffe, hw or zc"}'; exit 0 ;;
+		esac
+		if [ "$fam" = v6 ] && [ "$mode" = hw ]; then
+			printf '{"ok":false,"error":"IPv6 has no hw path"}'; exit 0
 		fi
-		uci -q set e2631.fastpath=fastpath
-		uci -q set e2631.fastpath.zerocopy="$v"
-		uci -q commit e2631 || {
-			printf '{"ok":false,"error":"uci commit failed"}'
+		dev=$(accel_dev "$fam")
+		if [ ! -w "$dev" ]; then
+			printf '{"ok":false,"error":"%s is not writable (debugfs not mounted?)"}' "$dev"
 			exit 0
-		}
-		# single apply path: the init script owns the driver knob and GRO
-		/etc/init.d/e2631-netune reload >/dev/null 2>&1
+		fi
+
+		# The PPE gate: the kernel refuses ffe/zc while a flowtable is bound,
+		# and refuses to tear the firewall down itself. Do that here, keep the
+		# old value, and put it back if the switch does not happen.
+		bound=$(ppe_bound)
+		old=$(flow_hw)
+		[ -n "$old" ] || old=1
+		uci_changed=0
+
+		if [ "$fam" = v4 ] && [ "$mode" = hw ] && [ "$bound" != 1 ]; then
+			if flow_hw_set 1; then
+				uci_changed=1
+				if ! wait_bound 1; then
+					flow_hw_set "$old"
+					printf '{"ok":false,"error":"fw4 reloaded but ppe_bound stayed 0 (flowtable not bound); uci rolled back"}'
+					exit 0
+				fi
+			else
+				printf '{"ok":false,"error":"cannot enable flow_offloading_hw (uci/fw4 failed)"}'
+				exit 0
+			fi
+		elif [ "$fam" = v4 ] && [ "$mode" != hw ] && [ "$mode" != stack ] && [ "$bound" = 1 ]; then
+			if flow_hw_set 0; then
+				uci_changed=1
+				if ! wait_bound 0; then
+					flow_hw_set "$old"
+					printf '{"ok":false,"error":"fw4 reloaded but ppe_bound stayed 1 (flowtable still bound); uci rolled back"}'
+					exit 0
+				fi
+			else
+				printf '{"ok":false,"error":"cannot disable flow_offloading_hw (uci/fw4 failed)"}'
+				exit 0
+			fi
+		fi
+
+		# 写失败时 shell/echo 的报错只能落到临时文件里抓（把 stderr 接回
+		# debugfs 文件本身会被同一个 -EBUSY 吞掉），这样错误信息才带得上
+		# "Device or resource busy" 这类原因。
+		errf=/tmp/e2631-accel.err
+		if ! echo "$mode" > "$dev" 2>"$errf"; then
+			[ "$uci_changed" = 1 ] && flow_hw_set "$old"
+			err=$(head -n 1 "$errf" 2>/dev/null | tr -d '"\\')
+			printf '{"ok":false,"error":"driver refused %s: %s"}' \
+				"$mode" "${err:-write failed}; uci restored"
+			exit 0
+		fi
+
 		accel_json ',"ok":true'
 		;;
 	esac
