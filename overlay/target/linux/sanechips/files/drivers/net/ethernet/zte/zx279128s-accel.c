@@ -158,11 +158,19 @@ MODULE_PARM_DESC(ffe_aging, "Age out FFE flows after this many seconds (0 = neve
 
 /*
  * 自动降级的阈值：drop > 0.1% 或 fallback > 50%，持续 10 s 就回 stack
- * （设计 §9-4）。drop 是 drop_noport + drop_local。
+ * （设计 §9-4）。
+ *
+ * P7 上机后改口径（design/extensibility.md §6.6）：drop 只算 drop_noport，
+ * 因为 drop_local 是"目的地址属本机、帧正常回栈、一帧没丢"，语义上不是失败；
+ * 而且分子分母都用**窗口增量**（当前 cnt[] 减去切入 ffe 时的基线 fb_base[]），
+ * 不再拿开机累计值判——累计口径下一次 ping -f 就能永久污染判据。窗口小于
+ * ZX_FFE_FB_MIN_LOOKUP 帧时不判定（见 zx_accel_degraded()）。
  */
 #define ZX_FFE_FB_DROP_PERMILLE		1
 #define ZX_FFE_FB_FALLBACK_PERMILLE	500
 #define ZX_FFE_FB_WINDOW_MS		10000
+/* 窗口内的最小帧数：几帧抖动不足以判降级，也保证判据里没有除零 */
+#define ZX_FFE_FB_MIN_LOOKUP		1000
 
 /*
  * 快路能转发的最长帧：1514 = 14 B 以太头 + 1500 B MTU。1515..1536 只可能是
@@ -2337,6 +2345,23 @@ static void zx_accel_quiesce_leave(struct zx_eth_adapter *adapter)
 }
 
 /*
+ * 把某一族的降级基线重置为当前 cnt[] 快照（design/extensibility.md §6.6）。
+ * 只在 zx_accel_set() 成功切入 ffe 之后、仍持 accel->lock 时调用：这样自动
+ * 降级判据看的是"这次进 ffe 之后"的增量，不背开机以来的历史计数。
+ */
+static void zx_accel_fb_base_reset(struct zx_accel *accel, int family)
+{
+	const struct zx_ffe_cnt *c = &accel->cnt[family];
+	struct zx_ffe_fb_base *b = &accel->fb_base[family];
+
+	b->lookup = READ_ONCE(c->lookup);
+	b->drop = READ_ONCE(c->drop_noport);
+	b->fallback = READ_ONCE(c->fallback);
+	/* 同一时刻清掉"10 s 持续"的起点：新窗口从这一刻算起 */
+	accel->fb_since[family] = 0;
+}
+
+/*
  * 切换协议 S0-S7（设计 §1.4）：要么整个切换完成，要么回滚到原模式，绝无
  * 半切换。family 0 = IPv4，1 = IPv6。返回 0 表示已是目标模式，-EINVAL 表示
  * 参数/该族不支持，-EBUSY 表示能力检查（ffe 与 PPE 冲突、池不可用）或排空
@@ -2487,6 +2512,13 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 
 	/* S5 切点：单字节写，数据面只会看到旧模式或新模式 */
 	WRITE_ONCE(*slot, new_mode);
+	/*
+	 * S5.1 切入 ffe 成功，重设这一族的降级基线：判据只看"进去之后"的增量，
+	 * 不背开机以来的历史计数（design/extensibility.md §6.6）。与 S4 的清表
+	 * 同一持锁区，所以数据面/age work 都不会看到半新半旧的基线。
+	 */
+	if (new_mode == ZX_ACC_FFE)
+		zx_accel_fb_base_reset(accel, family);
 
 	/* S6 目标 zc 打开零拷贝，然后恢复数据面。全局开关只在 0->非0 时开一次
 	 * （mask 已置位，所以 zc_rx 打开时不变式立刻成立），另一族本来就在 zc
@@ -2528,23 +2560,44 @@ unlock:
  * 本机终结流量误判成快路故障。P2 起 fwd 是真的提交给硬件了，drop/fallback
  * 都是真实结果，所以按设计的阈值与窗口直接启用。
  *
- * 注意 drop 里含 drop_local（目的 IP 属本机、回栈是**正确**行为），这是设计
- * §9-4 的原始口径：管理面 ping 多到 0.1% 以上时可能误降级，此时可以把
- * accel_autofallback 写成 0 关掉它。
+ * P7 上机后改口径（design/extensibility.md §6.6），三条：
+ *   1. 分子去掉 drop_local。它是"目的地址属本机、帧正常回栈"（complete() 里
+ *      计完仍返回 STACK），一帧没丢，不是失败；管理面 ping -f 打盒子不再
+ *      能把它算成快路故障。drop_local 照旧在 cnt[]/debugfs 里显示。
+ *   2. 分子分母都是**窗口增量**：当前 cnt[] 减去切入 ffe 时的基线 fb_base[]
+ *      （zx_accel_set() 的 S5 之后写入）。累计口径下一次 ping -f 就永久污染，
+ *      此后每次进 ffe 10 s 内被踢回 stack 并清空流表。
+ *   3. 窗口内帧数太少（< ZX_FFE_FB_MIN_LOOKUP）不判定；Δlookup 为零时直接
+ *      返回 false（判据用乘法比而不是除法，这里也没有除零）。
+ *
+ * dmesg 仍打印累计值（drop 是 drop_noport + drop_local 的老口径合计，字段名
+ * 不变），只是判据基于增量。
  */
-static bool zx_accel_degraded(const struct zx_accel *accel, int family)
+static bool zx_accel_degraded(const struct zx_eth_adapter *adapter, int family)
 {
+	const struct zx_accel *accel = &adapter->accel;
 	const struct zx_ffe_cnt *c = &accel->cnt[family];
+	const struct zx_ffe_fb_base *b = &accel->fb_base[family];
 	u64 lookup = READ_ONCE(c->lookup);
-	u64 drop;
+	u64 base_lookup = READ_ONCE(b->lookup);
+	u64 base_drop = READ_ONCE(b->drop);
+	u64 base_fb = READ_ONCE(b->fallback);
+	u64 drop = READ_ONCE(c->drop_noport);
+	u64 fallback = READ_ONCE(c->fallback);
+	u64 dlookup, ddrop, dfb;
 
-	if (!lookup)
+	/* 基线在持锁区取快照、计数只增，正常不会倒挂；倒了说明快照写坏，不判 */
+	if (lookup <= base_lookup)
 		return false;
-	drop = READ_ONCE(c->drop_noport) + READ_ONCE(c->drop_local);
-	if (drop * 1000 > lookup * ZX_FFE_FB_DROP_PERMILLE)
+	dlookup = lookup - base_lookup;
+	/* 窗口太小：不看，避免几帧抖动就把一条正常流判成故障 */
+	if (dlookup < ZX_FFE_FB_MIN_LOOKUP)
+		return false;
+	ddrop = drop > base_drop ? drop - base_drop : 0;
+	dfb = fallback > base_fb ? fallback - base_fb : 0;
+	if (ddrop * 1000 > dlookup * ZX_FFE_FB_DROP_PERMILLE)
 		return true;
-	if (READ_ONCE(c->fallback) * 1000 >
-	    lookup * ZX_FFE_FB_FALLBACK_PERMILLE)
+	if (dfb * 1000 > dlookup * ZX_FFE_FB_FALLBACK_PERMILLE)
 		return true;
 	return false;
 }
@@ -2560,7 +2613,7 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
 
 	for (family = 0; family < 2; family++) {
 		if (zx_accel_cur_mode(accel, family) != ZX_ACC_FFE ||
-		    !zx_accel_degraded(accel, family)) {
+		    !zx_accel_degraded(adapter, family)) {
 			accel->fb_since[family] = 0;
 			continue;
 		}
@@ -2614,6 +2667,8 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->zc_mask = 0;
 	WRITE_ONCE(accel->quiesce, false);
 	memset(accel->cnt, 0, sizeof(accel->cnt));
+	/* 降级基线与 cnt[] 一起归零：首次进 ffe 会再取一次快照（S5.1） */
+	memset(accel->fb_base, 0, sizeof(accel->fb_base));
 	accel->sw_in = 0;
 	accel->sw_out = 0;
 	accel->drain_ms = 0;

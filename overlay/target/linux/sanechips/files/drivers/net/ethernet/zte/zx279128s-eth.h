@@ -341,6 +341,20 @@ struct zx_ffe_cnt {
 };
 
 /*
+ * 自动降级的窗口基线（P7 上机后改口径，design/extensibility.md §6.6）：三
+ * 个字段都是 cnt[] 里对应计数的快照，由 zx_accel_set() 成功切入 ffe 时写入
+ * （持 accel->lock），zx_accel_degraded() 只比"当前 - 基线"。
+ *
+ * 只有 drop_noport 进基线：drop_local（目的地址属本机、帧正常回栈、一帧没
+ * 丢）语义上不是失败，不能当降级依据；它照旧在 cnt[]/debugfs 里计数。
+ */
+struct zx_ffe_fb_base {
+	u64	lookup;
+	u64	drop;		/* 只累计 cnt[].drop_noport */
+	u64	fallback;
+};
+
+/*
  * 快路的包描述符（P6 分层，design/extensibility.md §1.1）：**入口无关**的最小
  * 集，由 ingress op 填、判据链只读，不认识"帧从哪来、到哪去"。
  *
@@ -449,6 +463,14 @@ struct zx_accel {
 	 */
 	u64			add_replace;
 	struct zx_ffe_cnt	cnt[2];
+	/*
+	 * 自动降级的窗口基线（P7 上机后改口径，design/extensibility.md §6.6）：
+	 * 只由 zx_accel_set() 成功切入 ffe 时取 cnt[] 的快照（持 accel->lock），
+	 * zx_accel_degraded() 用"当前 - 基线"判降级，所以切进去不再背开机以来
+	 * 的历史计数。drop 只对 drop_noport 取基线：drop_local 是"目的地址属
+	 * 本机、帧正常回栈"，不是失败，不进分子。
+	 */
+	struct zx_ffe_fb_base	fb_base[2];
 	/*
 	 * 本机地址集合，只服务于判据 #2（目的 MAC）、#13（目的 IPv4）与 v6 判据
 	 * 链的 #10（目的 IPv6）：local_macs 的键是 u8[ETH_ALEN]，local_ips 的键
