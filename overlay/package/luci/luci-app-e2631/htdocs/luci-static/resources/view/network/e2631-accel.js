@@ -9,11 +9,12 @@
  * 转发加速：显示每族的加速路径，并给一个受框架保护的切换入口。
  *
  * 状态只有驱动里的 accel 框架（zx279128s-accel.c）能改，页面写的是驱动自己的
- * debugfs 旋钮（经 rpcd 的 accel_set）。之所以不直接 echo：IPv4 的 ffe/zc 与
- * PPE 硬件 offload 互斥，框架会以 -EBUSY 拒绝；把硬件 offload 关掉再 reload
- * 防火墙是**策略决定**，只能由用户态做。rpcd 里那一步是复合动作：改 uci
- * （flow_offloading_hw）、reload fw4、等 ppe_bound 落到目标值、再写模式，
- * 任一步失败回滚。切回 hw 是对称的（重新打开 offload 再写 hw）。
+ * debugfs 旋钮（经 rpcd 的 accel_set）。之所以不直接 echo：IPv4 的硬件 offload
+ * 与加速路径是绑在一起的。内核只看 flowtable 绑没绑（ppe_bound），不看
+ * accel_ipv4 的取值，所以"选 stack"也必须先把 flow_offloading_hw 关掉，否则
+ * PPE 照样接管 v4 流量。rpcd 里那一步是复合动作：按目标模式改 uci
+ * （flow_offloading_hw 只在 hw 档为 1）、reload fw4、等 ppe_bound 落到目标值、
+ * 再写模式，任一步失败回滚。切回 hw 是对称的。
  *
  * 默认 v4=hw、v6=stack、zc 关；命令行的等价写法见页面下方提示。
  */
@@ -43,7 +44,7 @@ function counter(c, k) {
 
 var MODE_DESC = {
 	stack: '标准协议栈',
-	ffe: '驱动内快路（P0 只有骨架）',
+	ffe: '驱动内快路（P1 只判定、不转发）',
 	hw: 'PPE 硬件流表（仅 IPv4）',
 	zc: '零拷贝直通'
 };
@@ -88,6 +89,11 @@ return view.extend({
 				lines.push(E('p', { 'class': 'cbi-section-descr' },
 					'PPE 正绑着 flowtable：此时切 IPv4 到 ffe 或 zc 会被驱动拒绝（EBUSY）。' +
 					'下面的切换动作会先把 flow_offloading_hw 关掉、重载防火墙，等 PPE 解绑后再切。'));
+
+			lines.push(E('p', { 'class': 'cbi-section-descr' },
+				'flow_offloading_hw 由加速框架维护：只有 IPv4 选 hw 时才保持为 1；选 stack、ffe 或 zc ' +
+				'都会把它关掉。内核只看 flowtable 绑没绑、不看 accel_ipv4 的取值，所以"stack"如果不关' +
+				'硬件 offload，PPE 其实还在接管 v4 流量。开机默认 IPv4=hw，因此默认是开着的。'));
 		}
 
 		lines.push(E('table', { 'class': 'table' }, [
@@ -183,9 +189,9 @@ return view.extend({
 				this.renderFamily(box, s, 'v4', V4_MODES, 'IPv4'),
 				this.renderFamily(box, s, 'v6', V6_MODES, 'IPv6'),
 				E('p', { 'class': 'cbi-section-descr' },
-					'注意：IPv4 切到 ffe 或 zc 会先关掉硬件 offload（flow_offloading_hw=0 并重载防火墙），' +
-					'因为 PPE 与这两条路径在同一族内互斥；切回 hw 会重新打开它。任一步失败会回滚 uci，' +
-					'盒子上不会留下"ffe + PPE 还绑着"的组合。'),
+					'注意：IPv4 切到 stack、ffe 或 zc 都会先关掉硬件 offload（flow_offloading_hw=0 并重载防火墙），' +
+					'只有切到 hw 才重新打开它——因为内核只看 flowtable 绑没绑，不看模式名。任一步失败会回滚 uci，' +
+					'盒子上不会留下"ffe + PPE 还绑着"或"stack + PPE 还在跑"的组合。'),
 				E('p', { 'class': 'cbi-section-descr' },
 					'命令行等价写法：ubus call e2631 accel_set \'{"family":"v4","mode":"ffe"}\'；' +
 					'只想直接看/写驱动旋钮也可以：cat /sys/kernel/debug/92000000.ethernet/accel_ipv4 。')

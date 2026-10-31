@@ -16,10 +16,10 @@
  * 作者，别的地方（开机脚本、debugfs 的 zc 兼容口、模块参数）都只能经
  * zx_accel_set() 或 probe 里的等价初始化来改。
  *
- * P0 阶段这里只搭框架：流表建起来但永远为空（没有插入路径），ffe 模式不产生
- * 任何转发——数据面只多一条"quiesce / 模式是不是 ffe"的判断并记一次 miss。
- * 切换协议 S0-S7、计数面、自动降级判据都按设计实现，P1 加条目与老化，P2 在
- * zx_ffe_rx() 里做真转发。
+ * P0 搭框架；P1 做 shadow 判定：zx_ffe_rx() 只读帧头 + 计数，命中后帧照样走
+ * 协议栈（不转发、不改写、不消费描述符），同时把静态流表（ffe_add/del/flush/
+ * ffe_flows）、本机 MAC/IP 地址集合、老化 work 立起来。P2 才在 zx_ffe_rx() 里
+ * 做真转发。
  *
  * 锁与顺序约定（很重要）：
  *   - accel->lock 串行化模式切换。持有它时**可以**调 zx_zc_set()；
@@ -35,23 +35,37 @@
  */
 #include <linux/types.h>
 #include <asm/byteorder.h>
+#include <asm/checksum.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/etherdevice.h>
+#include <linux/hex.h>
+#include <linux/if_ether.h>
+#include <linux/in.h>
+#include <linux/inet.h>
+#include <linux/inetdevice.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/ip.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/kstrtox.h>
+#include <linux/list.h>
+#include <linux/rculist.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/net_namespace.h>
 #include <linux/netdevice.h>
+#include <linux/notifier.h>
+#include <linux/rcupdate.h>
 #include <linux/rhashtable.h>
 #include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/time64.h>
 #include <linux/uaccess.h>
+#include <net/ip.h>
 
 #include "zx279128s-eth.h"
 
@@ -62,6 +76,15 @@
 /* 老化/降级定时器的节拍，以及 S3 排空发送环的超时（设计 §1.4） */
 #define ZX_FFE_TICK_MS		1000
 #define ZX_FFE_DRAIN_MS		100
+
+/*
+ * 流表老化时间（秒）：老化 work 每 1 s 走一遍 flow_list，某个条目超过它没有
+ * 再被"全部判据通过"的帧命中就删除（设计 §4.1）。P1 的条目都是 ffe_add 下发
+ * 的静态条目，照样老化，方便把"老化删掉了"和"判定错了"区分开。0 = 不老化。
+ */
+static unsigned int ffe_aging = 300;
+module_param(ffe_aging, uint, 0644);
+MODULE_PARM_DESC(ffe_aging, "Age out FFE flows after this many seconds (0 = never, default: 300)");
 
 /*
  * 自动降级的阈值：drop > 0.1% 或 fallback > 50%，持续 10 s 就回 stack
@@ -89,10 +112,44 @@ struct zx_ffe_key {
 	u16	vid;			/* 0xffff = 任意 */
 };
 
-/* P1 往这里加 dmac/mtu/eport/flags/hits/bytes/lastuse（设计 §4.1） */
+/* P1 的条目全部来自 ffe_add（静态下发），老化照样生效（P1-TASK §3） */
+#define ZX_FFE_FLOW_STATIC	BIT(0)
+
 struct zx_ffe_flow {
 	struct rhash_head	node;
+	struct list_head	list;		/* flow_list：老化与 ffe_flows 遍历 */
+	struct rcu_head		rcu;
 	struct zx_ffe_key	key;
+	u8			dmac[ETH_ALEN];	/* 出口下一跳 MAC（P2 改写用） */
+	u8			smac[ETH_ALEN];	/* 出口端口 MAC 快照（P2 改写用） */
+	u8			eport;
+	u8			flags;
+	u16			mtu;
+	u64			hits;		/* 通过全部判据（P2 会转发）的帧数 */
+	u64			bytes;
+	unsigned long		lastuse;
+};
+
+/*
+ * 本机地址集合的条目。判据 #2 查 MAC、#13 查 IPv4；dev 用来在地址变化 /
+ * 接口注销时把旧值删掉。netdev/inetaddr 通知链是原子的，所以全部操作在
+ * accel->local_lock 下，分配用 GFP_ATOMIC，删除用 kfree_rcu（数据面在 RCU
+ * 只读段里读）。
+ */
+struct zx_ffe_lmac {
+	struct rhash_head	node;
+	struct list_head	list;
+	struct rcu_head		rcu;
+	struct net_device	*dev;
+	u8			mac[ETH_ALEN];
+};
+
+struct zx_ffe_lip {
+	struct rhash_head	node;
+	struct list_head	list;
+	struct rcu_head		rcu;
+	struct net_device	*dev;
+	__be32			addr;
 };
 
 /* 与 zx_ppe_ht_params（zx279128s-main.c）同一套参数风格 */
@@ -102,6 +159,24 @@ static const struct rhashtable_params zx_ffe_ht_params = {
 	.key_len		= sizeof(struct zx_ffe_key),
 	.nelem_hint		= ZX_FFE_NELEM_HINT,
 	.max_size		= ZX_FFE_FLOWS_MAX,
+	.automatic_shrinking	= true,
+};
+
+static const struct rhashtable_params zx_ffe_lmac_params = {
+	.head_offset		= offsetof(struct zx_ffe_lmac, node),
+	.key_offset		= offsetof(struct zx_ffe_lmac, mac),
+	.key_len		= ETH_ALEN,
+	.nelem_hint		= 8,
+	.max_size		= 64,
+	.automatic_shrinking	= true,
+};
+
+static const struct rhashtable_params zx_ffe_lip_params = {
+	.head_offset		= offsetof(struct zx_ffe_lip, node),
+	.key_offset		= offsetof(struct zx_ffe_lip, addr),
+	.key_len		= sizeof(__be32),
+	.nelem_hint		= 8,
+	.max_size		= 64,
 	.automatic_shrinking	= true,
 };
 
@@ -136,28 +211,420 @@ int zx_eth_family(__be16 proto)
 	return -1;
 }
 
-/*
- * P0 唯一的计数入口：ffe 模式下回栈的帧。查过表但没命中，所以 lookup 与
- * miss 各加一（不变式 lookup == hit + miss，hit == fwd + fallback + drop）。
- * 用普通 64 位累加：读侧最多看到一个撕裂值，P1 再换成 per-CPU/u64_stats。
- */
-void zx_accel_count_miss(struct zx_eth_adapter *adapter, int family)
+/* ---- 静态流表（P1-TASK §2/§3）-------------------------------------- */
+
+static void zx_ffe_free_flow(void *ptr, void *arg)
 {
-	if (family < 0 || family > 1)
-		return;
-	adapter->accel.cnt[family].lookup++;
-	adapter->accel.cnt[family].miss++;
+	(void)arg;
+	kfree(ptr);
+}
+
+static void zx_ffe_free_lmac(void *ptr, void *arg)
+{
+	(void)arg;
+	kfree(ptr);
+}
+
+static void zx_ffe_free_lip(void *ptr, void *arg)
+{
+	(void)arg;
+	kfree(ptr);
 }
 
 /*
- * 清掉某一族的流表项（S4，切表=全清）。P0 没有任何插入路径，表永远是空的，
- * 所以这里没有可删的东西；P1 加插入后在这里按 family 走
- * rhashtable_walk + rhashtable_remove_fast（调用者已持 accel->lock）。
+ * 删除一个条目（调用者已持 accel->lock）。flow_list（老化/遍历）与 rhashtable
+ * （数据面查表）必须同时改；kfree_rcu 让还在 RCU 只读段里的查表者拿到一个
+ * 仍然有效的条目。
  */
-static void zx_ffe_flush(struct zx_eth_adapter *adapter, int family)
+static void __zx_ffe_flow_del(struct zx_eth_adapter *adapter,
+			      struct zx_ffe_flow *flow)
 {
-	(void)adapter;
-	(void)family;
+	struct zx_accel *accel = &adapter->accel;
+
+	list_del_rcu(&flow->list);
+	rhashtable_remove_fast(&accel->flows, &flow->node, zx_ffe_ht_params);
+	accel->n_flows--;
+	kfree_rcu(flow, rcu);
+}
+
+/* family：0=IPv4，1=IPv6，-1=全部。调用者已持 accel->lock。 */
+static u32 __zx_ffe_flush(struct zx_eth_adapter *adapter, int family)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_flow *flow, *tmp;
+	u8 key_family = family == 0 ? 4 : 6;
+	u32 n = 0;
+
+	list_for_each_entry_safe(flow, tmp, &accel->flow_list, list) {
+		if (family >= 0 && flow->key.family != key_family)
+			continue;
+		__zx_ffe_flow_del(adapter, flow);
+		n++;
+	}
+	return n;
+}
+
+/* ---- 本机地址集合（判据 #2 / #13）---------------------------------- */
+
+/*
+ * 哪些接口的 dev_addr 要进"本机 MAC 集合"：
+ *   - 本驱动的交换机口（lanX / wan）：地址来自 nvmem，探针里按 DT reg 建好；
+ *   - 桥接口（br-lan）：桥下路由帧的 h_dest 就是它的地址，5 个口里查不到；
+ *   - 桥成员口（例如 enslave 到 br-lan 的 wlan）：它自己的地址也会出现；
+ *   - 无线口（phy0-ap0），哪怕还没上桥。
+ * 全用通用接口属性判断，不按名字硬编码。
+ */
+static bool zx_ffe_should_track(const struct net_device *dev)
+{
+	if (dev->flags & IFF_LOOPBACK)
+		return false;
+	if (zx_eth_is_port(dev))
+		return true;
+	if (netif_is_bridge_master(dev))
+		return true;
+	if (netif_is_bridge_port(dev))
+		return true;
+	if (dev->ieee80211_ptr)
+		return true;
+	return false;
+}
+
+static bool zx_ffe_is_local_mac(struct zx_accel *accel, const u8 *mac)
+{
+	return rhashtable_lookup_fast(&accel->local_macs, mac,
+				      zx_ffe_lmac_params) != NULL;
+}
+
+static bool zx_ffe_is_local_ip(struct zx_accel *accel, __be32 addr)
+{
+	return rhashtable_lookup_fast(&accel->local_ips, &addr,
+				      zx_ffe_lip_params) != NULL;
+}
+
+/*
+ * add=true：用 dev 当前的 dev_addr 重建这个接口的条目；false：删掉它的条目。
+ * netdev notifier 是原子通知链，所以这里 spin_lock + GFP_ATOMIC，删除用
+ * kfree_rcu（数据面在 RCU 只读段里查表）。
+ */
+static void zx_ffe_local_mac_set(struct zx_eth_adapter *adapter,
+				 struct net_device *dev, bool add)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_lmac *e, *tmp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&accel->local_lock, flags);
+	list_for_each_entry_safe(e, tmp, &accel->local_mac_list, list) {
+		if (e->dev != dev)
+			continue;
+		list_del_rcu(&e->list);
+		rhashtable_remove_fast(&accel->local_macs, &e->node,
+				       zx_ffe_lmac_params);
+		kfree_rcu(e, rcu);
+	}
+	if (add) {
+		e = kzalloc(sizeof(*e), GFP_ATOMIC);
+		if (e) {
+			e->dev = dev;
+			ether_addr_copy(e->mac, dev->dev_addr);
+			if (rhashtable_insert_fast(&accel->local_macs, &e->node,
+						   zx_ffe_lmac_params)) {
+				/* 同一个 MAC 已经有条目（重复地址）：留旧的就够 */
+				kfree(e);
+			} else {
+				list_add_rcu(&e->list, &accel->local_mac_list);
+			}
+		}
+	}
+	spin_unlock_irqrestore(&accel->local_lock, flags);
+}
+
+static void zx_ffe_local_ip_add(struct zx_eth_adapter *adapter,
+				struct net_device *dev, __be32 addr)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_lip *e;
+	unsigned long flags;
+
+	if (!addr)
+		return;
+	e = kzalloc(sizeof(*e), GFP_ATOMIC);
+	if (!e)
+		return;
+	e->dev = dev;
+	e->addr = addr;
+
+	spin_lock_irqsave(&accel->local_lock, flags);
+	if (rhashtable_insert_fast(&accel->local_ips, &e->node,
+				   zx_ffe_lip_params)) {
+		kfree(e);	/* 已有同一个地址（重复事件） */
+	} else {
+		list_add_rcu(&e->list, &accel->local_ip_list);
+	}
+	spin_unlock_irqrestore(&accel->local_lock, flags);
+}
+
+/* addr == 0：删掉这个接口的全部地址（接口注销/重新扫描时用） */
+static void zx_ffe_local_ip_del(struct zx_eth_adapter *adapter,
+				struct net_device *dev, __be32 addr)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_lip *e, *tmp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&accel->local_lock, flags);
+	list_for_each_entry_safe(e, tmp, &accel->local_ip_list, list) {
+		if (e->dev != dev || (addr && e->addr != addr))
+			continue;
+		list_del_rcu(&e->list);
+		rhashtable_remove_fast(&accel->local_ips, &e->node,
+				       zx_ffe_lip_params);
+		kfree_rcu(e, rcu);
+	}
+	spin_unlock_irqrestore(&accel->local_lock, flags);
+}
+
+static int zx_ffe_netdev_event(struct notifier_block *nb, unsigned long event,
+			       void *ptr)
+{
+	struct zx_accel *accel = container_of(nb, struct zx_accel, netdev_nb);
+	struct zx_eth_adapter *adapter =
+		container_of(accel, struct zx_eth_adapter, accel);
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+
+	if (dev_net(dev) != &init_net)
+		return NOTIFY_DONE;
+
+	switch (event) {
+	case NETDEV_REGISTER:
+	case NETDEV_CHANGEADDR:
+	case NETDEV_CHANGEUPPER:
+		/* 地址变了/上桥下桥：先删这个接口的旧条目再按当前状态加回去 */
+		zx_ffe_local_mac_set(adapter, dev, zx_ffe_should_track(dev));
+		break;
+	case NETDEV_UNREGISTER:
+		zx_ffe_local_mac_set(adapter, dev, false);
+		zx_ffe_local_ip_del(adapter, dev, 0);
+		break;
+	default:
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static int zx_ffe_inetaddr_event(struct notifier_block *nb,
+				 unsigned long event, void *ptr)
+{
+	struct zx_accel *accel = container_of(nb, struct zx_accel, inetaddr_nb);
+	struct zx_eth_adapter *adapter =
+		container_of(accel, struct zx_eth_adapter, accel);
+	struct in_ifaddr *ifa = ptr;
+	struct net_device *dev;
+
+	if (!ifa || !ifa->ifa_dev)
+		return NOTIFY_DONE;
+	dev = ifa->ifa_dev->dev;
+	if (!dev || dev_net(dev) != &init_net)
+		return NOTIFY_DONE;
+
+	switch (event) {
+	case NETDEV_UP:
+		zx_ffe_local_ip_add(adapter, dev, ifa->ifa_local);
+		break;
+	case NETDEV_DOWN:
+		zx_ffe_local_ip_del(adapter, dev, ifa->ifa_local);
+		break;
+	default:
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+/* 端口全 down 后清表（在 work 里做，rtnl 上下文不能取 accel->lock） */
+static void zx_ffe_port_flush_work(struct work_struct *work)
+{
+	struct zx_accel *accel =
+		container_of(work, struct zx_accel, port_flush_work);
+	struct zx_eth_adapter *adapter =
+		container_of(accel, struct zx_eth_adapter, accel);
+
+	mutex_lock(&accel->lock);
+	__zx_ffe_flush(adapter, -1);
+	mutex_unlock(&accel->lock);
+}
+
+/* ---- 判据链（P1 shadow：只判不发）---------------------------------- */
+
+/*
+ * 出口端口 → netdev。ports[] 只在 probe 里写一次、没有 remove 路径，所以
+ * READ_ONCE 足够；DTS 缺某个 reg 时数组有洞，返回 NULL 必须判。数据面不取
+ * rtnl，netif_running/netif_carrier_ok 是良性竞态：判不准就回栈，不丢包。
+ */
+static bool zx_ffe_eport_usable(struct zx_eth_adapter *adapter, u32 eport)
+{
+	struct net_device *nd;
+
+	if (eport >= ZX_NUM_PORTS)
+		return false;
+	nd = READ_ONCE(adapter->ports[eport]);
+	/* IFF_UP 不等于能发：link down 时驱动会把 MAC 关掉（zx_mac_link_down） */
+	return nd && netif_running(nd) && netif_carrier_ok(nd);
+}
+
+/*
+ * 老化（设计 §4.1）：每秒一拍，某个条目超过 ffe_aging 秒没有被"全部判据
+ * 通过"的帧命中就删掉。P1 的条目都是静态条目，照样老化（P1-TASK §3）。
+ */
+static void zx_ffe_age(struct zx_eth_adapter *adapter)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_flow *flow, *tmp;
+	unsigned long now = jiffies;
+	u64 max_idle_ms;
+
+	if (!ffe_aging)
+		return;
+	max_idle_ms = (u64)ffe_aging * 1000;
+
+	mutex_lock(&accel->lock);
+	list_for_each_entry_safe(flow, tmp, &accel->flow_list, list) {
+		if (jiffies_to_msecs(now - flow->lastuse) <= max_idle_ms)
+			continue;
+		__zx_ffe_flow_del(adapter, flow);
+	}
+	mutex_unlock(&accel->lock);
+}
+
+/*
+ * P1 的判定函数：判"这一帧如果走快路会不会成功"，结果只进计数与条目的
+ * hits/bytes。**无论结果如何，调用方都让帧继续走原栈路径**（P1 唯一允许的
+ * 数据面副作用是"读 + 计数"）。
+ *
+ * 判据顺序按设计 §2.2，廉价在前；唯一的偏离是 #13（目的 IP 属本机）提前到
+ * #8（L4 协议）之前：这样 ping 本机地址（ICMP）也会记进 drop_local，而不是
+ * 在协议判据里被算成普通 miss（P1-TASK §5.3 的验收要求）。
+ *
+ * 计数口径（P1-TASK §1）：lookup == hit + miss 恒成立；hit 只统计"全部判据
+ * 通过"；csum_err/ttl_err/drop_local/drop_noport/fallback 是 miss 的子集，
+ * 各自单独计，便于判断是哪条判据把它挡回去的。
+ */
+bool zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len, int rx_port,
+	       int family, __be16 h_proto)
+{
+	struct zx_accel *accel = &adapter->accel;
+	const u8 *frame = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE + 16;
+	struct zx_ffe_key key;
+	struct zx_ffe_flow *flow;
+	struct zx_ffe_cnt *c;
+	struct iphdr ip;
+	__be16 ports[2];
+	u8 dmac[ETH_ALEN];
+	u32 eport;
+
+	if (family < 0 || family > 1)
+		return false;
+	c = &accel->cnt[family];
+
+	if (family != 0) {
+		/* IPv6 判定在 P1 是桩：只记一次 miss，恒回栈（设计 §6 留 P4） */
+		c->lookup++;
+		c->miss++;
+		return false;
+	}
+
+	c->lookup++;
+
+	dma_rmb();
+	memcpy(dmac, frame, ETH_ALEN);
+
+	/* #1 组播/广播：扩散面由桥与协议栈决定，快路不参与 */
+	if (is_multicast_ether_addr(dmac))
+		goto miss;
+	/* #2 目的 MAC 不在本机集合：这帧不是给我们的，交给桥/栈扩散 */
+	if (!zx_ffe_is_local_mac(accel, dmac))
+		goto miss;
+	/* #3 runt（< 64 B） */
+	if (len < 64)
+		goto miss;
+	/* #4 只处理裸 IPv4（ARP/PPPoE/VLAN 外层/IPv6 都不碰） */
+	if (h_proto != htons(ETH_P_IP))
+		goto miss;
+	/* #5 版本/IHL/长度：带选项、被截断的都不碰 */
+	memcpy(&ip, frame + ETH_HLEN, sizeof(ip));
+	if (ip.version != 4 || ip.ihl != 5 ||
+	    ntohs(ip.tot_len) > len - ETH_HLEN)
+		goto miss;
+	/* #6 IPv4 头校验和（错的帧栈也会丢，快路不背这个锅） */
+	if (ip_fast_csum(&ip, ip.ihl))
+		goto csum_err;
+	/* #7 分片：不重组、不猜偏移 */
+	if (ip.frag_off & htons(IP_MF | IP_OFFSET))
+		goto miss;
+	/* #13（提前）：目的 IP 属本机 = 终结/端口映射，必须走栈 */
+	if (zx_ffe_is_local_ip(accel, ip.daddr))
+		goto drop_local;
+	/* #8 只接 TCP/UDP：ICMP 要回错、IGMP 要上送，其余一律不碰 */
+	if (ip.protocol != IPPROTO_TCP && ip.protocol != IPPROTO_UDP)
+		goto miss;
+	/* #9 TTL 归零必须由栈发 ICMP Time Exceeded */
+	if (ip.ttl <= 1)
+		goto ttl_err;
+	/* 取 L4 端口至少要 4 字节（TCP/UDP 头的前两个字段就是端口） */
+	if (ntohs(ip.tot_len) < sizeof(ip) + 4)
+		goto miss;
+	memcpy(ports, frame + ETH_HLEN + sizeof(ip), sizeof(ports));
+
+	/* #10 查表（自己持 RCU 只读段：条目由 kfree_rcu 释放） */
+	memset(&key, 0, sizeof(key));
+	key.v4[0] = ip.saddr;
+	key.v4[1] = ip.daddr;
+	key.sport = ports[0];
+	key.dport = ports[1];
+	key.proto = ip.protocol;
+	key.family = 4;
+
+	rcu_read_lock();
+	flow = rhashtable_lookup(&accel->flows, &key, zx_ffe_ht_params);
+	if (!flow) {
+		rcu_read_unlock();
+		goto miss;
+	}
+	/* #11 出口端口现查现判：不存在/down 都回栈（P1 不转发，回栈不会丢） */
+	eport = flow->eport;
+	if (!zx_ffe_eport_usable(adapter, eport)) {
+		rcu_read_unlock();
+		goto drop_noport;
+	}
+	/* #12 同口进出：不做 hairpin */
+	if ((int)eport == rx_port) {
+		rcu_read_unlock();
+		goto fallback;
+	}
+	/* 全部判据通过：P1 只记账，帧照样走栈 */
+	flow->hits++;
+	flow->bytes += len;
+	flow->lastuse = jiffies;
+	rcu_read_unlock();
+	c->hit++;
+	return false;
+
+csum_err:
+	c->csum_err++;
+	goto miss;
+ttl_err:
+	c->ttl_err++;
+	goto miss;
+drop_local:
+	c->drop_local++;
+	goto miss;
+drop_noport:
+	c->drop_noport++;
+	goto miss;
+fallback:
+	c->fallback++;
+miss:
+	c->miss++;
+	return false;
 }
 
 /*
@@ -345,7 +812,7 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 	 * 没有任何族再用 zc，才真正关掉全局开关（zc_rx 为真时 mask 必然非零）。
 	 * 另一族还在 zc 里时不能关：那会把它的收包路径换掉，而它的模式仍写着 zc。
 	 */
-	zx_ffe_flush(adapter, family);
+	__zx_ffe_flush(adapter, family);
 	mask = READ_ONCE(accel->zc_mask);
 	if (new_mode == ZX_ACC_ZC)
 		mask |= BIT(family);
@@ -382,15 +849,22 @@ unlock:
 /*
  * 自动降级的判据：某一族在 ffe 模式下 drop 超过 0.1% 或者 fallback 超过
  * 50%，并且持续 10 s，就把它切回 stack 并返回 true（设计 §9-4）。
- * 由 zx_accel_age_work() 每秒调一次；P0 没有转发，这些计数不会增长，所以
- * 它总是返回 false——接口先立起来，P2 真转发落地后自然生效。
+ *
+ * P1 是 shadow（只判不发）：hit 的帧并没有真的转发，drop_local/drop_noport
+ * 也只是"如果走快路会被挡回去"的投影，不是真实丢包。拿这些影子计数做自动
+ * 降级，会把正常的本地终结流量（例如 ping 本机地址）误判成快路故障，所以 P1
+ * 里这条判据不启用；P2 接上真转发后把它改成 1 即可复用同一套阈值。
  */
+#define ZX_FFE_FORWARD_ENABLED	0
+
 static bool zx_accel_degraded(const struct zx_accel *accel, int family)
 {
 	const struct zx_ffe_cnt *c = &accel->cnt[family];
 	u64 lookup = READ_ONCE(c->lookup);
 	u64 drop;
 
+	if (!ZX_FFE_FORWARD_ENABLED)
+		return false;
 	if (!lookup)
 		return false;
 	drop = READ_ONCE(c->drop_noport) + READ_ONCE(c->drop_local);
@@ -439,13 +913,14 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
 	return degraded;
 }
 
-/* 每秒一拍：P0 只有自动降级判据；P1 在这里加流表老化（设计 §4.1）。 */
+/* 每秒一拍：流表老化 + 自动降级判据（设计 §4.1 / §9-4）。 */
 static void zx_accel_age_work(struct work_struct *work)
 {
 	struct zx_eth_adapter *adapter =
 		container_of(to_delayed_work(work), struct zx_eth_adapter,
 			     accel.age);
 
+	zx_ffe_age(adapter);
 	zx_accel_autofallback(adapter);
 	schedule_delayed_work(&adapter->accel.age,
 			      msecs_to_jiffies(ZX_FFE_TICK_MS));
@@ -468,43 +943,125 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->drain_frames = 0;
 	accel->autofallback = true;
 	memset(accel->fb_since, 0, sizeof(accel->fb_since));
+	accel->n_flows = 0;
+	accel->tbl_full = 0;
+	accel->ffe_last[0] = 0;
+	INIT_LIST_HEAD(&accel->flow_list);
+	INIT_LIST_HEAD(&accel->local_mac_list);
+	INIT_LIST_HEAD(&accel->local_ip_list);
+	spin_lock_init(&accel->local_lock);
+	INIT_WORK(&accel->port_flush_work, zx_ffe_port_flush_work);
 	INIT_DELAYED_WORK(&accel->age, zx_accel_age_work);
 
 	ret = rhashtable_init(&accel->flows, &zx_ffe_ht_params);
 	if (ret) {
-		dev_err(adapter->dev, "accel: rhashtable_init failed: %d\n",
+		dev_err(adapter->dev, "accel: rhashtable_init(flows) failed: %d\n",
 			ret);
 		return ret;
+	}
+	ret = rhashtable_init(&accel->local_macs, &zx_ffe_lmac_params);
+	if (ret) {
+		dev_err(adapter->dev,
+			"accel: rhashtable_init(local_macs) failed: %d\n", ret);
+		goto err_flows;
+	}
+	ret = rhashtable_init(&accel->local_ips, &zx_ffe_lip_params);
+	if (ret) {
+		dev_err(adapter->dev,
+			"accel: rhashtable_init(local_ips) failed: %d\n", ret);
+		goto err_macs;
+	}
+
+	/*
+	 * 本机地址集合的两个来源（判据 #2/#13）：netdev 通知链管 MAC（端口/
+	 * 桥/wlan 的 dev_addr，含地址变化与上桥下桥），inetaddr 通知链管本机
+	 * IPv4 地址。两者都是原子通知链，处理函数里只做 spin_lock + GFP_ATOMIC。
+	 * 注册时内核会把现存的接口依次回调一次，probe 之前就存在的 br-lan/
+	 * wlan 也能被收进集合。
+	 */
+	accel->netdev_nb.notifier_call = zx_ffe_netdev_event;
+	accel->inetaddr_nb.notifier_call = zx_ffe_inetaddr_event;
+	ret = register_netdevice_notifier(&accel->netdev_nb);
+	if (ret) {
+		dev_err(adapter->dev,
+			"accel: register_netdevice_notifier failed: %d\n", ret);
+		goto err_ips;
+	}
+	ret = register_inetaddr_notifier(&accel->inetaddr_nb);
+	if (ret) {
+		dev_err(adapter->dev,
+			"accel: register_inetaddr_notifier failed: %d\n", ret);
+		goto err_netdev;
 	}
 
 	schedule_delayed_work(&accel->age, msecs_to_jiffies(ZX_FFE_TICK_MS));
 	return 0;
+
+err_netdev:
+	unregister_netdevice_notifier(&accel->netdev_nb);
+err_ips:
+	rhashtable_free_and_destroy(&accel->local_ips, zx_ffe_free_lip, NULL);
+err_macs:
+	rhashtable_free_and_destroy(&accel->local_macs, zx_ffe_free_lmac, NULL);
+err_flows:
+	rhashtable_free_and_destroy(&accel->flows, zx_ffe_free_flow, NULL);
+	return ret;
 }
 
+/*
+ * 收摊：先停两个 work（老化会动流表，端口清表 work 会取 accel->lock），再摘
+ * 通知链，最后按条目释放三张表。本驱动是 builtin、正常没有 rmmod，但 probe
+ * 失败与将来加 remove 都必须走这里，不能漏。
+ */
 void zx_accel_exit(struct zx_eth_adapter *adapter)
 {
 	struct zx_accel *accel = &adapter->accel;
 
 	cancel_delayed_work_sync(&accel->age);
-	/* P0 的表是空的；P1 有插入后换成按条目释放的回调 */
-	rhashtable_free_and_destroy(&accel->flows, NULL, NULL);
+	cancel_work_sync(&accel->port_flush_work);
+	unregister_inetaddr_notifier(&accel->inetaddr_nb);
+	unregister_netdevice_notifier(&accel->netdev_nb);
+	rhashtable_free_and_destroy(&accel->flows, zx_ffe_free_flow, NULL);
+	rhashtable_free_and_destroy(&accel->local_macs, zx_ffe_free_lmac, NULL);
+	rhashtable_free_and_destroy(&accel->local_ips, zx_ffe_free_lip, NULL);
+	INIT_LIST_HEAD(&accel->flow_list);
+	INIT_LIST_HEAD(&accel->local_mac_list);
+	INIT_LIST_HEAD(&accel->local_ip_list);
+	accel->n_flows = 0;
 }
 
 /*
  * ndo_open / ndo_stop 的钩子（设计 §1.4 最后一段）。调用者持 rtnl，所以这里
- * 不许取 accel->lock（锁序见文件头）。
+ * 不许取 accel->lock（锁序见文件头：accel->lock → rtnl）。
  *
- * P0：流表是空的。P1 在 close 里按端口 flush（设计 §4.2），在 open 里重建
- * 本机地址集合。
+ * open：本机地址集合的兜底全量扫描（notifier 注册前就存在的接口）；
+ * close：所有端口都 down 了，整张流表都不再可用，转 work 清表（设计 §4.2）。
  */
 void zx_accel_on_open(struct zx_eth_adapter *adapter)
 {
-	(void)adapter;
+	struct net_device *dev;
+
+	ASSERT_RTNL();
+
+	for_each_netdev(&init_net, dev) {
+		if (zx_ffe_should_track(dev))
+			zx_ffe_local_mac_set(adapter, dev, true);
+	}
+	for_each_netdev(&init_net, dev) {
+		struct in_device *in_dev = __in_dev_get_rtnl(dev);
+		struct in_ifaddr *ifa;
+
+		if (!in_dev)
+			continue;
+		for (ifa = in_dev->ifa_list; ifa; ifa = ifa->ifa_next)
+			zx_ffe_local_ip_add(adapter, dev, ifa->ifa_local);
+	}
 }
 
 void zx_accel_on_close(struct zx_eth_adapter *adapter)
 {
-	(void)adapter;
+	/* 持 rtnl 时不能取 accel->lock（会与 zx_accel_set() 的锁序相反） */
+	schedule_work(&adapter->accel.port_flush_work);
 }
 
 /* ---- debugfs ------------------------------------------------------- */
@@ -533,11 +1090,12 @@ static void zx_accel_show(struct seq_file *s, int family)
 	 * 硬件 offload（uci firewall.@defaults[0].flow_offloading_hw=0 + reload），
 	 * 所以给一个不含空格的单 token，不会被按空格切字段的读侧打散。
 	 */
-	seq_printf(s, "ppe_bound=%u sw_in=%llu sw_out=%llu drain_ms=%llu drain_frames=%llu autofallback=%u zc_mask=%u hint=%s\n",
+	seq_printf(s, "ppe_bound=%u sw_in=%llu sw_out=%llu drain_ms=%llu drain_frames=%llu autofallback=%u zc_mask=%u flows=%u tbl_full=%llu hint=%s\n",
 		   bound ? 1u : 0u, accel->sw_in,
 		   accel->sw_out, accel->drain_ms, accel->drain_frames,
 		   READ_ONCE(accel->autofallback) ? 1u : 0u,
 		   READ_ONCE(accel->zc_mask),
+		   READ_ONCE(accel->n_flows), READ_ONCE(accel->tbl_full),
 		   bound ? "disable_flow_offloading_hw_to_use_ffe" : "none");
 }
 
@@ -632,11 +1190,375 @@ const struct file_operations zx_accel_v6_fops = {
 	.release	= single_release,
 };
 
-/* P0：没有插入路径，表永远为空；P1 在这里按 family 遍历打印条目（设计 §1.3） */
+/* ---- ffe_add / ffe_del / ffe_flush（P1-TASK §2）--------------------- */
+
+#define ZX_FFE_ARG_MAX		12
+
+/* 按空白切成 token（就地写 0），返回 token 数 */
+static int zx_ffe_split(char *buf, char **argv, int max)
+{
+	char *p = buf;
+	int argc = 0;
+
+	while (argc < max) {
+		while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+			p++;
+		if (!*p)
+			break;
+		argv[argc++] = p;
+		while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+			p++;
+		if (*p)
+			*p++ = 0;
+	}
+	return argc;
+}
+
+static int zx_ffe_bad_usage(struct zx_eth_adapter *adapter, const char *usage)
+{
+	struct zx_accel *accel = &adapter->accel;
+
+	mutex_lock(&accel->lock);
+	snprintf(accel->ffe_last, sizeof(accel->ffe_last), "usage: %s",
+		 usage);
+	mutex_unlock(&accel->lock);
+	return -EINVAL;
+}
+
+/*
+ * 解析流表键，共 8 个 token：
+ *   <family> <saddr> <daddr> <sport> <dport> <proto> <ipport> <vid>
+ * family 只接受 4；6 返回 -EOPNOTSUPP（P1 没有 v6 判定，见 P1-TASK §0）。
+ * 调用前 key 必须已清零（rhashtable 的键按字节比较，尾部填充也要一致）。
+ */
+static int zx_ffe_key_parse(struct zx_eth_adapter *adapter, char **argv,
+			    struct zx_ffe_key *key, const char **err)
+{
+	unsigned int fam, sport, dport, proto, ipport, vid;
+
+	if (kstrtouint(argv[0], 10, &fam) || (fam != 4 && fam != 6)) {
+		*err = "family must be 4 or 6";
+		return -EINVAL;
+	}
+	if (fam == 6) {
+		dev_info(adapter->dev,
+			 "ffe: IPv6 flow keys are not supported yet (P1)\n");
+		*err = "IPv6 keys are -EOPNOTSUPP in P1";
+		return -EOPNOTSUPP;
+	}
+	if (!in4_pton(argv[1], -1, (u8 *)&key->v4[0], '\0', NULL) ||
+	    !in4_pton(argv[2], -1, (u8 *)&key->v4[1], '\0', NULL)) {
+		*err = "bad IPv4 address";
+		return -EINVAL;
+	}
+	if (kstrtouint(argv[3], 10, &sport) || sport > 0xffff ||
+	    kstrtouint(argv[4], 10, &dport) || dport > 0xffff ||
+	    kstrtouint(argv[5], 10, &proto) || proto > 0xff ||
+	    kstrtouint(argv[6], 10, &ipport) || ipport > 0xff ||
+	    kstrtouint(argv[7], 10, &vid) || vid > 0xffff) {
+		*err = "bad sport/dport/proto/ipport/vid range";
+		return -EINVAL;
+	}
+
+	key->sport = htons(sport);
+	key->dport = htons(dport);
+	key->proto = proto;
+	key->ipport = ipport;
+	key->family = 4;
+	key->vid = vid;
+	return 0;
+}
+
+/* ffe_add <key 8 个 token> <eport> <dmac> */
+static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_key key;
+	struct zx_ffe_flow *flow;
+	struct net_device *nd;
+	unsigned int eport;
+	const char *err = NULL;
+	u8 dmac[ETH_ALEN];
+	int ret;
+
+	memset(&key, 0, sizeof(key));
+	ret = zx_ffe_key_parse(adapter, argv, &key, &err);
+	if (ret)
+		goto fail;
+	if (kstrtouint(argv[8], 10, &eport) || eport >= ZX_NUM_PORTS) {
+		err = "eport out of range";
+		ret = -EINVAL;
+		goto fail;
+	}
+	nd = READ_ONCE(adapter->ports[eport]);
+	if (!nd) {
+		err = "eport is not a probed switch port";
+		ret = -EINVAL;
+		goto fail;
+	}
+	if (!mac_pton(argv[9], dmac)) {
+		err = "bad dmac (xx:xx:xx:xx:xx:xx)";
+		ret = -EINVAL;
+		goto fail;
+	}
+
+	mutex_lock(&accel->lock);
+	/* 表满不驱逐（P1-TASK §3）：拒绝新条目，计数可解释 */
+	if (accel->n_flows >= ZX_FFE_FLOWS_MAX) {
+		accel->tbl_full++;
+		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+			 "add: -ENOSPC (table full: %u entries)",
+			 accel->n_flows);
+		mutex_unlock(&accel->lock);
+		return -ENOSPC;
+	}
+	flow = kzalloc(sizeof(*flow), GFP_KERNEL);
+	if (!flow) {
+		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+			 "add: -ENOMEM");
+		mutex_unlock(&accel->lock);
+		return -ENOMEM;
+	}
+	flow->key = key;
+	/* h_source 在 add 时快照，P2 改写不再每包读 dev_addr（6 字节会撕裂） */
+	ether_addr_copy(flow->dmac, dmac);
+	ether_addr_copy(flow->smac, nd->dev_addr);
+	flow->eport = eport;
+	flow->flags = ZX_FFE_FLOW_STATIC;
+	flow->lastuse = jiffies;
+	ret = rhashtable_insert_fast(&accel->flows, &flow->node,
+				     zx_ffe_ht_params);
+	if (ret) {
+		kfree(flow);
+		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+			 "add: %d (same key already present?)", ret);
+		mutex_unlock(&accel->lock);
+		return ret;
+	}
+	list_add_rcu(&flow->list, &accel->flow_list);
+	accel->n_flows++;
+	snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+		 "add %u %pI4 %pI4 sport=%u dport=%u proto=%u ipport=%u vid=%u -> eport %u ok, flows=%u",
+		 key.family, &key.v4[0], &key.v4[1],
+		 ntohs(key.sport), ntohs(key.dport), key.proto, key.ipport,
+		 key.vid, eport, accel->n_flows);
+	mutex_unlock(&accel->lock);
+	return 0;
+
+fail:
+	mutex_lock(&accel->lock);
+	snprintf(accel->ffe_last, sizeof(accel->ffe_last), "add: %d (%s)",
+		 ret, err ? err : "invalid");
+	mutex_unlock(&accel->lock);
+	return ret;
+}
+
+/* ffe_del <key 8 个 token>：key 必须与 add 完全一致，不猜 */
+static int zx_ffe_op_del(struct zx_eth_adapter *adapter, char **argv)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_key key;
+	struct zx_ffe_flow *flow;
+	const char *err = NULL;
+	int ret;
+
+	memset(&key, 0, sizeof(key));
+	ret = zx_ffe_key_parse(adapter, argv, &key, &err);
+	if (ret) {
+		mutex_lock(&accel->lock);
+		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+			 "del: %d (%s)", ret, err ? err : "invalid");
+		mutex_unlock(&accel->lock);
+		return ret;
+	}
+
+	mutex_lock(&accel->lock);
+	rcu_read_lock();
+	flow = rhashtable_lookup(&accel->flows, &key, zx_ffe_ht_params);
+	rcu_read_unlock();
+	if (!flow) {
+		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+			 "del: -ENOENT (no such flow)");
+		mutex_unlock(&accel->lock);
+		return -ENOENT;
+	}
+	__zx_ffe_flow_del(adapter, flow);
+	snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+		 "del: ok, flows=%u", accel->n_flows);
+	mutex_unlock(&accel->lock);
+	return 0;
+}
+
+/* ffe_flush <4|6|all> */
+static int zx_ffe_op_flush(struct zx_eth_adapter *adapter, const char *arg)
+{
+	struct zx_accel *accel = &adapter->accel;
+	u32 n;
+	int family;
+
+	if (!strcmp(arg, "all")) {
+		family = -1;
+	} else if (!strcmp(arg, "4")) {
+		family = 0;
+	} else if (!strcmp(arg, "6")) {
+		dev_info(adapter->dev,
+			 "ffe: IPv6 flush is not supported yet (P1)\n");
+		mutex_lock(&accel->lock);
+		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+			 "flush 6: -EOPNOTSUPP");
+		mutex_unlock(&accel->lock);
+		return -EOPNOTSUPP;
+	} else {
+		return zx_ffe_bad_usage(adapter, "ffe_flush <4|6|all>");
+	}
+
+	mutex_lock(&accel->lock);
+	n = __zx_ffe_flush(adapter, family);
+	snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+		 "flush %s: %u flows removed, flows=%u", arg, n,
+		 accel->n_flows);
+	mutex_unlock(&accel->lock);
+	return 0;
+}
+
+enum zx_ffe_op {
+	ZX_FFE_OP_ADD,
+	ZX_FFE_OP_DEL,
+	ZX_FFE_OP_FLUSH,
+};
+
+static ssize_t zx_ffe_store(struct file *file, const char __user *ubuf,
+			    size_t count, int op)
+{
+	struct seq_file *s = file->private_data;
+	struct zx_eth_adapter *adapter = s->private;
+	char buf[256];
+	char *argv[ZX_FFE_ARG_MAX];
+	int argc, ret = -EINVAL;
+
+	if (count == 0 || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = 0;
+	argc = zx_ffe_split(buf, argv, ARRAY_SIZE(argv));
+
+	switch (op) {
+	case ZX_FFE_OP_ADD:
+		if (argc != 10)
+			return zx_ffe_bad_usage(adapter,
+				"ffe_add <family> <saddr> <daddr> <sport> <dport> <proto> <ipport> <vid> <eport> <dmac>");
+		ret = zx_ffe_op_add(adapter, argv);
+		break;
+	case ZX_FFE_OP_DEL:
+		if (argc != 8)
+			return zx_ffe_bad_usage(adapter,
+				"ffe_del <family> <saddr> <daddr> <sport> <dport> <proto> <ipport> <vid>");
+		ret = zx_ffe_op_del(adapter, argv);
+		break;
+	default:
+		if (argc != 1)
+			return zx_ffe_bad_usage(adapter,
+				"ffe_flush <4|6|all>");
+		ret = zx_ffe_op_flush(adapter, argv[0]);
+		break;
+	}
+	return ret ? ret : (ssize_t)count;
+}
+
+static ssize_t zx_accel_add_store(struct file *file, const char __user *ubuf,
+				  size_t count, loff_t *ppos)
+{
+	return zx_ffe_store(file, ubuf, count, ZX_FFE_OP_ADD);
+}
+
+static ssize_t zx_accel_del_store(struct file *file, const char __user *ubuf,
+				  size_t count, loff_t *ppos)
+{
+	return zx_ffe_store(file, ubuf, count, ZX_FFE_OP_DEL);
+}
+
+static ssize_t zx_accel_flush_store(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	return zx_ffe_store(file, ubuf, count, ZX_FFE_OP_FLUSH);
+}
+
+/* ffe_add/del/flush 的读侧：最后一条操作结果（同一份缓冲区） */
+static int zx_accel_last_show(struct seq_file *s, void *data)
+{
+	struct zx_eth_adapter *adapter = s->private;
+	struct zx_accel *accel = &adapter->accel;
+
+	(void)data;
+	mutex_lock(&accel->lock);
+	if (accel->ffe_last[0])
+		seq_printf(s, "%s\n", accel->ffe_last);
+	else
+		seq_puts(s, "(no ffe_add/del/flush yet)\n");
+	mutex_unlock(&accel->lock);
+	return 0;
+}
+
+static int zx_accel_last_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_accel_last_show, inode->i_private);
+}
+
+const struct file_operations zx_accel_add_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_accel_last_open,
+	.read		= seq_read,
+	.write		= zx_accel_add_store,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+const struct file_operations zx_accel_del_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_accel_last_open,
+	.read		= seq_read,
+	.write		= zx_accel_del_store,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+const struct file_operations zx_accel_flush_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_accel_last_open,
+	.read		= seq_read,
+	.write		= zx_accel_flush_store,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+/*
+ * ffe_flows：每行
+ *   family saddr daddr sport dport proto ipport vid -> eport dmac hits bytes lastuse_ms [S]
+ * （P1-TASK §2 的读格式；末尾的 S 表示静态条目，P1-TASK §3。）
+ * hits/bytes 只统计"全部判据通过"的帧——就是 P2 会真正转发的那部分。读侧持
+ * RCU 只读段，条目删除用 list_del_rcu + kfree_rcu。
+ */
 static int zx_accel_flows_show(struct seq_file *s, void *data)
 {
+	struct zx_eth_adapter *adapter = s->private;
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_flow *flow;
+
 	(void)data;
-	seq_puts(s, "# ffe flows: none (P0 has no insert path)\n");
+	rcu_read_lock();
+	list_for_each_entry_rcu(flow, &accel->flow_list, list) {
+		seq_printf(s, "%u %pI4 %pI4 %u %u %u %u %u -> %u %pM %llu %llu %u%s\n",
+			   flow->key.family,
+			   &flow->key.v4[0], &flow->key.v4[1],
+			   ntohs(flow->key.sport), ntohs(flow->key.dport),
+			   flow->key.proto, flow->key.ipport, flow->key.vid,
+			   flow->eport, flow->dmac,
+			   flow->hits, flow->bytes,
+			   jiffies_to_msecs(jiffies - flow->lastuse),
+			   (flow->flags & ZX_FFE_FLOW_STATIC) ? " S" : "");
+	}
+	rcu_read_unlock();
 	return 0;
 }
 

@@ -292,18 +292,27 @@ enum zx_accel_mode {
 	ZX_ACC_ZC,
 };
 
-/* 快路计数：cnt[0] 是 IPv4，cnt[1] 是 IPv6，口径见设计 §1.5 */
+/* ffe_last：ffe_add/del/flush 的"最后一条操作结果"缓冲区 */
+#define ZX_FFE_LAST_LEN		160
+
+/*
+ * 快路计数：cnt[0] 是 IPv4，cnt[1] 是 IPv6，口径见设计 §1.5 / P1-TASK §1。
+ * P1（shadow，只判不发）的不变式是 lookup == hit + miss：每一帧进判据链时
+ * lookup 加一，通过全部判据才算 hit，其余一律 miss；csum_err/ttl_err/
+ * drop_local/drop_noport/fallback 是 miss 的子集，用来区分是哪条判据把它挡
+ * 回去的。P1 没有 fwd（真转发在 P2），hit 的帧照样走协议栈。
+ */
 struct zx_ffe_cnt {
 	u64	lookup;		/* 进判据链的帧 */
-	u64	hit;		/* 查表命中 */
-	u64	miss;		/* 查表未命中 */
-	u64	fwd;		/* 真正交给发送硬件 */
-	u64	drop_noport;	/* 命中但出口端口不可用 */
-	u64	drop_local;	/* 命中但目的地址属本机 */
-	u64	fallback;	/* 命中但被某条判据挡回栈 */
-	u64	fallback_qfull;	/* 其中因为 TX 环满而回栈 */
-	u64	csum_err;	/* IPv4 头校验和错 */
-	u64	ttl_err;	/* TTL / Hop-Limit 到期 */
+	u64	hit;		/* 通过全部判据（P2 里会转发） */
+	u64	miss;		/* 没通过：查表未命中或任一判据不符 */
+	u64	fwd;		/* P2：真正交给发送硬件 */
+	u64	drop_noport;	/* miss 的子集：出口端口不存在/down */
+	u64	drop_local;	/* miss 的子集：目的 IP 属本机（终结） */
+	u64	fallback;	/* miss 的子集：查表命中但被同口等判据挡回栈 */
+	u64	fallback_qfull;	/* P2：其中因为 TX 环满而回栈 */
+	u64	csum_err;	/* miss 的子集：IPv4 头校验和错 */
+	u64	ttl_err;	/* miss 的子集：TTL 到期 */
 	u64	bytes;		/* fwd 的字节数 */
 	u32	qlen_peak;	/* 快路占用 TX 环的峰值 */
 };
@@ -320,9 +329,34 @@ struct zx_accel {
 	 */
 	u8			zc_mask;
 	bool			quiesce;	/* 切换中：数据面一律走栈 */
-	struct mutex		lock;		/* 串行化模式切换（S0） */
+	struct mutex		lock;		/* 串行化模式切换（S0）与流表写操作 */
 	struct rhashtable	flows;		/* 单表，family 在键里 */
+	/*
+	 * 静态流表的遍历/老化走这条 RCU 链表（rhashtable 只负责查表）：
+	 * rhashtable 的 walk 不允许与删除并发，而老化、debugfs 的 ffe_flows
+	 * 都要"边看边删"，所以所有条目同时挂在 flow_list 上，写侧持
+	 * accel->lock，读侧 rcu_read_lock()，删除用 list_del_rcu + kfree_rcu。
+	 */
+	struct list_head	flow_list;
+	u32			n_flows;	/* flow_list 的条目数（持 lock） */
+	u64			tbl_full;	/* 表满（1024）拒绝的 add 次数 */
 	struct zx_ffe_cnt	cnt[2];
+	/*
+	 * 本机地址集合，只服务于判据 #2（目的 MAC）与 #13（目的 IPv4）：
+	 * local_macs 的键是 u8[ETH_ALEN]，local_ips 的键是 __be32。两张表
+	 * 与两条链表都由 local_lock 保护（netdev/inetaddr notifier 是原子
+	 * 通知链，不能在这里睡觉）；数据面查表只走 RCU。
+	 */
+	struct rhashtable	local_macs;
+	struct rhashtable	local_ips;
+	spinlock_t		local_lock;
+	struct list_head	local_mac_list;
+	struct list_head	local_ip_list;
+	struct notifier_block	netdev_nb;
+	struct notifier_block	inetaddr_nb;
+	/* 端口全 down（open_count → 0）后清表；rtnl 里不能取 accel->lock，转 work */
+	struct work_struct	port_flush_work;
+	char			ffe_last[ZX_FFE_LAST_LEN];	/* 最后一条 add/del/flush 结果 */
 	struct delayed_work	age;		/* 1 s：老化 + 自动降级判据 */
 	u64			sw_in;		/* 进入切换的次数 */
 	u64			sw_out;		/* 切换完成（或回滚）的次数 */
@@ -593,14 +627,20 @@ void zx_accel_on_open(struct zx_eth_adapter *adapter);
 void zx_accel_on_close(struct zx_eth_adapter *adapter);
 /* Ethernet type to family: 0 = IPv4, 1 = IPv6, -1 = the fast path passes. */
 int zx_eth_family(__be16 proto);
-/* A frame that leaves the ffe mode for the stack: lookup and miss, both +1.
- * P0 has no forwarding, so this is the only counter the data path touches.
+/*
+ * P1 shadow 判定：按设计 §2.2 的判据链判断"这一帧如果走快路会不会成功"，
+ * 结果只进 cnt[family] 与流表条目的 hits/bytes，返回值本身在 P1 里没有意义
+ * （调用方一律让帧继续走原栈路径）。数据面只读 + 计数，不消费描述符、不还 bp。
  */
-void zx_accel_count_miss(struct zx_eth_adapter *adapter, int family);
-/* debugfs: accel_ipv4, accel_ipv6, ffe_flows, accel_autofallback */
+bool zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len, int rx_port,
+	       int family, __be16 h_proto);
+/* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, accel_autofallback */
 extern const struct file_operations zx_accel_v4_fops;
 extern const struct file_operations zx_accel_v6_fops;
 extern const struct file_operations zx_accel_flows_fops;
+extern const struct file_operations zx_accel_add_fops;
+extern const struct file_operations zx_accel_del_fops;
+extern const struct file_operations zx_accel_flush_fops;
 extern const struct file_operations zx_accel_autofallback_fops;
 
 /* zx279128s-switch.c */

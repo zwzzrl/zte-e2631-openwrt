@@ -1877,9 +1877,9 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			/*
 			 * 加速分发点（唯一，设计 §1.2）：描述符已解析、池已
 			 * invalidate、自有源 MAC 已排除，但还没有建任何 skb。
-			 * P0 只判不发——ffe 模式下记一次 miss（lookup/miss
-			 * 各加一），帧照旧走协议栈。P2 在这里换成真转发：命中
-			 * 就把同一个 bp 写进 TX 描述符并 continue。
+			 * P1 只判不发——zx_ffe_rx() 只读帧头并计数，返回值一律
+			 * 忽略，帧继续走下面的 zc/skb 路径。**不许**在这里
+			 * continue / 消费描述符 / 还 bp（那会把帧丢掉）。
 			 *
 			 * 协议族在 quiesce 判断之前算好：零拷贝那一段也要用它
 			 * （zc 按族生效，见下）。两者都在 goto 之前初始化，所以
@@ -1891,9 +1891,26 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 
 			if (unlikely(READ_ONCE(adapter->accel.quiesce)))
 				goto accel_slow;
-			if (fam >= 0 &&
-			    zx_accel_cur_mode(&adapter->accel, fam) == ZX_ACC_FFE)
-				zx_accel_count_miss(adapter, fam);
+			/*
+			 * 只在对应族是 ffe 时才进判据链（其它模式零开销）。
+			 * 非 IPv4/IPv6 的帧（fam<0：ARP/PPPoE/VLAN 外层…）没有
+			 * 协议族，只要有一族在 ffe 里也让它们过一遍判据链并记
+			 * miss——"非 IP 一律不命中"这件事也要能被计数自证。
+			 */
+			if (fam >= 0) {
+				if (zx_accel_cur_mode(&adapter->accel, fam) ==
+				    ZX_ACC_FFE)
+					zx_ffe_rx(adapter, bp, len, port, fam,
+						  h_proto);
+			} else {
+				int nfam = zx_accel_cur_mode(&adapter->accel, 0) ==
+					   ZX_ACC_FFE ? 0 : 1;
+
+				if (zx_accel_cur_mode(&adapter->accel, nfam) ==
+				    ZX_ACC_FFE)
+					zx_ffe_rx(adapter, bp, len, port, nfam,
+						  h_proto);
+			}
 accel_slow:
 			/*
 			 * 零拷贝：把槽位本身做成 skb 交给协议栈，bp 先不还。
@@ -2386,10 +2403,10 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 	seq_printf(s, "bmu_alloc_fail=%u bmu_alloc_late=%u bmu_free_fail=%u bmu_free_slots=%u\n",
 		   adapter->bmu_alloc_fail, adapter->bmu_alloc_late,
 		   adapter->bmu_free_fail, adapter->bmu_free_slots);
-	seq_printf(s, "accel v4=%s v6=%s autofallback=%u\n",
+	seq_printf(s, "accel v4=%s v6=%s q=%u\n",
 		   zx_accel_mode_name(READ_ONCE(adapter->accel.v4_mode)),
 		   zx_accel_mode_name(READ_ONCE(adapter->accel.v6_mode)),
-		   READ_ONCE(adapter->accel.autofallback) ? 1u : 0u);
+		   READ_ONCE(adapter->tx_pending));
 	seq_printf(s, "zc_rx=%d rx_ok=%llu tx_ok=%llu free_ok=%llu out=%lld fallback=%llu q_ovf=%llu capped=%llu off=%llu\n",
 		   READ_ONCE(adapter->zc_rx), adapter->zc_rx_ok,
 		   adapter->zc_tx_ok, adapter->zc_free_ok,
@@ -2766,13 +2783,18 @@ static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 	debugfs_create_file("zc", 0644, dir, adapter, &zx_eth_zc_fops);
 	debugfs_create_file("zc_ev", 0444, dir, adapter, &zx_eth_zc_ev_fops);
 	debugfs_create_file("txtest", 0200, dir, adapter, &zx_eth_txtest_fops);
-	/* 加速路径（设计 §1.3）：两个族的模式与计数、只读流表、降级开关 */
+	/* 加速路径（设计 §1.3）：两个族的模式与计数、流表读写、降级开关 */
 	debugfs_create_file("accel_ipv4", 0644, dir, adapter,
 			    &zx_accel_v4_fops);
 	debugfs_create_file("accel_ipv6", 0644, dir, adapter,
 			    &zx_accel_v6_fops);
-	debugfs_create_file("ffe_flows", 0444, dir, adapter,
+	debugfs_create_file("ffe_flows", 0644, dir, adapter,
 			    &zx_accel_flows_fops);
+	/* P1 的静态流表入口（P1-TASK §2）：add/del/flush 写，读回最后一条结果 */
+	debugfs_create_file("ffe_add", 0644, dir, adapter, &zx_accel_add_fops);
+	debugfs_create_file("ffe_del", 0644, dir, adapter, &zx_accel_del_fops);
+	debugfs_create_file("ffe_flush", 0644, dir, adapter,
+			    &zx_accel_flush_fops);
 	debugfs_create_file("accel_autofallback", 0644, dir, adapter,
 			    &zx_accel_autofallback_fops);
 }

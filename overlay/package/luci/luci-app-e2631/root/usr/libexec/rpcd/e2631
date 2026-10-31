@@ -17,17 +17,23 @@
 #
 # The driver's accel framework (zx279128s-accel.c) is the only owner of the
 # per-family mode; the debugfs knobs under /sys/kernel/debug/92000000.ethernet/
-# are its only interface. This script writes nothing else - but two of the
-# modes are gated by the kernel on purpose:
+# are its only interface. This script writes nothing else - but the IPv4 mode
+# and the hardware offload are gated on each other on purpose:
 #
-#   ffe / zc on IPv4  -EBUSY while the PPE owns the flows (ppe_bound=1). The
-#   kernel refuses instead of silently tearing down the firewall, so the
-#   userspace action does the part that is a *policy* decision: turn
-#   firewall.@defaults[0].flow_offloading_hw off, reload fw4, wait for
-#   ppe_bound to drop (<=3 s), then write the mode. hw is the mirror image:
-#   turn hardware offload back on first, wait for ppe_bound=1, then write hw.
+#   IPv4 = hw         the PPE owns the flows: flow_offloading_hw must be 1.
+#   IPv4 = stack/ffe/zc
+#                     the PPE must NOT own them: flow_offloading_hw is turned
+#                     off and fw4 reloaded. The kernel only looks at whether a
+#                     flowtable is bound, not at accel_ipv4, so leaving it on
+#                     would keep the hardware offload running behind a "stack"
+#                     selection - the reason stack/ffe/zc are all in this group.
+#   The driver refuses ffe/zc while ppe_bound=1 (-EBUSY), so the userspace
+#   action does the part that is a *policy* decision: set
+#   firewall.@defaults[0].flow_offloading_hw to the value the mode implies,
+#   reload fw4, wait for ppe_bound to follow (<=3 s), then write the mode.
 #   Any step failing rolls the uci value back, so the box never ends up with
 #   ffe + a bound PPE (the combination the framework exists to prevent).
+#   flow_hw is therefore maintained by the framework, not by the user.
 #
 # fwslot lives in /usr/sbin on this layout (package default), not /sbin:
 # resolve instead of assuming, or the board page shows a read failure.
@@ -108,7 +114,7 @@ accel_json() { # $1 = leading ,"ok":true when the caller wants it
 	cnt=$(sed -n 2p "$ZC" 2>/dev/null |
 		sed -e 's/\([a-z_]*\)=\(-\{0,1\}[0-9][0-9]*\)/"\1":\2/g' -e 's/ /,/g')
 
-	printf '{"avail":true%s,"v4":"%s","v6":"%s","ppe_bound":%s,"autofallback":%s,"zc_mask":%s,"flow_hw":"%s","hint":"%s","counters":{%s}}' \
+	printf '{"avail":true%s,"v4":"%s","v6":"%s","ppe_bound":%s,"autofallback":%s,"zc_mask":%s,"flow_hw":"%s","flow_hw_policy":"hw_only","hint":"%s","counters":{%s}}' \
 		"$1" "$v4" "$v6" "${ppe:-0}" "${af:-0}" "${zm:-0}" "$fh" \
 		"${hint:-none}" "$cnt"
 }
@@ -170,37 +176,36 @@ call)
 			exit 0
 		fi
 
-		# The PPE gate: the kernel refuses ffe/zc while a flowtable is bound,
-		# and refuses to tear the firewall down itself. Do that here, keep the
-		# old value, and put it back if the switch does not happen.
-		bound=$(ppe_bound)
-		old=$(flow_hw)
-		[ -n "$old" ] || old=1
-		uci_changed=0
+		# 硬件 offload 只由 IPv4=hw 这一档打开；stack/ffe/zc 三档都要求
+		# 关掉（内核只看 flowtable 绑没绑，不看 accel_ipv4）。这里按目标
+		# 值对称处理：改 uci → reload fw4 → 等 ppe_bound 跟上 → 再写模式，
+		# 任何一步失败回滚 uci。
+		if [ "$fam" = v4 ]; then
+			if [ "$mode" = hw ]; then want=1; else want=0; fi
+			old=$(flow_hw)
+			[ -n "$old" ] || old=1
+			uci_changed=0
 
-		if [ "$fam" = v4 ] && [ "$mode" = hw ] && [ "$bound" != 1 ]; then
-			if flow_hw_set 1; then
-				uci_changed=1
-				if ! wait_bound 1; then
-					flow_hw_set "$old"
-					printf '{"ok":false,"error":"fw4 reloaded but ppe_bound stayed 0 (flowtable not bound); uci rolled back"}'
+			if [ "$old" != "$want" ] || [ "$(ppe_bound)" != "$want" ]; then
+				if flow_hw_set "$want"; then
+					uci_changed=1
+					if ! wait_bound "$want"; then
+						flow_hw_set "$old"
+						if [ "$want" = 1 ]; then
+							printf '{"ok":false,"error":"fw4 reloaded but ppe_bound stayed 0 (flowtable not bound); uci rolled back"}'
+						else
+							printf '{"ok":false,"error":"fw4 reloaded but ppe_bound stayed 1 (flowtable still bound); uci rolled back"}'
+						fi
+						exit 0
+					fi
+				else
+					if [ "$want" = 1 ]; then
+						printf '{"ok":false,"error":"cannot enable flow_offloading_hw (uci/fw4 failed)"}'
+					else
+						printf '{"ok":false,"error":"cannot disable flow_offloading_hw (uci/fw4 failed)"}'
+					fi
 					exit 0
 				fi
-			else
-				printf '{"ok":false,"error":"cannot enable flow_offloading_hw (uci/fw4 failed)"}'
-				exit 0
-			fi
-		elif [ "$fam" = v4 ] && [ "$mode" != hw ] && [ "$mode" != stack ] && [ "$bound" = 1 ]; then
-			if flow_hw_set 0; then
-				uci_changed=1
-				if ! wait_bound 0; then
-					flow_hw_set "$old"
-					printf '{"ok":false,"error":"fw4 reloaded but ppe_bound stayed 1 (flowtable still bound); uci rolled back"}'
-					exit 0
-				fi
-			else
-				printf '{"ok":false,"error":"cannot disable flow_offloading_hw (uci/fw4 failed)"}'
-				exit 0
 			fi
 		fi
 
