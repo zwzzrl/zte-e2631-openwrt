@@ -292,8 +292,12 @@ enum zx_accel_mode {
 	ZX_ACC_ZC,
 };
 
-/* ffe_last：ffe_add/del/flush 的"最后一条操作结果"缓冲区 */
-#define ZX_FFE_LAST_LEN		160
+/*
+ * ffe_last：ffe_add/del/flush 的"最后一条操作结果"缓冲区。P4 起 v6 的两条
+ * 地址最长各 39 个字符（%pI6c 的完整形式），一行要能装下两个地址加其余字段，
+ * 所以从 160 提到 192。
+ */
+#define ZX_FFE_LAST_LEN		192
 
 /*
  * 快路计数：cnt[0] 是 IPv4，cnt[1] 是 IPv6，口径见设计 §1.5 / P1-TASK §1。
@@ -301,7 +305,8 @@ enum zx_accel_mode {
  * 的才算 hit（所以 P2 起 hit == fwd），其余一律 miss；csum_err/ttl_err/
  * drop_local/drop_noport/fallback/fallback_qfull/rx_drop 都是 miss 的子集，
  * 用来区分是哪条判据把它挡回去的（rx_drop 是"改写后提交失败"的兜底，理论上
- * 不可达）。
+ * 不可达）。v6 没有头校验和，所以 cnt[1].csum_err 恒为 0；cnt[1].ttl_err 是
+ * hop_limit 到期。
  */
 struct zx_ffe_cnt {
 	u64	lookup;		/* 进判据链的帧 */
@@ -313,8 +318,8 @@ struct zx_ffe_cnt {
 	u64	fallback;	/* miss 的子集：查表命中但被同口等判据挡回栈 */
 	u64	fallback_qfull;	/* P2：其中因为 TX 环满而回栈 */
 	u64	rx_drop;	/* P2：已改写但提交失败（不可达），只能丢帧 */
-	u64	csum_err;	/* miss 的子集：IPv4 头校验和错 */
-	u64	ttl_err;	/* miss 的子集：TTL 到期 */
+	u64	csum_err;	/* miss 的子集：IPv4 头校验和错（v6 恒 0） */
+	u64	ttl_err;	/* miss 的子集：TTL / hop_limit 到期 */
 	u64	bytes;		/* fwd 的字节数 */
 	u32	qlen_peak;	/* 快路占用 TX 环的峰值 */
 };
@@ -344,18 +349,22 @@ struct zx_accel {
 	u64			tbl_full;	/* 表满（1024）拒绝的 add 次数 */
 	struct zx_ffe_cnt	cnt[2];
 	/*
-	 * 本机地址集合，只服务于判据 #2（目的 MAC）与 #13（目的 IPv4）：
-	 * local_macs 的键是 u8[ETH_ALEN]，local_ips 的键是 __be32。两张表
-	 * 与两条链表都由 local_lock 保护（netdev/inetaddr notifier 是原子
+	 * 本机地址集合，只服务于判据 #2（目的 MAC）、#13（目的 IPv4）与 v6 判据
+	 * 链的 #10（目的 IPv6）：local_macs 的键是 u8[ETH_ALEN]，local_ips 的键
+	 * 是 __be32，local_ip6s 的键是 struct in6_addr（16 B）。三张表与三条
+	 * 链表都由 local_lock 保护（netdev/inetaddr/inet6addr notifier 都是原子
 	 * 通知链，不能在这里睡觉）；数据面查表只走 RCU。
 	 */
 	struct rhashtable	local_macs;
 	struct rhashtable	local_ips;
+	struct rhashtable	local_ip6s;
 	spinlock_t		local_lock;
 	struct list_head	local_mac_list;
 	struct list_head	local_ip_list;
+	struct list_head	local_ip6_list;
 	struct notifier_block	netdev_nb;
 	struct notifier_block	inetaddr_nb;
+	struct notifier_block	inet6addr_nb;
 	/* 端口全 down（open_count → 0）后清表；rtnl 里不能取 accel->lock，转 work */
 	struct work_struct	port_flush_work;
 	char			ffe_last[ZX_FFE_LAST_LEN];	/* 最后一条 add/del/flush 结果 */
@@ -653,16 +662,19 @@ enum zx_ffe_rx_result {
  * 描述符（zx_tx_submit_bp()）交给硬件，帧不再进 zc/skb/协议栈。判据不符一律
  * 返回 STACK 且帧完好无损；数据面不消费描述符、不还 bp，收尾由调用方按返回
  * 值做（收尾对账见 zx279128s-main.c 的 ffe_done 标签）。
+ *
+ * P4 起按 family 分派判据链（v4/v6 各一条），提交段只有一份。
  */
 enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 				int rx_port, int family, __be16 h_proto);
-/* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, accel_autofallback */
+/* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, ffe_aging, accel_autofallback */
 extern const struct file_operations zx_accel_v4_fops;
 extern const struct file_operations zx_accel_v6_fops;
 extern const struct file_operations zx_accel_flows_fops;
 extern const struct file_operations zx_accel_add_fops;
 extern const struct file_operations zx_accel_del_fops;
 extern const struct file_operations zx_accel_flush_fops;
+extern const struct file_operations zx_accel_aging_fops;
 extern const struct file_operations zx_accel_autofallback_fops;
 
 /* zx279128s-switch.c */
