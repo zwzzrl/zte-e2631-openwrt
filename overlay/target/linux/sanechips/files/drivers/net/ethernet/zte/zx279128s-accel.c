@@ -51,6 +51,24 @@
  * ifindex，FDB 反查（br_fdb_find_port()，要求持 rtnl）留到 drain 里做；查到
  * 的端口再用 zx_eth_is_port() 复核，无线口/查不到一律放弃，绝不猜。
  *
+ * P5 修订二（P5b/P6，三处；都只在本文件与 -eth.h 里）：
+ *   1. **两个方向都学**。P5 只学 ctinfo 的 ORIGINAL 侧，于是家庭流量里真正
+ *      的 bulk（下载，WAN→LAN，属于连接的 REPLY 侧）完全不加速。现在按
+ *      ctinfo 的方向位选元组：ORIGINAL 取 tuple[ORIGINAL]、REPLY 取
+ *      tuple[REPLY]，两侧存的都是"该方向报文在链路上的 pre-NAT 形态"，所以
+ *      "键 = 元组 / 输出 = 当前报头(post-NAT)"这条规则对两方向同构。依据见
+ *      zx_ffe_learn_hook() 的 #11 注释（6.18.55 源码逐行核对过）。
+ *   2. **"目的地址属本机"改成延迟判定**（v4 判据 #13 → #13'）。端口映射的
+ *      pre-NAT daddr 就是盒子 WAN IP（本机），P5 在判据链里直接 drop_local
+ *      回栈，于是命中带 DNAT 的学习条目也永远进不了快路。现在判据链只算
+ *      daddr_local，查表之后才裁决：无条目 → miss；有条目且带 NAT_D → 放行
+ *      （改写把 daddr 换成 daddr_out）；有条目不带 NAT_D → drop_local。
+ *      drop_local 仍是 miss 的子集，但口径从"未查表的本机目的地"变成
+ *      "命中条目且该条目没有 DNAT 改写"（见 zx_ffe_forward() 的 #13'）。
+ *   3. **ffe_add 幂等**：同 key 已存在时原地更新（dmac/smac/mtu/NAT 输出/
+ *      flags 合并/lastuse）并返回成功，不再 -EEXIST、不再产生重复行；学习
+ *      路径的"已存在就刷新"与它共用 __zx_ffe_store()。见该函数的注释。
+ *
  * 锁与顺序约定（很重要）：
  *   - accel->lock 串行化模式切换。持有它时**可以**调 zx_zc_set()；
  *     zx_zc_set() 自己会 rtnl_lock()，所以本文件在调它之前不得先持 rtnl。
@@ -237,9 +255,14 @@ struct zx_ffe_nat {
  * 一条候选就是"钩子看到的一条可学的流"，字段已经拆成 pre-NAT（键）与
  * post-NAT（改写目标）两套，work 里只剩查邻居 + 落表两件事。
  * 钩子里不许分配：这个结构必须是 POD，只 memcpy。
+ *
+ * 两个方向共用这个结构（P5 修订二 §A）：**键永远是"这一方向的报文在链路上
+ * 的 pre-NAT 形态"**（也就是数据面从帧头拼出来的那个键），输出永远是"同一
+ * 报文 NAT 之后的形态"（也就是要写到对端的形态）。钩子按 ctinfo 的方向位挑
+ * 元组，其它字段的来源不变，所以 drain 与判据链对方向一无所知。
  */
 struct zx_ffe_learn_cand {
-	__be32	saddr;		/* pre-NAT：conntrack ORIGINAL 元组 */
+	__be32	saddr;		/* pre-NAT：conntrack 该方向的元组（ORIGINAL 或 REPLY） */
 	__be32	daddr;
 	__be16	sport;
 	__be16	dport;
@@ -249,7 +272,7 @@ struct zx_ffe_learn_cand {
 	__be16	dport_out;
 	u8	proto;
 	u8	eport;		/* 出口端口（DT reg 编号，与 ffe_add 的 eport 同一套） */
-	u8	nat;		/* ZX_FFE_FLOW_NAT_S / _D */
+	u8	nat;		/* ZX_FFE_FLOW_NAT_S / _D（键与输出不一致的那几维） */
 	u8	pad;
 	/*
 	 * eport == ZX_FFE_EPORT_BRIDGE 时有效：出口是桥，钩子只记桥的
@@ -502,6 +525,82 @@ static int __zx_ffe_insert(struct zx_eth_adapter *adapter,
 	list_add_rcu(&flow->list, &accel->flow_list);
 	accel->n_flows++;
 	return 0;
+}
+
+/*
+ * 同 key 条目的原地更新（P5 修订二 §C）：ffe_add 与旁路学习对"这条流已经在表
+ * 里"的处理必须是同一段代码，否则同一条流会被写进两行（P4 验收实测出现过），
+ * 或者学习条目与静态条目在 flags 上打架。
+ *
+ * 谁赢：**后写者赢**。同一个 key 就是同一条流，两边的字段本该一致；用户用
+ * ffe_add 钉住的 dmac/eport/MTU 也以用户给的为准（学习条目被钉住后就在
+ * ffe_flows 里变成 `S`，见下）。
+ *
+ * flags 合并规则（改之前先想清楚 ffe_flows 的行尾标记与数据面判据）：
+ *   - NAT 位只增不减：同一 key 的 NAT 语义不会"一会儿 NAT 一会儿不 NAT"
+ *     （NAT 在 conntrack 里是先确定的、对整条连接一致的），后来者没给 nat/dnat
+ *     段时**不许**把旧位擦掉，否则数据面会把带 NAT 语义的帧当纯路由发出去；
+ *   - NAT 输出字段按新给者的维度覆盖：带 NAT_S 就更新 saddr_out/sport_out，
+ *     带 NAT_D 就更新 daddr_out/dport_out，另一维保持旧值；
+ *   - STATIC 只增不减，且一旦是静态条目就清掉 LEARNED：用户钉过的条目在
+ *     ffe_flows 里只打 `S`，不会出现 `S L` 两个标记；
+ *   - 学习条目不能把静态条目降级成学习条目。
+ * hits/bytes 不清零：还是同一条流，计数连续比"看起来是新建的"有用。
+ */
+static void __zx_ffe_flow_update(struct zx_ffe_flow *flow,
+				 const struct zx_ffe_flow *src)
+{
+	ether_addr_copy(flow->dmac, src->dmac);
+	ether_addr_copy(flow->smac, src->smac);
+	flow->eport = src->eport;
+	flow->mtu = src->mtu;
+	if (src->flags & ZX_FFE_FLOW_NAT_S) {
+		flow->saddr_out = src->saddr_out;
+		flow->sport_out = src->sport_out;
+	}
+	if (src->flags & ZX_FFE_FLOW_NAT_D) {
+		flow->daddr_out = src->daddr_out;
+		flow->dport_out = src->dport_out;
+	}
+	flow->flags |= src->flags & ZX_FFE_FLOW_NAT_MASK;
+	if (src->flags & ZX_FFE_FLOW_STATIC) {
+		flow->flags |= ZX_FFE_FLOW_STATIC;
+		flow->flags &= ~ZX_FFE_FLOW_LEARNED;
+	} else if (!(flow->flags & ZX_FFE_FLOW_STATIC)) {
+		flow->flags |= ZX_FFE_FLOW_LEARNED;
+	}
+	flow->lastuse = jiffies;
+}
+
+/*
+ * 落表（ffe_add 与旁路学习共用的唯一入口）。调用者持 accel->lock。
+ *   返回 1  = 同 key 已存在：字段已并进旧条目，**flow 本身没进表**（调用者
+ *             自己释放它），表里同 key 永远只有一行；
+ *   返回 0  = 新键，已插入；
+ *   返回 <0 = 失败（-ENOSPC = 表满，-ENOMEM/-EEXIST 之类来自 rhashtable）。
+ *
+ * 容量检查放在**查表之后**：同 key 的更新不该因为表满被拒（ffe_add 幂等化的
+ * 要点之一——表里已满 1024 条时，对一条已存在的键重新 add 必须成功）。表满
+ * 只拒绝**新键**，照旧计 tbl_full、不驱逐，等老化腾位置。
+ */
+static int __zx_ffe_store(struct zx_eth_adapter *adapter,
+			  struct zx_ffe_flow *flow)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_flow *old;
+
+	rcu_read_lock();
+	old = rhashtable_lookup(&accel->flows, &flow->key, zx_ffe_ht_params);
+	rcu_read_unlock();
+	if (old) {
+		__zx_ffe_flow_update(old, flow);
+		return 1;
+	}
+	if (accel->n_flows >= ZX_FFE_FLOWS_MAX) {
+		accel->tbl_full++;
+		return -ENOSPC;
+	}
+	return __zx_ffe_insert(adapter, flow);
 }
 
 /* ---- 本机地址集合（判据 #2 / #13 / v6 链 #10）---------------------- */
@@ -970,9 +1069,10 @@ static int zx_ffe_learn_brport(struct zx_eth_adapter *adapter,
 }
 
 /*
- * 一条候选落表（P5-TASK §1.4）：与 ffe_add 走同一个 __zx_ffe_insert，区别只在
+ * 一条候选落表（P5-TASK §1.4）：与 ffe_add 走同一个 __zx_ffe_store，区别只在
  * 字段来源——键来自 pre-NAT 元组、出口/NAT 来自 post-NAT 报头、dmac 来自上面
- * 的邻居查询。
+ * 的邻居查询。**方向无关**：两个方向的候选在钩子里就已经归一成"键=线上 pre-NAT
+ * 形态、输出=NAT 后形态"，这里不需要知道它来自连接的哪一侧。
  *
  * 出口分两种（P5 修订一）：
  *   - 钩子直接拿到交换机口：out = ports[cand->eport]，邻居按这个口查；
@@ -981,10 +1081,11 @@ static int zx_ffe_learn_brport(struct zx_eth_adapter *adapter,
  *     出口端口；smac 必须是**桥**的 dev_addr（对端 ARP 表里网关就是桥的
  *     MAC），MTU 取出口端口的。
  *
- * 已存在（同 key）：只刷新 dmac/MTU/lastuse 并计 learn_dup，**不碰** flags 与
- * NAT 字段——静态条目的 NAT 语义是用户下发的，学习不能悄悄改它。dmac 的更新
- * 没有加锁：数据面可能在同一条目上读到一个撕裂的 6 字节 MAC，代价是那一帧发
- * 到错 MAC 被交换机丢掉（不是发错内容）；邻居 MAC 变化本身极罕见，接受。
+ * 已存在（同 key）：交给 __zx_ffe_flow_update() 原地刷新，计 learn_dup。字段
+ * 与 flags 的合并规则写在那个函数头上（NAT 位只增不减、STATIC 只增不减）；
+ * dmac 的更新没有加锁：数据面可能在同一条目上读到一个撕裂的 6 字节 MAC，代价
+ * 是那一帧发到错 MAC 被交换机丢掉（不是发错内容）；邻居 MAC 变化本身极罕见，
+ * 接受。
  */
 static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 			     const struct zx_ffe_learn_cand *cand)
@@ -1063,23 +1164,11 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 	 */
 
 	mutex_lock(&accel->lock);
-	rcu_read_lock();
-	flow = rhashtable_lookup(&accel->flows, &key, zx_ffe_ht_params);
-	rcu_read_unlock();
-	if (flow) {
-		ether_addr_copy(flow->dmac, dmac);
-		flow->mtu = min_t(u32, out->mtu, 0xffff);
-		flow->lastuse = jiffies;
-		accel->learn_dup++;
-		mutex_unlock(&accel->lock);
-		return;
-	}
-	/* 表满不驱逐（与 ffe_add 同一条规矩）：记 tbl_full，等老化腾位置 */
-	if (accel->n_flows >= ZX_FFE_FLOWS_MAX) {
-		accel->tbl_full++;
-		mutex_unlock(&accel->lock);
-		return;
-	}
+	/*
+	 * 模板条目：先填好，再交给 __zx_ffe_store()。它要么把 flow 挂进表（新键），
+	 * 要么把字段并进同 key 的旧条目并返回 1——两条路都只有一行，绝不会出现
+	 * 同键两条。
+	 */
 	flow = kzalloc(sizeof(*flow), GFP_KERNEL);
 	if (!flow) {
 		mutex_unlock(&accel->lock);
@@ -1099,13 +1188,17 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 	flow->sport_out = cand->sport_out;
 	flow->dport_out = cand->dport_out;
 	flow->lastuse = jiffies;
-	ret = __zx_ffe_insert(adapter, flow);
-	if (ret) {
+	ret = __zx_ffe_store(adapter, flow);
+	if (ret == 1) {
+		/* 同 key 已存在：字段已经在 __zx_ffe_flow_update() 里并进旧条目 */
 		kfree(flow);
-		mutex_unlock(&accel->lock);
-		return;
+		accel->learn_dup++;
+	} else if (ret == 0) {
+		accel->learn_add++;
+	} else {
+		/* 表满（__zx_ffe_store 已计 tbl_full）或 rhashtable 失败：本拍不学 */
+		kfree(flow);
 	}
-	accel->learn_add++;
 	mutex_unlock(&accel->lock);
 }
 
@@ -1117,10 +1210,42 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
  * 语义：**只旁听，不做任何决定**，恒返回 NF_ACCEPT。过滤不通过就直接返回，
  * 投递只做 memcpy + 环写，所有分配/邻居查询都在 work 里。
  *
- * ctinfo 方向：conntrack 给两个方向的 tuple，与包的方向无关；这里只处理
- * ctinfo < IP_CT_IS_REPLY（= 0/1/2，ORIGINAL 方向）的包，REPLY 方向的包跳过。
- * 也就是说**一条连接只学它自己的原始方向**（回程是另一条"方向"，本版不学，
- * 也不合成反向条目，见 P5-TASK §2 与报告里的说明）。
+ * ctinfo 方向（P5 修订二 §A 改成两侧都学）：conntrack 给两个方向的 tuple，与
+ * 包的方向无关，方向只看 ctinfo 的 IP_CT_IS_REPLY 位（CTINFO2DIR() 就是这么
+ * 定义的，include/uapi/linux/netfilter/nf_conntrack_tuple_common.h:44）：
+ *
+ *   ORIGINAL 侧：键 = ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple（pre-NAT），
+ *               输出 = ip_hdr(skb) + L4 端口（post-NAT）。这就是 P5 的行为。
+ *   REPLY 侧：   键 = ct->tuplehash[IP_CT_DIR_REPLY].tuple，
+ *               输出 = ip_hdr(skb) + L4 端口。
+ *
+ * **两侧存的都是"该方向报文在链路上的 pre-NAT 形态"**，不是"一侧 pre、一侧
+ * post"，所以上面这条规则对两个方向同构。依据（linux-6.18.55 源码，P5 修订二
+ * 逐行核对过）：
+ *   - 建连：net/netfilter/nf_conntrack_core.c:1735 init_conntrack() 里
+ *     nf_ct_invert_tuple(&repl_tuple, tuple)，invert 只交换源/目的与端口（同一
+ *     文件 :432 nf_ct_invert_tuple()），于是 tuple[REPLY] 一开始就是"回包到达
+ *     时的样子"；
+ *   - 原始方向的 tuple 全内核只在 nf_conntrack_core.c:1651
+ *     __nf_conntrack_alloc() 里写过一次（取首包的 pre-NAT 元组），NAT 之后再没人
+ *     碰它 → tuple[ORIGINAL] 永远是 pre-NAT；
+ *   - NAT：net/netfilter/nf_nat_core.c:771 nf_nat_setup_info() 先
+ *     :793 curr_tuple = invert(tuple[REPLY]) —— 注意这恰好回到"原始方向 pre-NAT"
+ *     的坐标系 —— 由 get_unique_tuple() 挑新值，再 :802 reply = invert(new_tuple)
+ *     交给 :803 nf_conntrack_alter_reply() 写回 tuple[REPLY]
+ *     （include/net/netfilter/nf_conntrack.h:284 里就是
+ *     `tuplehash[IP_CT_DIR_REPLY].tuple = *newreply`）。invert(原始方向 NAT 之后
+ *     的值) 正是"回程包在链路上的 pre-NAT 形态"：例如 masquerade 的下载方向
+ *     tuple[REPLY] = (服务器:53 → WAN_IP:随机端口)，与 WAN 口收到的帧头逐字段
+ *     相同；NAT 之后才变成 (服务器:53 → 客户端:1234)，也就是 ip_hdr(skb)。
+ *   - 反证：net/netfilter/nf_nat_proto.c:376/383 nf_nat_manip_pkt() 用
+ *     invert(tuple[!dir]) 作**改写目标**（"We are aiming to look like inverse of
+ *     other direction"），说明报文自身在改写前持有的就是 pre-NAT 值——与本钩子
+ *     在 NAT 之后读到的 post-NAT 正好互补。
+ *
+ * 因此两个方向都能拼出 (键, 输出) 一对；NAT 位照旧按"键 vs 输出"的差异置位，
+ * 不需要任何方向特判。下载方向（WAN→LAN 的 bulk）就是 REPLY 侧，P5 只学
+ * ORIGINAL 等于只加速了上行小包，这是本次修订要修的第一件事。
  *
  * 为什么在钩子里能看到 confirmed：本驱动是 builtin（probe 早于 conntrack 模块
  * 加载），而 nf_hook_entries_grow() 对同优先级是"后注册的排前面"，ipv4_confirm
@@ -1143,6 +1268,7 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	struct zx_ffe_learn_ring *ring;
 	struct zx_ffe_learn_cand cand;
 	const struct nf_conntrack_tuple *ot;
+	enum ip_conntrack_dir dir;
 	enum ip_conntrack_info ctinfo;
 	const struct iphdr *iph;
 	struct nf_conn *ct;
@@ -1221,22 +1347,34 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	}
 	if (iiport < 0 || eport == iiport)
 		return NF_ACCEPT;
-	/* #10 目的地址属本机：本机终结，回栈（判据 #13） */
+	/*
+	 * #10 目的地址属本机（看的是 **post-NAT** 的 daddr，即这一帧真正要去的
+	 * 地址）：本机终结的流学了也没用。注意端口映射 / NAT 回程的帧，pre-NAT
+	 * 的 daddr 才是本机地址（WAN IP），post-NAT 的 daddr 是内网主机——所以
+	 * 这条判据不会把该加速的 NAT 流挡掉；数据面那边由判据 #13' 的延迟判定
+	 * 放行（见 zx_ffe_forward()）。
+	 */
 	if (zx_ffe_is_local_ip(accel, iph->daddr))
 		return NF_ACCEPT;
 
 	/*
-	 * #11 conntrack：ctinfo >= IP_CT_IS_REPLY(3) 是 REPLY 方向（含
-	 * IP_CT_UNTRACKED=7），跳过；只学已 confirm 的连接（首包在 confirm
-	 * 之前，本来也不该学）。
+	 * #11 conntrack：**两个方向都学**（P5 修订二 §A，依据见函数头注释）。
+	 * 方向只看 ctinfo 的方向位，元组按方向挑：ORIGINAL 侧取 tuple[ORIGINAL]、
+	 * REPLY 侧取 tuple[REPLY]，两侧存着的都是"该方向报文在链路上的 pre-NAT
+	 * 形态"，正是数据面从帧头拼出来的键。
+	 *
+	 * 未跟踪/没跟踪的包在 6.18 里是 nf_ct_set(skb, NULL, IP_CT_UNTRACKED)
+	 * （net/netfilter/nf_conntrack_core.c:1981 就是这么判的），所以 ct 为
+	 * NULL；下面那条 ctinfo 判据纯属防御（枚举本身是给用户态兼容留的）。
+	 * 只学已 confirm 的连接：首包在 confirm 之前，本来也不该学。
 	 */
 	ct = nf_ct_get(skb, &ctinfo);
-	if (!ct || ctinfo >= IP_CT_IS_REPLY)
+	if (!ct || ctinfo == IP_CT_UNTRACKED)
 		return NF_ACCEPT;
 	if (!nf_ct_is_confirmed(ct) || nf_ct_is_dying(ct))
 		return NF_ACCEPT;
-	/* 原始元组（pre-NAT）：源/目的地址 + proto 都取 conntrack 的 */
-	ot = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
+	dir = (ctinfo & IP_CT_IS_REPLY) ? IP_CT_DIR_REPLY : IP_CT_DIR_ORIGINAL;
+	ot = &ct->tuplehash[dir].tuple;
 	if (ot->src.l3num != AF_INET || ot->dst.protonum != iph->protocol)
 		return NF_ACCEPT;
 
@@ -1250,6 +1388,9 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	 * 组装候选。先写本地变量、再整体 memcpy 进环：去重要拿整条候选做键，
 	 * 而且"槽位发布"必须排在所有字段写完之后（smp_store_release），本地
 	 * 副本让这两件事都简单。结构是 POD，只赋值不分配。
+	 *
+	 * 键（cand.saddr/daddr/sport/dport）来自上面按方向挑好的元组，输出
+	 * （*_out）永远是当前报头：两个方向用的是同一条规则，没有方向特判。
 	 */
 	cand.saddr = ot->src.u3.ip;
 	cand.daddr = ot->dst.u3.ip;
@@ -1265,7 +1406,12 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	cand.br_ifindex = br_ifindex;
 	cand.nat = 0;
 	cand.pad = 0;
-	/* NAT 位：pre 与 post 不一致就是这一维被 NAT 改写（纯路由流两位都不置） */
+	/*
+	 * NAT 位：键与输出不一致 = 这一维被 NAT 改写过（纯路由流两位都不置）。
+	 * 注意对 REPLY 侧来说，"目的地址变了"就是 masquerade 的反向改写
+	 * （键里的 daddr 是 WAN IP、输出是内网主机），数据面要靠 NAT_D 这位
+	 * 才能放行，见 zx_ffe_forward() 的 #13'。
+	 */
 	if (cand.saddr != cand.saddr_out || cand.sport != cand.sport_out)
 		cand.nat |= ZX_FFE_FLOW_NAT_S;
 	if (cand.daddr != cand.daddr_out || cand.dport != cand.dport_out)
@@ -1350,7 +1496,10 @@ enum zx_ffe_verdict {
 	ZX_FFE_V_MISS,		/* 普通 miss：某条判据不符或查表未命中 */
 	ZX_FFE_V_CSUM_ERR,	/* 只有 v4：IPv4 头校验和错 */
 	ZX_FFE_V_TTL_ERR,	/* TTL/hop_limit <= 1：由栈回 ICMP(6) Time Exceeded */
-	ZX_FFE_V_DROP_LOCAL,	/* 目的地址属本机：本机终结，回栈 */
+	ZX_FFE_V_DROP_LOCAL,	/* 目的地址属本机：v6 #10 一律终结；v4 只在"命中条目
+				 * 但该条目没有 DNAT 改写"或非 TCP/UDP 的 ICMP 上
+				 * 报（P5 修订二 §B 的延迟判定）
+				 */
 	ZX_FFE_V_DROP_NOPORT,	/* 出口端口不存在 / !running / !carrier */
 	ZX_FFE_V_FALLBACK,	/* 命中但按判据回栈（同口/NAT 缺字段/帧长/出口 MTU） */
 	ZX_FFE_V_QFULL,		/* 命中但发送环满：回栈让 qdisc 背压 */
@@ -1377,13 +1526,23 @@ static inline bool zx_ffe_v6_is_linklocal(const struct in6_addr *addr)
  * tot_len，即 IP 层长度），返回 ZX_FFE_V_OK。入口口/MAC/runt 三条两族共用的
  * 判据在 zx_ffe_rx() 的前置段里做过，这里不再重复。
  *
- * 顺序按设计 §2.2，唯一的偏离是 #13（目的 IP 属本机）提到 #8（L4 协议）之前：
- * 否则 ping 本机地址（ICMP）会在协议判据里被算成普通 miss，drop_local 永远不
- * 涨，验收判据无法成立（P1-TASK §5.3 / design-errata §2）。
+ * #13（目的 IP 属本机）从 P5 修订二起**只算不判**（P5 修订二 §B）：端口映射与
+ * NAT 回程的 pre-NAT daddr 就是盒子自己的 WAN IP，在这一步直接 drop_local 会把
+ * 所有"命中带 DNAT 的学习条目"挡在快路外面。所以这里只把布尔值交给调用方
+ * （*daddr_local），真正的裁决在查表之后（zx_ffe_forward() 的 #13'）：
+ *   查表未命中          → miss（本来也要回栈）
+ *   命中且带 NAT_D      → 放行（改写把 daddr 换成 daddr_out）
+ *   命中但不带 NAT_D    → drop_local（这帧确实是给本机终结的）
+ *
+ * 唯一的例外是**非 TCP/UDP** 的帧：它们在 #8 就返回了，根本走不到查表，所以
+ * #8 里就地按 daddr_local 报 DROP_LOCAL——否则 ping 本机地址（ICMP）会被算成
+ * 普通 miss，P1-TASK §5.3 的验收判据（drop_local 上涨）不成立
+ * （design-errata §2 记的就是这条）。
  */
 static enum zx_ffe_verdict
 zx_ffe_v4_check(struct zx_accel *accel, const u8 *frame, u16 len,
-		__be16 h_proto, struct zx_ffe_key *key, u32 *pkt_len)
+		__be16 h_proto, struct zx_ffe_key *key, u32 *pkt_len,
+		bool *daddr_local)
 {
 	struct iphdr ip;
 	__be16 ports[2];
@@ -1402,12 +1561,18 @@ zx_ffe_v4_check(struct zx_accel *accel, const u8 *frame, u16 len,
 	/* #7 分片：不重组、不猜偏移 */
 	if (ip.frag_off & htons(IP_MF | IP_OFFSET))
 		return ZX_FFE_V_MISS;
-	/* #13（提前）：目的 IP 属本机 = 终结/端口映射，必须走栈 */
-	if (zx_ffe_is_local_ip(accel, ip.daddr))
-		return ZX_FFE_V_DROP_LOCAL;
-	/* #8 只接 TCP/UDP：ICMP 要回错、IGMP 要上送，其余一律不碰 */
+	/*
+	 * #13（算出来但延后判）：一次 local_ips 查表，与判据链里其它步骤同价，
+	 * 而且 pre-NAT 的 daddr 在一条流里不变。裁决见函数头注释。
+	 */
+	*daddr_local = zx_ffe_is_local_ip(accel, ip.daddr);
+	/*
+	 * #8 只接 TCP/UDP：ICMP 要回错、IGMP 要上送，其余一律不碰。
+	 * 非 TCP/UDP 走不到查表，所以本机目的地址在这里就要报 drop_local（见函数
+	 * 头注释最后一段）。
+	 */
 	if (ip.protocol != IPPROTO_TCP && ip.protocol != IPPROTO_UDP)
-		return ZX_FFE_V_MISS;
+		return *daddr_local ? ZX_FFE_V_DROP_LOCAL : ZX_FFE_V_MISS;
 	/* #9 TTL 归零必须由栈发 ICMP Time Exceeded */
 	if (ip.ttl <= 1)
 		return ZX_FFE_V_TTL_ERR;
@@ -1444,7 +1609,9 @@ zx_ffe_v4_check(struct zx_accel *accel, const u8 *frame, u16 len,
  *      MAC + 出口"的确定映射，扩散面归栈与桥；
  *   #10 目的地址属本机 v6 地址集合 → drop_local（终结）。**必须排在协议判据
  *      之前**，否则 ping6 本机地址（ICMPv6）先被 #12 挡成普通 miss，
- *      drop_local 永远不涨（与 v4 提前 #13 同一条理由）；
+ *      drop_local 永远不涨（与 v4 提前 #13 同一条理由）。v6 保持"立刻回栈"
+ *      而不是 v4 的延迟判定：没有 NAT66 就没有"目的地址被改写"的情况，本机
+ *      v6 地址就是这条流的终点（P4-TASK §0 "不做 NAT66"）；
  *   #11 源地址属 fe80::/10：链路本地不进快路，避免旁路 ND 状态机（同一
  *      链路两端的 fe80 流本来也该由栈按 scope id 处理）；
  *   #12 只有 TCP(6)/UDP(17)：58 ICMPv6 整类排除（NS/NA/RS/RA/MLD/echo 全在
@@ -1619,8 +1786,8 @@ static void zx_ffe_rewrite(u8 *frame, const struct zx_ffe_flow *flow, int family
 /*
  * 两族共用的提交段（P4 的硬要求：v4/v6 只走这一份，别复制两份）：
  *
- *   查表 → 出口现判 → 同口/NAT 字段/帧长/出口 MTU → 取 tx_lock → 查容量 → 改写 →
- *   clean（池可缓存时）→ 提交 → 条目记账 → 解锁
+ *   查表 → #13' 本机目的地的延迟判定 → 出口现判 → 同口/NAT 字段/帧长/出口 MTU →
+ *   取 tx_lock → 查容量 → 改写 → clean（池可缓存时）→ 提交 → 条目记账 → 解锁
  *
  * 顺序本身就是不变量（P2-TASK §1）：容量检查必须在改写之前（"回栈"只对没改过
  * 的帧成立），又必须在 tx_lock 里（查完到提交之间不能有别人把环填满：
@@ -1631,13 +1798,18 @@ static void zx_ffe_rewrite(u8 *frame, const struct zx_ffe_flow *flow, int family
  * flow->mtu 同口径——不是帧长（帧长另有一条 len > 1514 的上限）。两族都传
  * IP 层长度，所以 MTU 判据也只有一份。
  *
+ * daddr_local 是判据链算出来的"这一帧 pre-NAT 的 daddr 属本机"（只有 v4 可能
+ * 为真，v6 在 #10 就回栈了）。它不再是提前回栈的条件，而是**查表之后**才用：
+ * 端口映射/NAT 回程的 pre-NAT daddr 就是盒子自己的 WAN IP，只有"该条目带
+ * DNAT 改写"时这帧才该被转发出去。
+ *
  * 返回 ZX_FFE_V_FWD 表示已提交并记完账（/proc/net/dev 的 rx/tx 也在里面补），
  * 其余裁决交回 zx_ffe_rx() 统一计数。
  */
 static enum zx_ffe_verdict
 zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	       u8 *frame, u16 bp, u16 len, int rx_port, int family,
-	       const struct zx_ffe_key *key, u32 pkt_len)
+	       const struct zx_ffe_key *key, u32 pkt_len, bool daddr_local)
 {
 	struct zx_accel *accel = &adapter->accel;
 	struct zx_ffe_flow *flow;
@@ -1645,12 +1817,34 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	unsigned int clean;
 	u32 eport;
 
-	/* #13 查表（自己持 RCU 只读段：条目由 kfree_rcu 释放） */
+	/* #13 查表（自己持 RCU 只读段：条目由 kfree_rcu 释放）。
+	 * 没命中就是普通 miss（P5 修订二起本机目的地在未命中时也算 miss，不再记
+	 * drop_local——这时候它和别的 miss 没有区别，且回栈的决定与 daddr 无关）。
+	 */
 	rcu_read_lock();
 	flow = rhashtable_lookup(&accel->flows, key, zx_ffe_ht_params);
 	if (!flow) {
 		rcu_read_unlock();
 		return ZX_FFE_V_MISS;
+	}
+	/*
+	 * #13' 目的地址属本机的**延迟判定**（P5 修订二 §B）。
+	 *
+	 * 本机目的地的帧有两种截然不同的命运，区别只在这个条目带不带 DNAT：
+	 *   - 带 ZX_FFE_FLOW_NAT_D：这是端口映射（ORIGINAL 侧 WAN_IP:port →
+	 *     LAN 服务器）或 masquerade 的下载方向（REPLY 侧 WAN_IP:port →
+	 *     客户端）。pre-NAT 的 daddr 是盒子自己的 WAN IP，但命中后 #16 的
+	 *     改写会把 daddr/dport 换成 daddr_out/dport_out，帧必须**放行**；
+	 *   - 不带 NAT_D：这帧确实是给本机终结的（SSH 到路由器自己那类），
+	 *     回栈。这就是 drop_local 的新口径：**命中条目但该条目没有 DNAT 改写**，
+	 *     仍然是 miss 的子集（计数出口在 zx_ffe_rx() 里，并没有多算）。
+	 *
+	 * 顺序：排在 #14 出口现判之前，与 P5 的"#13 提到最前"一致——本机目的地
+	 * 的帧不该被算成 drop_noport。
+	 */
+	if (daddr_local && !(flow->flags & ZX_FFE_FLOW_NAT_D)) {
+		rcu_read_unlock();
+		return ZX_FFE_V_DROP_LOCAL;
 	}
 	/* #14 出口端口现查现判：不存在/down 都回栈。
 	 *
@@ -1793,7 +1987,8 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
  *   前置段（#0-#3，两族共用）：入口口已 probe → 目的 MAC 非组播/广播 →
  *     目的 MAC 在本机集合 → len >= 64
  *   判据段（按 family 二选一）：zx_ffe_v4_check() / zx_ffe_v6_check()
- *     ——各自的判据顺序详见这两个函数的头注释
+ *     ——各自的判据顺序详见这两个函数的头注释。v4 的判据段只把
+ *     "目的地址属本机"算成 daddr_local，裁决在提交段里（#13'）。
  *   提交段（#13-#19 + 改写/提交/记账，两族共用）：zx_ffe_forward()
  *   计数段（只有这一份）：把裁决换算成 cnt[family] 的字段
  *
@@ -1801,7 +1996,9 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
  * 真正转发出去的帧（P2 起 hit == fwd）；csum_err/ttl_err/drop_local/
  * drop_noport/fallback/fallback_qfull/rx_drop 都是 miss 的子集，用来区分是哪
  * 条判据把它挡回去的。v6 没有头校验和，所以 csum_err 在 v6 上恒为 0；
- * ttl_err 对 v6 是 hop_limit 到期。
+ * ttl_err 对 v6 是 hop_limit 到期。drop_local 从 P5 修订二起是"命中条目但该
+ * 条目没有 DNAT 改写"（v4）与本机终结（v6、非 TCP/UDP 的 v4），见
+ * zx_ffe_forward() 的 #13'——仍是 miss 的子集，只是子集的定义变了。
  */
 enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 				int rx_port, int family, __be16 h_proto)
@@ -1813,6 +2010,7 @@ enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 	struct net_device *nd_in;
 	enum zx_ffe_verdict v;
 	u32 pkt_len = 0;
+	bool daddr_local = false;
 	u8 dmac[ETH_ALEN];
 
 	if (family < 0 || family > 1)
@@ -1843,14 +2041,19 @@ enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 	if (len < 64)
 		goto plain_miss;
 
+	/*
+	 * daddr_local 只由 v4 链填写（v6 在 #10 就按本机目的地回栈了，走不到
+	 * 这里），初值 false 保证 v6 与"v4 非本机"两条路完全一致。
+	 */
 	if (!family)
-		v = zx_ffe_v4_check(accel, frame, len, h_proto, &key, &pkt_len);
+		v = zx_ffe_v4_check(accel, frame, len, h_proto, &key, &pkt_len,
+				    &daddr_local);
 	else
 		v = zx_ffe_v6_check(accel, frame, len, h_proto, &key, &pkt_len);
 
 	if (v == ZX_FFE_V_OK)
 		v = zx_ffe_forward(adapter, nd_in, frame, bp, len, rx_port,
-				   family, &key, pkt_len);
+				   family, &key, pkt_len, daddr_local);
 
 	/* 统一出口：裁决 → 计数 → 返回值（两族口径只有这一份） */
 	switch (v) {
@@ -2775,7 +2978,14 @@ static int zx_ffe_nat_parse(char **argv, int base, int argc,
 	return 0;
 }
 
-/* ffe_add <key 8 个 token> <eport> <dmac> [nat ...] [dnat ...] */
+/*
+ * ffe_add <key 8 个 token> <eport> <dmac> [nat ...] [dnat ...]
+ *
+ * **幂等**（P5 修订二 §C）：同 key 已存在时原地更新（见 __zx_ffe_flow_update()
+ * 的 flags 合并规则）并返回成功，不再 -EEXIST、也不再产生第二条同键行；
+ * add_replace 计数加一，ffe_last 里带 `(replaced ...)` 便于上机分辨。
+ * 这与"学习路径先插、用户后钉"互相不打架：谁后写谁赢，NAT 位只增不减。
+ */
 static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 {
 	struct zx_accel *accel = &adapter->accel;
@@ -2819,15 +3029,6 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 	}
 
 	mutex_lock(&accel->lock);
-	/* 表满不驱逐（P1-TASK §3）：拒绝新条目，计数可解释 */
-	if (accel->n_flows >= ZX_FFE_FLOWS_MAX) {
-		accel->tbl_full++;
-		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
-			 "add: -ENOSPC (table full: %u entries)",
-			 accel->n_flows);
-		mutex_unlock(&accel->lock);
-		return -ENOSPC;
-	}
 	flow = kzalloc(sizeof(*flow), GFP_KERNEL);
 	if (!flow) {
 		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
@@ -2856,17 +3057,34 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 	flow->sport_out = nat.sport_out;
 	flow->dport_out = nat.dport_out;
 	flow->lastuse = jiffies;
-	ret = __zx_ffe_insert(adapter, flow);
-	if (ret) {
+	/*
+	 * 落表：同 key 已存在 → 原地更新并返回 1（flow 没进表，自己释放）；
+	 * 新键才走容量检查（__zx_ffe_store 里，"表满"只拒绝新键）。
+	 */
+	ret = __zx_ffe_store(adapter, flow);
+	if (ret < 0) {
 		kfree(flow);
 		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
-			 "add: %d (same key already present?)", ret);
+			 "add: %d (%s)", ret,
+			 ret == -ENOSPC ? "table full" : "cannot insert");
 		mutex_unlock(&accel->lock);
 		return ret;
+	}
+	if (ret == 1) {
+		accel->add_replace++;
+		kfree(flow);
 	}
 	zx_ffe_key_print(accel->ffe_last, sizeof(accel->ffe_last), "add",
 			 &key, eport, accel->n_flows);
 	zx_ffe_nat_print(accel->ffe_last, sizeof(accel->ffe_last), &nat);
+	if (ret == 1) {
+		size_t n = strlen(accel->ffe_last);
+
+		if (n < sizeof(accel->ffe_last))
+			scnprintf(accel->ffe_last + n,
+				  sizeof(accel->ffe_last) - n,
+				  " (replaced: same key updated in place)");
+	}
 	mutex_unlock(&accel->lock);
 	return 0;
 
@@ -3074,6 +3292,16 @@ const struct file_operations zx_accel_flush_fops = {
  *
  * P5 再加一个行尾标记：` L` = 旁路学习插进来的条目（两种标记互斥，静态条目
  * 不会被学习改写 flags）。位置在 lastuse 之后、SNAT/DNAT 之前，与 ` S` 并列。
+ *
+ * P5 修订二的两条不变式（上机核对时就看这两条）：
+ *   1. **同一个 key 只会有一行**：所有落表路径（ffe_add、旁路学习）都过
+ *      __zx_ffe_store()，同 key 时原地更新旧条目而不是再插一条，所以这里不会
+ *      出现两行同键（P4 验收曾见过）。
+ *   2. **带 DNAT 的行是"pre-NAT 目的地址属本机"的那些流**（端口映射的
+ *      ORIGINAL 侧、masquerade 的 REPLY 侧）：它们 pre-NAT 的 daddr 是盒子
+ *      自己的 WAN IP，数据面靠 ZX_FFE_FLOW_NAT_D 这位放行——没有这一位的
+ *      行，本机目的地的帧一律回栈（drop_local），见 zx_ffe_forward() #13'。
+ *      ` S`/` L` 与 SNAT/DNAT 的组合都合法：学习条目也可能带 NAT 位。
  */
 static int zx_accel_flows_show(struct seq_file *s, void *data)
 {
@@ -3236,7 +3464,7 @@ const struct file_operations zx_accel_aging_fops = {
  * 读：
  *   第 1 行  开关 0/1
  *   第 2 行  cand=.. add=.. dup=.. drop=.. noneigh=.. nobrport=.. nonport=..
- *            dedup=.. flows=.. tbl_full=..
+ *            dedup=.. flows=.. tbl_full=.. add_replace=..
  *   第 3 行  每 CPU 环的占用（还没落表的候选数，逗号分隔）
  * 写 0/1（也认 off/on）：
  *   0 = 不再把新流写进环（环里剩的候选在下一拍清掉），已有条目照常工作到老化；
@@ -3244,11 +3472,15 @@ const struct file_operations zx_accel_aging_fops = {
  *
  * 计数口径：learn_cand 是钩子"看到并投递"的候选数，learn_drop 是环满没投递
  * 的（所以 cand 不含 drop），learn_noneigh 是候选在 work 里取不到下一跳 MAC
- * 的，learn_dup 是同 key 已存在只刷新字段的，learn_add 才是真正新增的条目。
- * learn_nobrport 是桥出口在 work 里解不出本驱动端口的（FDB 未命中/要泛洪/
- * 桥已不在），learn_nonport 是 FDB 命中的端口不是本驱动交换机口的（无线口
- * 等），learn_dedup 是被 1 s 去重挡下的重复候选——这三种都是"主动放弃"，
- * 不是错误。
+ * 的，learn_dup 是同 key 已存在、字段被并进旧条目的（P5 修订二起不只是刷新
+ * dmac/MTU），learn_add 才是真正新增的条目。learn_nobrport 是桥出口在 work
+ * 里解不出本驱动端口的（FDB 未命中/要泛洪/桥已不在），learn_nonport 是 FDB
+ * 命中的端口不是本驱动交换机口的（无线口等），learn_dedup 是被 1 s 去重挡下
+ * 的重复候选——这三种都是"主动放弃"，不是错误。
+ *
+ * add_replace 是 ffe_add 的同键替换次数（P5 修订二 §C）；它与学习无关，放在
+ * 这一行只是因为 ffe_learn 是唯一常开的计数行（不做额外的 debugfs 文件）。
+ * 一行里的 key=value 只做追加，不改已有 key 的名字与顺序。
  */
 static int zx_accel_learn_show(struct seq_file *s, void *data)
 {
@@ -3258,14 +3490,14 @@ static int zx_accel_learn_show(struct seq_file *s, void *data)
 
 	(void)data;
 	seq_printf(s, "%u\n", READ_ONCE(accel->learn_on) ? 1u : 0u);
-	seq_printf(s, "cand=%llu add=%llu dup=%llu drop=%llu noneigh=%llu nobrport=%llu nonport=%llu dedup=%llu flows=%u tbl_full=%llu\n",
+	seq_printf(s, "cand=%llu add=%llu dup=%llu drop=%llu noneigh=%llu nobrport=%llu nonport=%llu dedup=%llu flows=%u tbl_full=%llu add_replace=%llu\n",
 		   READ_ONCE(accel->learn_cand), READ_ONCE(accel->learn_add),
 		   READ_ONCE(accel->learn_dup), READ_ONCE(accel->learn_drop),
 		   READ_ONCE(accel->learn_noneigh),
 		   READ_ONCE(accel->learn_nobrport),
 		   READ_ONCE(accel->learn_nonport),
 		   READ_ONCE(accel->learn_dedup), READ_ONCE(accel->n_flows),
-		   READ_ONCE(accel->tbl_full));
+		   READ_ONCE(accel->tbl_full), READ_ONCE(accel->add_replace));
 	if (!accel->learn_rings) {
 		seq_puts(s, "ring=n/a\n");
 		return 0;

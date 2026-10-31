@@ -315,7 +315,16 @@ struct zx_ffe_cnt {
 	u64	miss;		/* 没通过：查表未命中或任一判据不符（含下面的子集） */
 	u64	fwd;		/* P2：真正交给发送硬件 */
 	u64	drop_noport;	/* miss 的子集：出口端口不存在/down */
-	u64	drop_local;	/* miss 的子集：目的 IP 属本机（终结） */
+	/*
+	 * miss 的子集：目的地址属本机（终结）。P5 修订二起口径是**延迟判定**的
+	 * 结果：v6 在判据 #10 一律算（无 NAT66，目的地址不会变）；v4 只在
+	 *   - 命中条目但该条目没有 ZX_FFE_FLOW_NAT_D（这帧真是给本机终结的），或
+	 *   - 非 TCP/UDP 的帧（ICMP 等，走不到查表）上算。
+	 * 端口映射 / masquerade 回程的 pre-NAT 目的地址虽然是本机 WAN IP，但条目
+	 * 带 DNAT，命中后会被放行并改写，不计 drop_local。详见
+	 * zx279128s-accel.c 的 zx_ffe_forward() #13'。
+	 */
+	u64	drop_local;
 	u64	fallback;	/* miss 的子集：查表命中但被同口等判据挡回栈 */
 	u64	fallback_qfull;	/* P2：其中因为 TX 环满而回栈 */
 	u64	rx_drop;	/* P2：已改写但提交失败（不可达），只能丢帧 */
@@ -380,18 +389,30 @@ struct zx_accel {
 	 * 到桥、拿不到交换机端口号，所以候选里带一个哨兵 + 桥的 ifindex，
 	 * FDB 反查（要 rtnl）留到 age work 的 drain 里做；解析不出本驱动端口
 	 * 就整条放弃，绝不猜（无线口也在"放弃"里，见 learn_nonport）。
+	 *
+	 * 两个方向都学（P5 修订二）：连接的 ORIGINAL 与 REPLY 两侧各生成一条
+	 * 候选，键都是"该方向报文在链路上的 pre-NAT 形态"（ORIGINAL 取
+	 * tuple[ORIGINAL]、REPLY 取 tuple[REPLY]），所以家庭流量的下载方向
+	 * （REPLY，WAN→LAN 的 bulk）现在也能进表；依据见
+	 * zx279128s-accel.c 的 zx_ffe_learn_hook() 头注释。
 	 */
 	struct zx_ffe_learn_ring __percpu	*learn_rings;
 	struct nf_hook_ops	learn_hook;	/* pf=IPv4, POST_ROUTING, NF_IP_PRI_LAST */
 	u8			learn_on;	/* debugfs ffe_learn：0/1，默认 0 */
 	u64			learn_cand;	/* 钩子看到的候选（含被丢的） */
 	u64			learn_add;	/* 真正插进表的学习条目 */
-	u64			learn_dup;	/* 同 key 已存在：只刷新 dmac/MTU/lastuse */
+	u64			learn_dup;	/* 同 key 已存在：原地更新 dmac/smac/MTU/NAT/lastuse */
 	u64			learn_drop;	/* 环满丢掉的候选（绝不阻塞数据面） */
 	u64			learn_noneigh;	/* 候选拿不到下一跳 MAC */
 	u64			learn_nobrport;	/* 桥出口解析不出本驱动端口：FDB 未命中/要泛洪/桥已不在 */
 	u64			learn_nonport;	/* FDB 命中的是无线口等非本驱动端口（如 phy0-ap0） */
 	u64			learn_dedup;	/* 1 s 内同一五元组的重复候选，未再投递 */
+	/*
+	 * ffe_add 命中同 key 的次数（P5 修订二 §C 的幂等化）：这次 add 走的是
+	 * "原地更新"而不是"新插入"，表里不会多出一行。与学习无关，放在这一组
+	 * 里只是因为 ffe_learn 是唯一常开的计数行（见 zx_accel_learn_show()）。
+	 */
+	u64			add_replace;
 	struct zx_ffe_cnt	cnt[2];
 	/*
 	 * 本机地址集合，只服务于判据 #2（目的 MAC）、#13（目的 IPv4）与 v6 判据
