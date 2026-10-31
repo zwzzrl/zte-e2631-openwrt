@@ -2880,6 +2880,9 @@ static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 	/* 老化时间的调试口（P4）：与模块参数 ffe_aging 同一个变量，读回当前值 */
 	debugfs_create_file("ffe_aging", 0644, dir, adapter,
 			    &zx_accel_aging_fops);
+	/* hw→ffe 迁移桥（P3）：写 1 取 PPE 快照，读回统计与样例 cookie */
+	debugfs_create_file("ffe_migrate", 0644, dir, adapter,
+			    &zx_accel_migrate_fops);
 	debugfs_create_file("accel_autofallback", 0644, dir, adapter,
 			    &zx_accel_autofallback_fops);
 }

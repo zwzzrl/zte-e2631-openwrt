@@ -27,6 +27,17 @@
  * L4 伪首部也不含 hop_limit）。本机 IPv6 地址集合由 inet6addr 通知链维护，
  * 与 IPv4 那条并列。v6 没有 NAT66，带 NAT 语义的条目照样回栈。
  *
+ * P3 起 v4 条目带 NAT 改写：`flags` 的 ZX_FFE_FLOW_NAT_S/_D 两位分别表示
+ * "命中后把 saddr/sport 换成 saddr_out/sport_out"与"把 daddr/dport 换成
+ * daddr_out/dport_out"，两位可同时置位。改写顺序是：先按旧值算 L4 增量
+ * 校验和（RFC 1624，csum_replace4/csum_replace2），再写新地址/端口，最后
+ * 整头重算 IPv4 头校验和。UDP 校验和为 0 表示"发送方没算"（RFC 768），
+ * 这时地址照改、校验和一个比特都不动。v6 仍然没有 NAT66。
+ *
+ * P3 还加了 debugfs `ffe_migrate`：hw→ffe 的迁移桥目前是**最小可用版**，
+ * 只统计 PPE 已绑定条数并打印样例，不落表（原因见 zx_accel_migrate_store()
+ * 的头注释）。
+ *
  * 锁与顺序约定（很重要）：
  *   - accel->lock 串行化模式切换。持有它时**可以**调 zx_zc_set()；
  *     zx_zc_set() 自己会 rtnl_lock()，所以本文件在调它之前不得先持 rtnl。
@@ -46,6 +57,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
+#include <linux/err.h>
 #include <linux/etherdevice.h>
 #include <linux/hex.h>
 #include <linux/if_ether.h>
@@ -71,13 +83,19 @@
 #include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
 #include <linux/string.h>
+#include <linux/tcp.h>
 #include <linux/time64.h>
+#include <linux/udp.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 #include <net/addrconf.h>
+#include <net/checksum.h>
 #include <net/if_inet6.h>
 #include <net/ip.h>
 
 #include "zx279128s-eth.h"
+/* ffe_migrate 要读 adapter->ppe_flows 的条目（struct zx_ppe_entry/cookie） */
+#include "zx279128s-ppe.h"
 
 /* 流表容量：PPE 硬件是 127 条，软件表给 1024 条（设计 §4.1） */
 #define ZX_FFE_FLOWS_MAX	1024
@@ -132,11 +150,19 @@ struct zx_ffe_key {
 /* P1 的条目全部来自 ffe_add（静态下发），老化照样生效（P1-TASK §3） */
 #define ZX_FFE_FLOW_STATIC	BIT(0)
 /*
- * 条目带 NAT 语义：P2 只做"纯路由"改写，源地址/端口一律不动（设计 §9-1
- * 决策 A）。P3 才会给条目写这个位；在那之前命中它的帧一律回栈——用没改写
- * 源地址的帧冒充 NAT 输出，比不转发更糟（对端收到一个源地址不属于链路的包）。
+ * 条目带 SNAT/DNAT 语义（P3-TASK §0 A）。两位可以同时置位（双向都改），
+ * 命中时改写见 zx_ffe_v4_nat_rewrite()：
+ *
+ *   NAT_S  saddr ← saddr_out、sport ← sport_out
+ *   NAT_D  daddr ← daddr_out、dport ← dport_out
+ *
+ * 只有 v4 条目可能有这两位（v6 没有 NAT66，ffe_add 直接拒）。BIT(1) 在 P2
+ * 是"带 NAT 一律回栈"的占位位，P3 把它给 SNAT 用——条目本来就不能跨版本
+ * 持久化（只在 debugfs 里现加现用），不需要兼容旧镜像里的内存布局。
  */
-#define ZX_FFE_FLOW_NAT		BIT(1)
+#define ZX_FFE_FLOW_NAT_S	BIT(1)
+#define ZX_FFE_FLOW_NAT_D	BIT(2)
+#define ZX_FFE_FLOW_NAT_MASK	(ZX_FFE_FLOW_NAT_S | ZX_FFE_FLOW_NAT_D)
 
 struct zx_ffe_flow {
 	struct rhash_head	node;
@@ -145,12 +171,34 @@ struct zx_ffe_flow {
 	struct zx_ffe_key	key;
 	u8			dmac[ETH_ALEN];	/* 出口下一跳 MAC（P2 改写用） */
 	u8			smac[ETH_ALEN];	/* 出口端口 MAC 快照（P2 改写用） */
+	/*
+	 * NAT 后的地址/端口（P3）。只有 flags 里对应位有效；没置位时这些字段
+	 * 不参与改写（纯路由条目保持 P2 的行为）。判据 #16 要求"置了位就必须
+	 * 齐全"：地址或端口为 0 视为未设，命中后回栈。
+	 */
+	__be32			saddr_out;
+	__be32			daddr_out;
+	__be16			sport_out;
+	__be16			dport_out;
 	u8			eport;
 	u8			flags;
 	u16			mtu;		/* 出口 MTU 快照（add 时取），0 = 未知 */
 	u64			hits;		/* 真正转发出去的帧数（P2 起 == fwd） */
 	u64			bytes;
 	unsigned long		lastuse;	/* 最近一次命中（转发或环满回栈） */
+};
+
+/*
+ * ffe_add 可选 NAT 尾段的解析结果（P3-TASK §0 A.2）。先解析到这个临时结构，
+ * 等 key/eport/dmac 全部通过、容量检查也过了，再一次性写进条目——失败路径
+ * 不需要回滚半填的 flow。
+ */
+struct zx_ffe_nat {
+	u8			flags;		/* ZX_FFE_FLOW_NAT_S / _D */
+	__be32			saddr_out;
+	__be32			daddr_out;
+	__be16			sport_out;
+	__be16			dport_out;
 };
 
 /*
@@ -671,7 +719,7 @@ enum zx_ffe_verdict {
 	ZX_FFE_V_TTL_ERR,	/* TTL/hop_limit <= 1：由栈回 ICMP(6) Time Exceeded */
 	ZX_FFE_V_DROP_LOCAL,	/* 目的地址属本机：本机终结，回栈 */
 	ZX_FFE_V_DROP_NOPORT,	/* 出口端口不存在 / !running / !carrier */
-	ZX_FFE_V_FALLBACK,	/* 命中但按判据回栈（同口/NAT/帧长/出口 MTU） */
+	ZX_FFE_V_FALLBACK,	/* 命中但按判据回栈（同口/NAT 缺字段/帧长/出口 MTU） */
 	ZX_FFE_V_QFULL,		/* 命中但发送环满：回栈让 qdisc 背压 */
 	ZX_FFE_V_RX_DROP,	/* 已改写但提交失败，只能丢帧（不可达） */
 };
@@ -827,14 +875,83 @@ zx_ffe_v6_check(struct zx_accel *accel, const u8 *frame, u16 len,
 }
 
 /*
- * 报文改写（设计 §3 + P4-TASK §0）。只碰 L2 头与 IP 层必然要变的那一个字节：
+ * IPv4 条目的 NAT 改写（P3-TASK §0 A.3）：先按**旧**值把 L4 校验和的增量算
+ * 掉，再写新地址/新端口，最后调用方整头重算 IPv4 头校验和。
  *
- *   v4  h_dest ← 条目 dmac；h_source ← 出口端口 MAC 快照；ttl--；IPv4 头校验和
- *       整头重算（不用 RFC 1624 增量，见 P2）。
+ * 为什么 L4 校验和必须增量、而且地址和端口都要算进去：
+ *   TCP/UDP 的校验和覆盖"伪首部 + L4 头 + 数据"，伪首部里就有源/目的地址。
+ *   只改端口不减地址的增量，校验和立刻错（对端静默丢包，比崩溃难查）。所以
+ *   每改一个 4 字节地址就 csum_replace4() 一次，每改一个 2 字节端口就
+ *   csum_replace2() 一次——两者都是 RFC 1624 的公式，内核实现在
+ *   include/net/checksum.h，不需要 skb。
+ *
+ * 两个特例（都会让"看起来对"的实现产生静默丢包）：
+ *   - UDP 校验和 0 = 发送方没算校验和（RFC 768）。这时**不许**给它编一个：
+ *     对端见到非 0 会真的去校验，而我们没有覆盖全部数据的和。整段跳过。
+ *   - 增量更新恰好算出 0 的 UDP 校验和必须按全 1 发（0 有"没有校验和"的
+ *     特殊含义），原值 0 的情况上面已经跳过。
+ *
+ * 对齐与字节序（这里错过一次，别想当然）：
+ *   - 帧基址是 4 字节对齐（池页 + 16 B 头），L4 起点 14 + ihl*4 = 34，端口在
+ *     +0/+2、校验和在 +6（UDP）/+16（TCP），都是 2 字节对齐；访问走
+ *     get_unaligned/put_unaligned，避免以后放宽 ihl 时踩到奇地址。
+ *   - csum_replace2/csum_replace4 的 **三个操作数必须是同一套字节序约定**：
+ *     `*check` 是内存里的 u16（网络序字节被按主机序读出来的那个值），
+ *     `flow->sport_out` 是 htons() 过的（同一个约定），所以旧端口也必须用
+ *     get_unaligned(*(__be16 *)l4) 取内存值——用 get_unaligned_be16() 会拿到
+ *     主机序的数值（字节交换过的），三个操作数就不是同一套约定，算出来的
+ *     校验和是错的（用户态对拍：mix 约定给 0xb68e，正确答案 0x1233）。
+ *     地址那两处没这个问题：`ip->saddr` 是解引用 __be32，也是内存约定。
+ */
+static void zx_ffe_v4_nat_rewrite(u8 *frame, struct iphdr *ip,
+				  const struct zx_ffe_flow *flow)
+{
+	u8 *l4 = frame + ETH_HLEN + ip->ihl * 4;
+	bool udp = ip->protocol == IPPROTO_UDP;
+	__sum16 *check = (__sum16 *)(l4 + (udp ? offsetof(struct udphdr, check) :
+					       offsetof(struct tcphdr, check)));
+	/*
+	 * TCP/UDP 头的前两个字段都是端口：sport、dport。取**内存值**（不是
+	 * get_unaligned_be16 的字节交换值），与 *check / *_out 保持同一约定。
+	 */
+	__be16 sport = get_unaligned((__be16 *)l4);
+	__be16 dport = get_unaligned((__be16 *)(l4 + 2));
+
+	if (!(udp && !*check)) {
+		if (flow->flags & ZX_FFE_FLOW_NAT_S) {
+			csum_replace4(check, ip->saddr, flow->saddr_out);
+			csum_replace2(check, sport, flow->sport_out);
+		}
+		if (flow->flags & ZX_FFE_FLOW_NAT_D) {
+			csum_replace4(check, ip->daddr, flow->daddr_out);
+			csum_replace2(check, dport, flow->dport_out);
+		}
+		if (udp && !*check)
+			*check = CSUM_MANGLED_0;
+	}
+	/* 校验和算完才能动地址/端口：上面的 from 值必须是改写前的 */
+	if (flow->flags & ZX_FFE_FLOW_NAT_S) {
+		ip->saddr = flow->saddr_out;
+		put_unaligned(flow->sport_out, (__be16 *)l4);
+	}
+	if (flow->flags & ZX_FFE_FLOW_NAT_D) {
+		ip->daddr = flow->daddr_out;
+		put_unaligned(flow->dport_out, (__be16 *)(l4 + 2));
+	}
+}
+
+/*
+ * 报文改写（设计 §3 + P4-TASK §0 + P3-TASK §0 A）。只碰必然要变的字节：
+ *
+ *   v4  h_dest ← 条目 dmac；h_source ← 出口端口 MAC 快照；带 NAT 位时按
+ *       zx_ffe_v4_nat_rewrite() 改地址/端口并增量更新 TCP/UDP 校验和；ttl--；
+ *       IPv4 头校验和整头重算（头里改了两处地址加 TTL，重算比三次增量更直白，
+ *       而且这是每包一次、20 字节的活）。
  *   v6  h_dest/h_source 同上；hop_limit--；**不碰任何校验和**——IPv6 固定头里
  *       没有校验和，L4 伪首部不含 hop_limit（RFC 8200 §8.1：hop limit 不在
  *       pseudo-header 里），所以改它对比上层 checksum 零影响。这里明确不写
- *       "重算/清零校验和"的代码：写了才是错的。
+ *       "重算/清零校验和"的代码：写了才是错的。v6 没有 NAT66，带 NAT 位的
+ *       v6 条目在判据 #16 就回栈了，不会走到这里。
  *
  * **没有失败返回**：调用它的前提是"这一帧一定提交得出去"——容量检查在同一把
  * tx_lock 里、改写之前做完。改完以后帧头已经是出口形态，再交给协议栈就会发出
@@ -854,6 +971,8 @@ static void zx_ffe_rewrite(u8 *frame, const struct zx_ffe_flow *flow, int family
 		ip6->hop_limit--;
 		return;
 	}
+	if (flow->flags & ZX_FFE_FLOW_NAT_MASK)
+		zx_ffe_v4_nat_rewrite(frame, ip, flow);
 	/* 判据 #9 已挡掉 ttl<=1：这里 ttl >= 2，减完必然 >= 1 */
 	ip->ttl--;
 	/*
@@ -867,7 +986,7 @@ static void zx_ffe_rewrite(u8 *frame, const struct zx_ffe_flow *flow, int family
 /*
  * 两族共用的提交段（P4 的硬要求：v4/v6 只走这一份，别复制两份）：
  *
- *   查表 → 出口现判 → 同口/NAT/帧长/出口 MTU → 取 tx_lock → 查容量 → 改写 →
+ *   查表 → 出口现判 → 同口/NAT 字段/帧长/出口 MTU → 取 tx_lock → 查容量 → 改写 →
  *   clean（池可缓存时）→ 提交 → 条目记账 → 解锁
  *
  * 顺序本身就是不变量（P2-TASK §1）：容量检查必须在改写之前（"回栈"只对没改过
@@ -913,12 +1032,21 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 		return ZX_FFE_V_FALLBACK;
 	}
 	/*
-	 * #16 NAT 语义：P2 只做纯路由（设计 §9-1 决策 A）；v6 更是没有 NAT66
-	 * （P4-TASK §0 "不做"），这条对两族都只是防御：带 NAT 位的条目回栈。
+	 * #16 NAT 语义（P3-TASK §0 A.4）：v4 条目带 SNAT/DNAT 位时，对应的
+	 * 输出地址与端口必须齐全（add 时允许写 0，数据面在这里挡），缺一个就
+	 * 回栈——拿没改写的帧冒充 NAT 输出，比不转发更糟（对端收到一个源地址
+	 * 不属于链路的包）。v6 没有 NAT66（P4-TASK §0 "不做"），带 NAT 位的
+	 * v6 条目一律回栈；ffe_add 在入口就拒了，这里只是防御。
 	 */
-	if (flow->flags & ZX_FFE_FLOW_NAT) {
-		rcu_read_unlock();
-		return ZX_FFE_V_FALLBACK;
+	if (flow->flags & ZX_FFE_FLOW_NAT_MASK) {
+		if (family ||
+		    ((flow->flags & ZX_FFE_FLOW_NAT_S) &&
+		     (!flow->saddr_out || !flow->sport_out)) ||
+		    ((flow->flags & ZX_FFE_FLOW_NAT_D) &&
+		     (!flow->daddr_out || !flow->dport_out))) {
+			rcu_read_unlock();
+			return ZX_FFE_V_FALLBACK;
+		}
 	}
 	/*
 	 * #17 帧长上限：这份驱动没有 SG/TSO，发送侧对 >1536 的帧直接丢（见
@@ -965,6 +1093,16 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	 */
 	clean = 16 + ETH_HLEN +
 		(family ? sizeof(struct ipv6hdr) : sizeof(struct iphdr));
+	/*
+	 * 带 NAT 的 v4 条目还要动 L4 头的端口与校验和，一致性点扩到整个 L4
+	 * 固定头（TCP 20 B / UDP 8 B）。TCP 的 data offset 不影响这里：端口与
+	 * 校验和都在前 20 B 里。UDP 校验和为 0 时改写不动 L4，多同步这 8 B
+	 * 只是把已经写过的端口推下去，没有坏处。
+	 */
+	if (!family && (flow->flags & ZX_FFE_FLOW_NAT_MASK)) {
+		clean += flow->key.proto == IPPROTO_UDP ?
+			 sizeof(struct udphdr) : sizeof(struct tcphdr);
+	}
 	if (adapter->pkt_pool_cacheable)
 		dma_sync_single_for_device(adapter->dev,
 					   adapter->pkt_pool_dma +
@@ -1337,6 +1475,16 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 		 "accel: IPv%d %s -> %s (%llu ms, %u frames drained)\n",
 		 family ? 6 : 4, zx_accel_mode_name(old_mode),
 		 zx_accel_mode_name(new_mode), accel->drain_ms, drained);
+	/*
+	 * P3-TASK §0 B.2：只在 v4 从 hw 切到 ffe 时提示迁移。S4 已经把这一族
+	 * 的 FFE 条目全清了（"切表=全清"），所以这里照实报"上次 PPE 快照有 N
+	 * 条、表里现在 M 条"，剩下的要用户按 conntrack -L 手工 ffe_add；
+	 * mig_ppe_flows 由 ffe_migrate 在 PPE 还绑着时写入。
+	 */
+	if (family == 0 && old_mode == ZX_ACC_HW && new_mode == ZX_ACC_FFE)
+		dev_info(adapter->dev,
+			 "accel: hw -> ffe: last PPE snapshot had %u flow(s), the FFE table has %u; re-add the rest with ffe_add (NAT fields from conntrack -L)\n",
+			 READ_ONCE(accel->mig_ppe_flows), accel->n_flows);
 
 unlock:
 	mutex_unlock(&accel->lock);				/* S7 */
@@ -1441,6 +1589,7 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->autofallback = true;
 	memset(accel->fb_since, 0, sizeof(accel->fb_since));
 	accel->n_flows = 0;
+	accel->mig_ppe_flows = 0;
 	accel->tbl_full = 0;
 	accel->ffe_last[0] = 0;
 	INIT_LIST_HEAD(&accel->flow_list);
@@ -1726,9 +1875,13 @@ const struct file_operations zx_accel_v6_fops = {
 	.release	= single_release,
 };
 
-/* ---- ffe_add / ffe_del / ffe_flush（P1-TASK §2）--------------------- */
+/* ---- ffe_add / ffe_del / ffe_flush（P1-TASK §2 / P3-TASK §0 A.2）---- */
 
-#define ZX_FFE_ARG_MAX		12
+/*
+ * 最多的 token 数：ffe_add 的 10 个固定字段 + nat/dnat 各 3 个 = 16。
+ * ffe_del 只用前 8 个、ffe_flush 只用 1 个，同一份缓冲区够用。
+ */
+#define ZX_FFE_ARG_MAX		16
 
 /* 按空白切成 token（就地写 0），返回 token 数 */
 static int zx_ffe_split(char *buf, char **argv, int max)
@@ -1833,10 +1986,93 @@ static int zx_ffe_key_print(char *buf, size_t len, const char *what,
 			key->proto, key->ipport, key->vid, eport, n_flows);
 }
 
-/* ffe_add <key 8 个 token> <eport> <dmac> */
-static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv)
+/* 把 NAT 尾段追加到 ffe_last（key_print 已经把键打在前面） */
+static void zx_ffe_nat_print(char *buf, size_t len,
+			     const struct zx_ffe_nat *nat)
+{
+	size_t n = strlen(buf);
+
+	if (n >= len)
+		return;
+	if (nat->flags & ZX_FFE_FLOW_NAT_S)
+		scnprintf(buf + n, len - n, " nat %pI4 %u",
+			  &nat->saddr_out, ntohs(nat->sport_out));
+	n = strlen(buf);
+	if (n >= len)
+		return;
+	if (nat->flags & ZX_FFE_FLOW_NAT_D)
+		scnprintf(buf + n, len - n, " dnat %pI4 %u",
+			  &nat->daddr_out, ntohs(nat->dport_out));
+}
+
+/*
+ * ffe_add 的可选 NAT 尾段（P3-TASK §0 A.2）。从 argv[base] 起每 3 个 token
+ * 一组，关键字 nat/dnat，顺序任意、可同时给、不可重复：
+ *
+ *   ... <dmac> [nat <saddr_out> <sport_out>] [dnat <daddr_out> <dport_out>]
+ *
+ * nat  → ZX_FFE_FLOW_NAT_S + saddr_out/sport_out
+ * dnat → ZX_FFE_FLOW_NAT_D + daddr_out/dport_out
+ *
+ * 地址必须是点分十进制 IPv4（NAT 只属于 v4 条目，v6 在调用方入口就拒了）。
+ * 地址/端口写 0 这里不拦：数据面判据 #16 把"置了位但字段不全"的条目回栈，
+ * 这样"下发错条目 → 回栈而不是发错包"这条语义在实机上可验证。
+ */
+static int zx_ffe_nat_parse(char **argv, int base, int argc,
+			    struct zx_ffe_nat *nat, const char **err)
+{
+	int i = base;
+
+	while (i < argc) {
+		unsigned int port;
+		__be32 addr;
+		bool snat;
+		u8 bit;
+
+		if (i + 3 > argc) {
+			*err = "nat/dnat needs <ipv4> <port>";
+			return -EINVAL;
+		}
+		if (!strcmp(argv[i], "nat"))
+			snat = true;
+		else if (!strcmp(argv[i], "dnat"))
+			snat = false;
+		else {
+			*err = "unknown keyword (only nat/dnat)";
+			return -EINVAL;
+		}
+		bit = snat ? ZX_FFE_FLOW_NAT_S : ZX_FFE_FLOW_NAT_D;
+		if (nat->flags & bit) {
+			*err = snat ? "duplicate nat" : "duplicate dnat";
+			return -EINVAL;
+		}
+		if (!in4_pton(argv[i + 1], -1, (u8 *)&addr, '\0', NULL)) {
+			*err = "bad NAT IPv4 address";
+			return -EINVAL;
+		}
+		if (kstrtouint(argv[i + 2], 10, &port) || port > 0xffff) {
+			*err = "bad NAT port";
+			return -EINVAL;
+		}
+
+		if (snat) {
+			nat->saddr_out = addr;
+			nat->sport_out = htons(port);
+		} else {
+			nat->daddr_out = addr;
+			nat->dport_out = htons(port);
+		}
+		nat->flags |= bit;
+		i += 3;
+	}
+	return 0;
+}
+
+/* ffe_add <key 8 个 token> <eport> <dmac> [nat ...] [dnat ...] */
+static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 {
 	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_nat nat = {};
 	struct zx_ffe_key key;
 	struct zx_ffe_flow *flow;
 	struct net_device *nd;
@@ -1863,6 +2099,15 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv)
 	if (!mac_pton(argv[9], dmac)) {
 		err = "bad dmac (xx:xx:xx:xx:xx:xx)";
 		ret = -EINVAL;
+		goto fail;
+	}
+	ret = zx_ffe_nat_parse(argv, 10, argc, &nat, &err);
+	if (ret)
+		goto fail;
+	/* 没有 NAT66：v6 条目带 nat/dnat 直接拒（P4-TASK §0 "不做"） */
+	if (key.family == 6 && nat.flags) {
+		err = "v6 has no NAT66: nat/dnat are IPv4 only";
+		ret = -EOPNOTSUPP;
 		goto fail;
 	}
 
@@ -1897,7 +2142,12 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv)
 	 * 为它加通知链。
 	 */
 	flow->mtu = min_t(u32, nd->mtu, 0xffff);
-	flow->flags = ZX_FFE_FLOW_STATIC;
+	/* NAT 尾段在 key/eport/dmac 都过了之后才写进条目（P3） */
+	flow->flags = ZX_FFE_FLOW_STATIC | nat.flags;
+	flow->saddr_out = nat.saddr_out;
+	flow->daddr_out = nat.daddr_out;
+	flow->sport_out = nat.sport_out;
+	flow->dport_out = nat.dport_out;
 	flow->lastuse = jiffies;
 	ret = rhashtable_insert_fast(&accel->flows, &flow->node,
 				     zx_ffe_ht_params);
@@ -1912,6 +2162,7 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv)
 	accel->n_flows++;
 	zx_ffe_key_print(accel->ffe_last, sizeof(accel->ffe_last), "add",
 			 &key, eport, accel->n_flows);
+	zx_ffe_nat_print(accel->ffe_last, sizeof(accel->ffe_last), &nat);
 	mutex_unlock(&accel->lock);
 	return 0;
 
@@ -2010,10 +2261,15 @@ static ssize_t zx_ffe_store(struct file *file, const char __user *ubuf,
 
 	switch (op) {
 	case ZX_FFE_OP_ADD:
-		if (argc != 10)
+		/*
+		 * 骨架 10 个 token，之后每 3 个一组 nat/dnat（P3-TASK §0 A.2）：
+		 * 10、13、16 合法，其余都是语法错。第一个 token 是 family，
+		 * family 6 + nat 段在 zx_ffe_op_add() 里按 -EOPNOTSUPP 拒。
+		 */
+		if (argc < 10 || (argc - 10) % 3)
 			return zx_ffe_bad_usage(adapter,
-				"ffe_add <family> <saddr> <daddr> <sport> <dport> <proto> <ipport> <vid> <eport> <dmac>");
-		ret = zx_ffe_op_add(adapter, argv);
+				"ffe_add <family> <saddr> <daddr> <sport> <dport> <proto> <ipport> <vid> <eport> <dmac> [nat <saddr_out> <sport_out>] [dnat <daddr_out> <dport_out>]");
+		ret = zx_ffe_op_add(adapter, argv, argc);
 		break;
 	case ZX_FFE_OP_DEL:
 		if (argc != 8)
@@ -2099,12 +2355,18 @@ const struct file_operations zx_accel_flush_fops = {
 
 /*
  * ffe_flows：每行
- *   family saddr daddr sport dport proto ipport vid -> eport dmac hits bytes lastuse_ms [S]
+ *   family saddr daddr sport dport proto ipport vid -> eport dmac hits bytes lastuse_ms [S] [SNAT=a:p] [DNAT=a:p]
  * （P1-TASK §2 的读格式；末尾的 S 表示静态条目，P1-TASK §3。）
  * family 4 的地址用 %pI4，family 6 用 %pI6c（P4-TASK §0.3），token 位置与含义
  * 两族一致。hits/bytes 只统计真正转发出去的帧（P2 起 == fwd）；lastuse 在
  * "转发"与"命中但环满回栈"两种情况下都刷新。读侧持
  * RCU 只读段，条目删除用 list_del_rcu + kfree_rcu。
+ *
+ * P3 的 NAT 标记（P3-TASK §0 A.5）：`SNAT=<saddr_out>:<sport_out>` 对应
+ * ZX_FFE_FLOW_NAT_S、`DNAT=<daddr_out>:<dport_out>` 对应 ZX_FFE_FLOW_NAT_D，
+ * 只在对应位有效时追加；纯路由条目（P2 形态）的行一点不变，老的解析脚本
+ * 不受影响。字母用 SNAT/DNAT 而不单是 S/D：末尾那个 ` S` 从 P1 起就表示
+ * "静态条目"，再让 S 表示 SNAT 会读错。
  */
 static int zx_accel_flows_show(struct seq_file *s, void *data)
 {
@@ -2115,8 +2377,8 @@ static int zx_accel_flows_show(struct seq_file *s, void *data)
 	(void)data;
 	rcu_read_lock();
 	list_for_each_entry_rcu(flow, &accel->flow_list, list) {
-		if (flow->key.family == 6)
-			seq_printf(s, "6 %pI6c %pI6c %u %u %u %u %u -> %u %pM %llu %llu %u%s\n",
+		if (flow->key.family == 6) {
+			seq_printf(s, "6 %pI6c %pI6c %u %u %u %u %u -> %u %pM %llu %llu %u%s",
 				   (const struct in6_addr *)&flow->key.v6[0],
 				   (const struct in6_addr *)
 					&flow->key.v6[sizeof(struct in6_addr)],
@@ -2126,8 +2388,8 @@ static int zx_accel_flows_show(struct seq_file *s, void *data)
 				   flow->hits, flow->bytes,
 				   jiffies_to_msecs(jiffies - flow->lastuse),
 				   (flow->flags & ZX_FFE_FLOW_STATIC) ? " S" : "");
-		else
-			seq_printf(s, "4 %pI4 %pI4 %u %u %u %u %u -> %u %pM %llu %llu %u%s\n",
+		} else {
+			seq_printf(s, "4 %pI4 %pI4 %u %u %u %u %u -> %u %pM %llu %llu %u%s",
 				   &flow->key.v4[0], &flow->key.v4[1],
 				   ntohs(flow->key.sport), ntohs(flow->key.dport),
 				   flow->key.proto, flow->key.ipport,
@@ -2135,6 +2397,15 @@ static int zx_accel_flows_show(struct seq_file *s, void *data)
 				   flow->hits, flow->bytes,
 				   jiffies_to_msecs(jiffies - flow->lastuse),
 				   (flow->flags & ZX_FFE_FLOW_STATIC) ? " S" : "");
+			/* NAT 后的输出字段（P3）：v6 没有 NAT66，只有 v4 行会有 */
+			if (flow->flags & ZX_FFE_FLOW_NAT_S)
+				seq_printf(s, " SNAT=%pI4:%u", &flow->saddr_out,
+					   ntohs(flow->sport_out));
+			if (flow->flags & ZX_FFE_FLOW_NAT_D)
+				seq_printf(s, " DNAT=%pI4:%u", &flow->daddr_out,
+					   ntohs(flow->dport_out));
+		}
+		seq_putc(s, '\n');
 	}
 	rcu_read_unlock();
 	return 0;
@@ -2244,6 +2515,132 @@ const struct file_operations zx_accel_aging_fops = {
 	.open		= zx_accel_aging_open,
 	.read		= seq_read,
 	.write		= zx_accel_aging_store,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+/* ---- hw→ffe 迁移桥（P3-TASK §0 B，最小可用版）---------------------- */
+
+/*
+ * ffe_migrate：写 1 取一个"PPE 当前绑着哪些流"的快照，并把结果打到
+ * ffe_last（读回）与 dmesg。
+ *
+ * **P3 只做到统计与打印，没有真正把条目灌进 FFE 表**，原因是取数接口不在
+ * 核心驱动这一侧：
+ *   - 核心驱动只留下 adapter->ppe_flows（键是 fw4 的 cookie，值只有
+ *     hash/flow/nh/subnet 这 4 个 16 位索引，见 zte/zx279128s-ppe.h 的
+ *     struct zx_ppe_entry）；
+ *   - 每个条目的五元组、NAT 后地址、出口端口、下一跳 MAC 是
+ *     kmod-e2631-ppe 在 flow_cb（zx_ppe_flow_add）里解析完就丢掉的局部变量
+ *     （struct zx_ppe_tuple / zx_ppe_rewrite），既没写进 ppe_entry，也没有
+ *     暴露给核心驱动的回调。
+ *   - 要完整镜像，二选一：给 zx_ppe_entry 加五元组字段（改 PPE 模块 + 它
+ *     自己的 commit），或在 struct zx_ppe_hooks 加一条 "dump 一条 flow" 的
+ *     回调、由模块暂存 tuple（同样要改模块，还要处理模块卸载与 peek 的竞态）。
+ *   两条都超出"最小可用版"，留到 P5。P3-TASK §0 B 允许先只做统计并要求在
+ *   报告里说明，这里按那条走。
+ *
+ * 现在这份快照仍有两个实际用途：
+ *   1. 上机验收时拿 ppe_flows 跟 `conntrack -L` 里 hardware-offloaded 的行数
+ *      对账（P3-TASK §2 判据 5 的前半）；
+ *   2. 快照记进 accel->mig_ppe_flows，v4 从 hw 切到 ffe 时提示"上次 PPE 有
+ *      多少条、要你手工搬多少条"（zx_accel_set() 的 S7）。
+ *
+ * 用法与时机：**必须趁 PPE 还绑着 flowtable 时写**。先关 hardware offload 再
+ * 切 ffe 的话，条目已经被 DESTROY 回调删掉，这里只会看到 0——那时候能取的
+ * 五元组只剩 `conntrack -L` 里的 conntrack 表项（用户态拿），这也正是目前
+ * 上机验收的做法。
+ *
+ * ppe_flows 的所有增删都在 adapter->ppe_lock 下（trampoline 一圈都持着它），
+ * 所以这里持同一把锁取 nelems 与样例 cookie；不取 rtnl 读表，只在判断
+ * "有没有绑 flowtable" 时短占 rtnl（与 accel_show 的做法一致）。
+ */
+static ssize_t zx_accel_migrate_store(struct file *file, const char __user *ubuf,
+				      size_t count, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct zx_eth_adapter *adapter = s->private;
+	struct zx_accel *accel = &adapter->accel;
+	struct rhashtable_iter iter;
+	unsigned long cookie[4];
+	struct zx_ppe_entry *e;
+	u32 n_ppe, n_ffe;
+	bool bound;
+	unsigned int val;
+	char sample[64];
+	size_t len = 0;
+	int ret, i, n = 0;
+
+	ret = kstrtouint_from_user(ubuf, count, 10, &val);
+	if (ret)
+		return ret;
+	if (val != 1)
+		return -EINVAL;
+
+	/* "有没有东西在喂 PPE" 只能问 TC 的 flow_block 列表（要 rtnl） */
+	rtnl_lock();
+	bound = zx_ppe_has_bound_blocks(adapter);
+	rtnl_unlock();
+
+	mutex_lock(&adapter->ppe_lock);
+	n_ppe = atomic_read(&adapter->ppe_flows.nelems);
+	rhashtable_walk_enter(&adapter->ppe_flows, &iter);
+	rhashtable_walk_start(&iter);
+	while (n < ARRAY_SIZE(cookie)) {
+		e = rhashtable_walk_next(&iter);
+		if (!e || IS_ERR(e))
+			/* 没有条目 / 表正在扩容（这里持着 ppe_lock，不该发生） */
+			break;
+		cookie[n++] = e->cookie;
+	}
+	rhashtable_walk_stop(&iter);
+	rhashtable_walk_exit(&iter);
+	WRITE_ONCE(accel->mig_ppe_flows, n_ppe);
+	mutex_unlock(&adapter->ppe_lock);
+
+	sample[0] = 0;
+	for (i = 0; i < n; i++)
+		len += scnprintf(sample + len, sizeof(sample) - len, " %#lx",
+				 cookie[i]);
+
+	mutex_lock(&accel->lock);
+	n_ffe = accel->n_flows;
+	snprintf(accel->ffe_last, sizeof(accel->ffe_last),
+		 "migrate: ppe_bound=%u ppe_flows=%u ffe_flows=%u mirrored=0 (PPE tuple export not implemented, P5) cookies:%s",
+		 bound ? 1u : 0u, n_ppe, n_ffe, sample);
+	mutex_unlock(&accel->lock);
+
+	dev_info(adapter->dev,
+		 "accel: ffe_migrate snapshot: ppe_bound=%u ppe_flows=%u ffe_flows=%u mirrored=0 (needs a PPE hook to export tuples, planned for P5)\n",
+		 bound ? 1u : 0u, n_ppe, n_ffe);
+	return count;
+}
+
+static int zx_accel_migrate_show(struct seq_file *s, void *data)
+{
+	struct zx_eth_adapter *adapter = s->private;
+	struct zx_accel *accel = &adapter->accel;
+
+	(void)data;
+	mutex_lock(&accel->lock);
+	if (accel->ffe_last[0])
+		seq_printf(s, "%s\n", accel->ffe_last);
+	else
+		seq_puts(s, "(no ffe_migrate yet)\n");
+	mutex_unlock(&accel->lock);
+	return 0;
+}
+
+static int zx_accel_migrate_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_accel_migrate_show, inode->i_private);
+}
+
+const struct file_operations zx_accel_migrate_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_accel_migrate_open,
+	.read		= seq_read,
+	.write		= zx_accel_migrate_store,
 	.llseek		= seq_lseek,
 	.release	= single_release,
 };

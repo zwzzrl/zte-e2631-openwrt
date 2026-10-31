@@ -346,6 +346,13 @@ struct zx_accel {
 	 */
 	struct list_head	flow_list;
 	u32			n_flows;	/* flow_list 的条目数（持 lock） */
+	/*
+	 * ffe_migrate 最近一次快照到的 PPE 绑定条数（P3 的 hw→ffe 迁移桥是
+	 * 最小可用版：只统计与打印，不落表，见 zx279128s-accel.c 的
+	 * zx_accel_migrate_store()）。v4 从 hw 切到 ffe 时拿它跟当前 FFE 条数
+	 * 对照，提示"还有多少条要手工搬"。只由 ffe_migrate 写，READ_ONCE 读。
+	 */
+	u32			mig_ppe_flows;
 	u64			tbl_full;	/* 表满（1024）拒绝的 add 次数 */
 	struct zx_ffe_cnt	cnt[2];
 	/*
@@ -667,7 +674,9 @@ enum zx_ffe_rx_result {
  */
 enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 				int rx_port, int family, __be16 h_proto);
-/* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, ffe_aging, accel_autofallback */
+/* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, ffe_aging,
+ * ffe_migrate, accel_autofallback
+ */
 extern const struct file_operations zx_accel_v4_fops;
 extern const struct file_operations zx_accel_v6_fops;
 extern const struct file_operations zx_accel_flows_fops;
@@ -675,6 +684,7 @@ extern const struct file_operations zx_accel_add_fops;
 extern const struct file_operations zx_accel_del_fops;
 extern const struct file_operations zx_accel_flush_fops;
 extern const struct file_operations zx_accel_aging_fops;
+extern const struct file_operations zx_accel_migrate_fops;
 extern const struct file_operations zx_accel_autofallback_fops;
 
 /* zx279128s-switch.c */
