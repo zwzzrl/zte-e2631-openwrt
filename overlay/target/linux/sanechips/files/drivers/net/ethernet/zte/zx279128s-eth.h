@@ -454,9 +454,19 @@ struct zx_accel {
 	 * 是 GSO skb，旧代码一律拒绝。现在入口改成"源 MAC + 桥 ifindex → drain
 	 * 里 FDB 反查"，GSO 放开成"TCP/UDP + 无分片 + 头在线性区"。**没有新增
 	 * 计数**：入口反查失败并入 learn_nonport（口径见下）。
+	 *
+	 * 两个协议族（P10）：同一个回调 zx_ffe_learn_hook() 注册两次（learn_hook
+	 * = IPv4、learn_hook6 = IPv6，都是 POST_ROUTING/NF_IP_PRI_LAST），按
+	 * state->pf 选报头解析器；入口/出口/同口/conntrack/组装/投递只有一份。
+	 * v6 的额外边界（扩展头、ICMPv6、fe80::/10 源）在解析器里，与数据面
+	 * v6 判据链同一个口径。候选/键的地址宽度按族取 4/16 B（union
+	 * nf_inet_addr），去重仍是整结构 memcmp——所有构造点先 memset。
+	 * **计数仍是两族合计、没有新增字段**（ffe_learn 的行格式不变），要区分
+	 * 族就看 ffe_flows 里条目的地址形态（v4/v6 键）。
 	 */
 	struct zx_ffe_learn_ring __percpu	*learn_rings;
 	struct nf_hook_ops	learn_hook;	/* pf=IPv4, POST_ROUTING, NF_IP_PRI_LAST */
+	struct nf_hook_ops	learn_hook6;	/* pf=IPv6, 同一个回调，P10 */
 	u8			learn_on;	/* debugfs ffe_learn：0/1，默认 0 */
 	u64			learn_cand;	/* 钩子看到的候选（含被丢的） */
 	u64			learn_add;	/* 真正插进表的学习条目 */

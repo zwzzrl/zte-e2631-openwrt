@@ -90,6 +90,27 @@
  * lan1，不会被误判成"进=出"。计数与 ffe_learn 的行格式一个字段都没动
  * （learn_nonport 的口径扩到"入口解析不出交换机端口"，语义见 -eth.h）。
  *
+ * P10（v6 旁路学习，**数据面零改动**）：把上面整套学习路径扩到 IPv6。
+ *   1. **钩子覆盖两个族**：同一个回调 zx_ffe_learn_hook() 注册两次
+ *      （learn_hook = NFPROTO_IPV4、learn_hook6 = NFPROTO_IPV6，都是
+ *      POST_ROUTING + NF_IP_PRI_LAST），按 state->pf 选报头解析器
+ *      （zx_ffe_learn_parse4()/parse6()）。之后的出口解析（P9 的 state->out
+ *      + skb_dst 兜底）、入口解析（skb_iif 快路径 + 桥 FDB 反查）、同口保护、
+ *      ctinfo 方向、候选组装、每 CPU 环投递**只有一份**，不会两族漂移。
+ *   2. **地址按族取宽**：候选里的地址是 union nf_inet_addr；v4 只拷 4 B、v6
+ *      拷 16 B，且候选先 memset（去重是整结构 memcmp），所以 v4 的
+ *      "余下 12 B"恒为 0，v4 去重语义不变。键仍填进同一个 struct zx_ffe_key
+ *      （v4[2] 或 v6[32]，同一片 union）。
+ *   3. **v6 报头解析**：从 ipv6_hdr(skb) 取 saddr/daddr；扩展头（逐跳/路由/
+ *      分片/目的选项）一律放弃候选、ICMPv6(58) 与 fe80::/10 源排除——全部
+ *      与数据面 zx_ffe_v6_check() 的 #7/#12/#11 同一条线，避免学出永远命中
+ *      不了的条目。GSO 与 v4 同一口径（不额外拒绝，边界在解析器里）。
+ *   4. **下一跳 MAC 按族**：v4 用 arp_tbl + ip_route_output_key()，v6 用
+ *      nd_tbl + ip6_route_output()/rt6_nexthop()；"直连优先、否则查路由取
+ *      网关"的语义相同。
+ * 计数与 ffe_learn 的行格式**一个字段都没动**：cand/add/dup/... 是两族合计，
+ * 要分辨族就看 ffe_flows 里条目的地址形态。
+ *
  * 锁与顺序约定（很重要）：
  *   - accel->lock 串行化模式切换。持有它时**可以**调 zx_zc_set()；
  *     zx_zc_set() 自己会 rtnl_lock()，所以本文件在调它之前不得先持 rtnl。
@@ -152,6 +173,8 @@
 #include <net/checksum.h>
 #include <net/if_inet6.h>
 #include <net/ip.h>
+#include <net/ip6_route.h>	/* ip6_route_output()/rt6_nexthop()：v6 下一跳 */
+#include <net/ndisc.h>		/* nd_tbl：v6 邻居表 */
 #include <net/neighbour.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/route.h>
@@ -307,20 +330,26 @@ struct zx_ffe_nat {
  * 报文 NAT 之后的形态"（也就是要写到对端的形态）。钩子按 ctinfo 的方向位挑
  * 元组，其它字段的来源不变，所以 drain 与判据链对方向一无所知。
  *
+ * 两个协议族也共用它（P10）：地址字段是 union nf_inet_addr（16 B），v4 只用
+ * 前 4 B、v6 用满 16 B，**按 family 决定拷几字节**（拷 16 B 会把 v4 的垃圾
+ * 字节带进来，而本结构的去重是整结构 memcmp）。family 是必填字段：键按它决定
+ * 填 key.v4[] 还是 key.v6[]，下一跳 MAC 按它决定查 arp_tbl 还是 nd_tbl。
+ *
  * 入口（P9）：iiport 是"这一帧从哪个交换机端口进来"，只用来做同口保护
  * （数据面 #15 的预判），不进键。快路径由钩子用 skb_iif 直接对出来；桥端口
  * 进来的帧只有源 MAC 与桥的 ifindex，留给 drain 反查 FDB。
  */
 struct zx_ffe_learn_cand {
-	__be32	saddr;		/* pre-NAT：conntrack 该方向的元组（ORIGINAL 或 REPLY） */
-	__be32	daddr;
+	union nf_inet_addr saddr;	/* pre-NAT：conntrack 该方向的元组（按族取 4/16 B） */
+	union nf_inet_addr daddr;
+	union nf_inet_addr saddr_out;	/* post-NAT：ip_hdr/ipv6_hdr(skb)（按族取 4/16 B） */
+	union nf_inet_addr daddr_out;
 	__be16	sport;
 	__be16	dport;
-	__be32	saddr_out;	/* post-NAT：ip_hdr(skb) 与 L4 端口 */
-	__be32	daddr_out;
 	__be16	sport_out;
 	__be16	dport_out;
 	u8	proto;
+	u8	family;		/* 4 / 6：键的族、下一跳用哪张邻居表 */
 	u8	eport;		/* 出口端口（DT reg 编号，与 ffe_add 的 eport 同一套） */
 	u8	nat;		/* ZX_FFE_FLOW_NAT_S / _D（键与输出不一致的那几维） */
 	u8	iiport;		/* 入口端口 0..4；ZX_FFE_IPORT_BRIDGE = 桥、待反查 */
@@ -328,6 +357,37 @@ struct zx_ffe_learn_cand {
 	u32	in_br_ifindex;	/* 入口桥 ifindex：iiport == ZX_FFE_IPORT_BRIDGE 时有效 */
 	u8	src_mac[ETH_ALEN]; /* 入口 FDB 反查键：iiport == ZX_FFE_IPORT_BRIDGE 时有效 */
 };
+
+/*
+ * 钩子从**本族报头**解析出来的"这一帧在链路上的形态"（post-NAT）。两族只看
+ * 地址宽度不同，其余字段共用；解析结果先落到这里，再由共用段组装候选。
+ */
+struct zx_ffe_learn_pkt {
+	union nf_inet_addr saddr;
+	union nf_inet_addr daddr;
+	__be16	sport;
+	__be16	dport;
+	u8	proto;
+	u8	family;
+};
+
+/* 按族拷 4/16 字节：v4 的 union 余下 12 B 必须保持 memset 后的 0。 */
+static inline void zx_ffe_learn_addr_cpy(union nf_inet_addr *dst,
+					 const union nf_inet_addr *src,
+					 u8 family)
+{
+	memcpy(dst, src, family == 6 ? sizeof(struct in6_addr) :
+				       sizeof(__be32));
+}
+
+/* 按族比较两个地址（NAT 位判定用）；两边的非本族字节都是 0。 */
+static inline bool zx_ffe_learn_addr_eq(const union nf_inet_addr *a,
+					const union nf_inet_addr *b,
+					u8 family)
+{
+	return !memcmp(a, b, family == 6 ? sizeof(struct in6_addr) :
+					  sizeof(__be32));
+}
 
 /*
  * cand->eport 的哨兵值（ZX_NUM_PORTS 是 5，0xff 不会与真端口号冲突）。
@@ -356,8 +416,9 @@ struct zx_ffe_learn_cand {
  * （learn_drop 涨），drain 里还要做上千次重复的邻居查询/落表。数据面命中时
  * 自己会刷新 lastuse，所以 dmac/MTU 每 1 s 刷新一次完全够用。
  *
- * 16 槽 × 36 B 的线性比（memcmp 整键 32 B）+ 一个 jiffies，只在**已经确认环有
- * 空位**之后才做；不分配、不取锁，表满就覆盖最老的一格（dedup_idx 轮转）。
+ * 16 槽 × 104 B 的线性比（memcmp 整键 96 B，P10 把地址加宽到 16 B 之后）+
+ * 一个 jiffies，只在**已经确认环有空位**之后才做；不分配、不取锁，表满就
+ * 覆盖最老的一格（dedup_idx 轮转）。
  * 同一 CPU 的软中断理论上可能嵌套，最坏结果是偶尔多投/漏投一条候选；计数
  * 本来就是"尽力而为"的口径，接受。
  */
@@ -1008,16 +1069,18 @@ static void zx_ffe_age(struct zx_eth_adapter *adapter)
 /* ---- 旁路学习：POST_ROUTING 钩子 → 每 CPU 环 → age work 落表 -------- */
 
 /*
- * 下一跳 MAC。先在出口 dev 上按**目的地址**查 ARP 邻居；查不到说明这个目的
- * 不直连，要用出口 dev 做一次路由查询、拿网关地址再查一次。只在 work 里调
- * （进程上下文，可以睡眠），钩子里一步都不能碰。
+ * 下一跳 MAC（P10 起按族分成 v4/v6 两份实现，语义逐条对应）。先在出口 dev
+ * 上按**目的地址**查邻居表（v4 = arp_tbl、v6 = nd_tbl，ha/nud_state/ha_lock
+ * 的读法完全一样）；查不到说明这个目的不直连，要用出口 dev 做一次路由查询、
+ * 拿网关地址再查一次。只在 work 里调（进程上下文，可以睡眠），钩子里一步都
+ * 不能碰。
  *
  * neigh_lookup() 不创建邻居（那是 __neigh_lookup/neigh_create 的事）：邻居表
- * 是转发路径自己填的，我们只是抄。拿不到 = 不学，绝不为了学习去触发 ARP。
+ * 是转发路径自己填的，我们只是抄。拿不到 = 不学，绝不为了学习去触发 ARP/ND。
  * n->ha 由 ha_lock（seqlock）保护，读侧用 read_seqbegin/retry 复制，
  * nud_state 必须落在 NUD_VALID 里，否则 ha 还是全 0（INCOMPLETE）。
  */
-static bool zx_ffe_learn_neigh(struct net_device *out, __be32 daddr, u8 *dmac)
+static bool zx_ffe_learn_neigh4(struct net_device *out, __be32 daddr, u8 *dmac)
 {
 	struct neighbour *n;
 	unsigned int seq;
@@ -1041,13 +1104,13 @@ static bool zx_ffe_learn_neigh(struct net_device *out, __be32 daddr, u8 *dmac)
  * 一条候选的下一跳：直连目的先查，查不到再按出口 dev 查路由取网关。
  * flowi4_oif 钉住出口，保证拿到的是"这一帧真会走的那条路由"的网关。
  */
-static bool zx_ffe_learn_mac(struct net_device *out, __be32 daddr, u8 *dmac)
+static bool zx_ffe_learn_mac4(struct net_device *out, __be32 daddr, u8 *dmac)
 {
 	struct flowi4 fl4;
 	struct rtable *rt;
 	__be32 nh;
 
-	if (zx_ffe_learn_neigh(out, daddr, dmac))
+	if (zx_ffe_learn_neigh4(out, daddr, dmac))
 		return true;
 
 	memset(&fl4, 0, sizeof(fl4));
@@ -1060,7 +1123,69 @@ static bool zx_ffe_learn_mac(struct net_device *out, __be32 daddr, u8 *dmac)
 	ip_rt_put(rt);
 	if (!nh || nh == daddr)
 		return false;
-	return zx_ffe_learn_neigh(out, nh, dmac);
+	return zx_ffe_learn_neigh4(out, nh, dmac);
+}
+
+/*
+ * IPv6 版下一跳 MAC（P10）：邻居表是 nd_tbl；路由查询用 ip6_route_output()
+ * + flowi6_oif 钉住出口（与 v4 版 ip_route_output_key() 一一对应），网关由
+ * rt6_nexthop() 选（RTF_GATEWAY 时是 rt6i_gateway，否则是目的地址本身）。
+ * 两族的"直连优先、否则查路由取网关"语义相同，只是 API 与表不同。
+ */
+static bool zx_ffe_learn_neigh6(struct net_device *out,
+				const struct in6_addr *daddr, u8 *dmac)
+{
+	struct neighbour *n;
+	unsigned int seq;
+	bool ok = false;
+
+	n = neigh_lookup(&nd_tbl, daddr, out);
+	if (!n)
+		return false;
+	if (READ_ONCE(n->nud_state) & NUD_VALID) {
+		do {
+			seq = read_seqbegin(&n->ha_lock);
+			memcpy(dmac, n->ha, ETH_ALEN);
+		} while (read_seqretry(&n->ha_lock, seq));
+		ok = !is_zero_ether_addr(dmac);
+	}
+	neigh_release(n);
+	return ok;
+}
+
+static bool zx_ffe_learn_mac6(struct net_device *out,
+			      const struct in6_addr *daddr, u8 *dmac)
+{
+	struct flowi6 fl6;
+	struct dst_entry *dst;
+	const struct in6_addr *nh;
+	bool ok;
+
+	if (zx_ffe_learn_neigh6(out, daddr, dmac))
+		return true;
+
+	memset(&fl6, 0, sizeof(fl6));
+	fl6.daddr = *daddr;
+	fl6.flowi6_oif = out->ifindex;
+	dst = ip6_route_output(dev_net(out), NULL, &fl6);
+	if (IS_ERR_OR_NULL(dst))
+		return false;
+	nh = rt6_nexthop((const struct rt6_info *)dst, daddr);
+	ok = !ipv6_addr_equal(nh, daddr) && zx_ffe_learn_neigh6(out, nh, dmac);
+	dst_release(dst);
+	return ok;
+}
+
+/*
+ * 按族分派（P10）：候选里存的是 union nf_inet_addr，family 已经定了宽度；
+ * 这里只把"查哪张邻居表"的选择收在一处，learn_one 的两个出口共用。
+ */
+static bool zx_ffe_learn_mac_family(struct net_device *out, u8 family,
+				    const union nf_inet_addr *nh, u8 *dmac)
+{
+	if (family == 6)
+		return zx_ffe_learn_mac6(out, &nh->in6, dmac);
+	return zx_ffe_learn_mac4(out, nh->ip, dmac);
 }
 
 /*
@@ -1133,6 +1258,9 @@ static int zx_ffe_learn_brport(struct zx_eth_adapter *adapter,
  * 字段来源——键来自 pre-NAT 元组、出口/NAT 来自 post-NAT 报头、dmac 来自上面
  * 的邻居查询。**方向无关**：两个方向的候选在钩子里就已经归一成"键=线上 pre-NAT
  * 形态、输出=NAT 后形态"，这里不需要知道它来自连接的哪一侧。
+ * **协议族也只影响三处**（P10）：下一跳查哪张邻居表、键填 key.v4[] 还是
+ * key.v6[]、NAT 输出字段（v6 没有 NAT66，保持 0）。入口/出口解析、同口保护、
+ * 落表路径两族完全共用。
  *
  * 入口（P9）：桥端口进来的候选只带"源 MAC + 入口桥 ifindex"，这里在 rtnl 下
  * 用 FDB 反查物理端口；反查不出/命中无线口 → learn_nonport++、丢弃。入口端口
@@ -1141,10 +1269,10 @@ static int zx_ffe_learn_brport(struct zx_eth_adapter *adapter,
  *
  * 出口分两种（P5 修订一）：
  *   - 钩子直接拿到交换机口：out = ports[cand->eport]，邻居按这个口查；
- *   - 钩子拿到桥（WAN→LAN 的常态）：先用**桥**查下一跳 MAC（LAN 主机的 ARP
- *     邻居挂在 br-lan 上，不在 lanX 上），再拿这个 MAC 查桥 FDB 得到真正的
- *     出口端口；smac 必须是**桥**的 dev_addr（对端 ARP 表里网关就是桥的
- *     MAC），MTU 取出口端口的。
+ *   - 钩子拿到桥（WAN→LAN 的常态）：先用**桥**查下一跳 MAC（LAN 主机的 ARP/
+ *     ND 邻居挂在 br-lan 上，不在 lanX 上），再拿这个 MAC 查桥 FDB 得到真正
+ *     的出口端口；smac 必须是**桥**的 dev_addr（对端 ARP/ND 表里网关就是桥
+ *     的 MAC），MTU 取出口端口的。
  *   两条路的出口都必须解析成 0..4 的真端口才落表（解析失败不猜、不落表）。
  *
  * 已存在（同 key）：交给 __zx_ffe_flow_update() 原地刷新，计 learn_dup。字段
@@ -1161,14 +1289,15 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 	struct net_device *out;		/* 真正的交换机出口口：决定 eport 与 MTU */
 	struct net_device *br = NULL;	/* 桥出口：决定 smac，也是 FDB 反查的入口 */
 	struct zx_ffe_key key;
+	union nf_inet_addr nh;		/* 下一跳（按族取 4/16 B，非本族字节为 0） */
 	u8 smac[ETH_ALEN];
-	__be32 nh;
 	u8 dmac[ETH_ALEN];
+	u8 family = cand->family;
 	int eport = cand->eport;
 	int iiport = cand->iiport;
 	int ret;
 
-	/* DNAT 之后的目的地址才是链路上的目标；SNAT 不动目的地址 */
+	/* DNAT 之后的目的地址才是链路上的目标；SNAT 不动目的地址（v6 无 NAT） */
 	nh = (cand->nat & ZX_FFE_FLOW_NAT_D) ? cand->daddr_out : cand->daddr;
 
 	/*
@@ -1218,7 +1347,7 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 				dev_put(br);
 			return;
 		}
-		if (!zx_ffe_learn_mac(br, nh, dmac)) {
+		if (!zx_ffe_learn_mac_family(br, family, &nh, dmac)) {
 			accel->learn_noneigh++;
 			dev_put(br);
 			return;
@@ -1249,7 +1378,7 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 		out = READ_ONCE(adapter->ports[eport]);
 		if (!out || !netif_running(out))
 			return;
-		if (!zx_ffe_learn_mac(out, nh, dmac)) {
+		if (!zx_ffe_learn_mac_family(out, family, &nh, dmac)) {
 			accel->learn_noneigh++;
 			return;
 		}
@@ -1266,14 +1395,25 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 		return;
 
 	memset(&key, 0, sizeof(key));
-	key.v4[0] = cand->saddr;
-	key.v4[1] = cand->daddr;
+	/*
+	 * 键按族填（P10）：v4 填 key.v4[2]（union 的前 8 B），v6 填 key.v6[32]；
+	 * 数据面 zx_ffe_v4_check()/zx_ffe_v6_check() 建键时填的是同一片字节
+	 * （同为 memset 后赋值），键按字节比较，所以必须逐字段一致。
+	 */
+	if (family == 6) {
+		memcpy(key.v6, &cand->saddr, sizeof(struct in6_addr));
+		memcpy(key.v6 + sizeof(struct in6_addr), &cand->daddr,
+		       sizeof(struct in6_addr));
+	} else {
+		key.v4[0] = cand->saddr.ip;
+		key.v4[1] = cand->daddr.ip;
+	}
 	key.sport = cand->sport;
 	key.dport = cand->dport;
 	key.proto = cand->proto;
-	key.family = 4;
+	key.family = family;
 	/*
-	 * ipport/vid 保持 0：数据面 zx_ffe_v4_check() 建键时只填 v4/sport/dport/
+	 * ipport/vid 保持 0：数据面两族的判据链建键时都只填地址/sport/dport/
 	 * proto/family（memset 之后），键按字节比较，填别的值这条永远不命中。
 	 */
 
@@ -1298,10 +1438,17 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 	flow->mtu = min_t(u32, out->mtu, 0xffff);
 	flow->flags = ZX_FFE_FLOW_LEARNED |
 		      (cand->nat & ZX_FFE_FLOW_NAT_MASK);
-	flow->saddr_out = cand->saddr_out;
-	flow->daddr_out = cand->daddr_out;
-	flow->sport_out = cand->sport_out;
-	flow->dport_out = cand->dport_out;
+	/*
+	 * NAT 输出字段是 __be32，只有 v4 有对应语义（v6 没有 NAT66，flags 里的
+	 * NAT 位恒 0）；v6 条目保持 kzalloc 的 0，避免把 v6 地址的前 4 B 写进
+	 * 一个只对 v4 有意义的字段。
+	 */
+	if (family == 4) {
+		flow->saddr_out = cand->saddr_out.ip;
+		flow->daddr_out = cand->daddr_out.ip;
+		flow->sport_out = cand->sport_out;
+		flow->dport_out = cand->dport_out;
+	}
 	flow->lastuse = jiffies;
 	ret = __zx_ffe_store(adapter, flow);
 	if (ret == 1) {
@@ -1399,9 +1546,132 @@ static u32 zx_ffe_learn_inbridge(struct zx_eth_adapter *adapter,
 }
 
 /*
- * 学习钩子（P5-TASK §1.1/§1.2）：NFPROTO_IPV4 + POST_ROUTING + NF_IP_PRI_LAST，
+ * 两个前缀判据（v6 学习解析器与 v6 判据链共用）。直接判字节而不 include
+ * <net/ipv6.h>：判据在每包热路径上，两个 bit 测试就够，没必要为一个
+ * ff00::/8 拉进整棵 IPv6 头文件树。
+ */
+static inline bool zx_ffe_v6_is_mcast(const struct in6_addr *addr)
+{
+	return addr->s6_addr[0] == 0xff;			/* ff00::/8 */
+}
+
+static inline bool zx_ffe_v6_is_linklocal(const struct in6_addr *addr)
+{
+	return addr->s6_addr[0] == 0xfe &&
+	       (addr->s6_addr[1] & 0xc0) == 0x80;	/* fe80::/10 */
+}
+
+/*
+ * 钩子的 IPv4 报头解析（P5/P9 的全部过滤条件，逐条原样搬进来）：只做"这一帧
+ * 能不能学 + 线上 saddr/daddr/sport/dport/proto 是什么"，不碰 skb、不分配。
+ * 判据：
+ *   #4 裸 IPv4、ihl == 5（带选项的帧数据面也不收）；
+ *   #5 无分片（MF/OFFSET）；
+ *   #6 只学 TCP/UDP；
+ *   #9 IP 头与 L4 端口都在 skb_headlen() 里（钩子不做 pskb_may_pull）。
+ * P9 的 GSO 放开不需要额外代码：这里没有任何 skb_is_gso() 判据，GSO skb 的
+ * IP 头与 L4 头同样合法（同一五元组才会被 GRO 合并）。
+ */
+static bool zx_ffe_learn_parse4(struct sk_buff *skb,
+				struct zx_ffe_learn_pkt *pkt)
+{
+	const struct iphdr *iph;
+	__be16 ports[2];
+
+	if (skb->protocol != htons(ETH_P_IP))
+		return false;
+	if (skb_headlen(skb) < sizeof(*iph))
+		return false;
+	iph = ip_hdr(skb);
+	if (iph->version != 4 || iph->ihl != 5)
+		return false;
+	if (iph->frag_off & htons(IP_MF | IP_OFFSET))
+		return false;
+	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
+		return false;
+	if (skb_headlen(skb) < iph->ihl * 4 + (unsigned int)sizeof(ports))
+		return false;
+	memcpy(ports, (const u8 *)iph + iph->ihl * 4, sizeof(ports));
+
+	memset(pkt, 0, sizeof(*pkt));
+	pkt->saddr.ip = iph->saddr;
+	pkt->daddr.ip = iph->daddr;
+	pkt->sport = ports[0];
+	pkt->dport = ports[1];
+	pkt->proto = iph->protocol;
+	pkt->family = 4;
+	return true;
+}
+
+/*
+ * 钩子的 IPv6 报头解析（P10）。取法与 v4 版同构，但有三条 v6 特有的边界，
+ * 全部与数据面 zx_ffe_v6_check() 对齐——**学出来的条目必须是数据面真会命中的
+ * 键**，否则只是占一行、等老化：
+ *
+ *   1. **扩展头一律放弃**。逐跳(0)/路由(43)/分片(44)/目的选项(60) 与数据面
+ *      判据 #7 同一个黑名单（AH/ESP 等其余 next header 在下面按"非 TCP/UDP"
+ *      拒掉，与数据面 #12 一致）。不猜扩展头长度，就不用把扩展头当 L4 端口
+ *      读；这正是"v6 快路只吃纯 TCP/UDP 帧"的落地方式。
+ *   2. **ICMPv6(58) 排除**：NS/NA/RS/RA/MLD/echo 全在"非 TCP/UDP"这条里，
+ *      与数据面 #12 同一刀。
+ *   3. **fe80::/10 源排除**：数据面 #11 不收链路本地源（避免旁路 ND 状态机），
+ *      学了也永远命中不了。目的组播 ff00::/8（数据面 #9）同样排除。
+ *
+ * 不查 "payload_len + 40 == 帧长 - 14" 的严格等式：数据面在**每一帧**上都会
+ * 查（它决定这一帧能不能走快路），而学习只需要键；GSO 超级包的 payload_len
+ * 覆盖的是聚合长度，等式本来就不该套在"学不学"上（P9 已为 v4 放开 GSO）。
+ * 学到的键若因尾部 padding/截断而永远不命中，也只是按 ffe_aging 老化掉。
+ */
+static bool zx_ffe_learn_parse6(struct sk_buff *skb,
+				struct zx_ffe_learn_pkt *pkt)
+{
+	const struct ipv6hdr *ip6;
+	__be16 ports[2];
+
+	if (skb->protocol != htons(ETH_P_IPV6))
+		return false;
+	if (skb_headlen(skb) < sizeof(*ip6))
+		return false;
+	ip6 = ipv6_hdr(skb);
+	if (ip6->version != 6)
+		return false;
+	/* 1. 扩展头：与数据面 #7 同一个黑名单，遇到就放弃 */
+	switch (ip6->nexthdr) {
+	case IPPROTO_HOPOPTS:
+	case IPPROTO_ROUTING:
+	case IPPROTO_FRAGMENT:
+	case IPPROTO_DSTOPTS:
+		return false;
+	}
+	/* 2. 只学 TCP/UDP（ICMPv6 = 58 在这里被排除） */
+	if (ip6->nexthdr != IPPROTO_TCP && ip6->nexthdr != IPPROTO_UDP)
+		return false;
+	if (skb_headlen(skb) < sizeof(*ip6) + (unsigned int)sizeof(ports))
+		return false;
+	/* 3. 目的组播 / 源链路本地：与数据面 #9/#11 同一条线 */
+	if (zx_ffe_v6_is_mcast(&ip6->daddr) ||
+	    zx_ffe_v6_is_linklocal(&ip6->saddr))
+		return false;
+	memcpy(ports, (const u8 *)ip6 + sizeof(*ip6), sizeof(ports));
+
+	memset(pkt, 0, sizeof(*pkt));
+	memcpy(&pkt->saddr.in6, &ip6->saddr, sizeof(ip6->saddr));
+	memcpy(&pkt->daddr.in6, &ip6->daddr, sizeof(ip6->daddr));
+	pkt->sport = ports[0];
+	pkt->dport = ports[1];
+	pkt->proto = ip6->nexthdr;
+	pkt->family = 6;
+	return true;
+}
+
+/*
+ * 学习钩子（P5-TASK §1.1/§1.2；P10 起**两个协议族共用**）：NFPROTO_IPV4 与
+ * NFPROTO_IPV6 各注册一次，hooknum = POST_ROUTING、priority = NF_IP_PRI_LAST，
  * 也就是 NAT（nf_nat 的 POST_ROUTING 在 NF_IP_PRI_NAT_SRC=100）之后，所以
- * `ip_hdr(skb)` 里已经是 NAT 后的地址；pre-NAT 的元组只能从 conntrack 取。
+ * `ip_hdr()/ipv6_hdr()` 里已经是 NAT 后的地址；pre-NAT 的元组只能从 conntrack
+ * 取。两个 pf 走**同一个回调**，按 state->pf 选报头解析器（parse4/parse6），
+ * 之后的入口/出口解析、同口保护、元组选择、候选组装、投递只有一份——两族
+ * 判据不会漂移，这也是"优先共用"的落法。
  *
  * 语义：**只旁听，不做任何决定**，恒返回 NF_ACCEPT。过滤不通过就直接返回，
  * 投递只做 memcpy + 环写，所有分配/邻居查询都在 work 里。
@@ -1484,14 +1754,13 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 {
 	struct zx_eth_adapter *adapter = priv;
 	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_learn_pkt pkt;
 	struct zx_ffe_learn_ring *ring;
 	struct zx_ffe_learn_cand cand;
 	const struct nf_conntrack_tuple *ot;
 	enum ip_conntrack_dir dir;
 	enum ip_conntrack_info ctinfo;
-	const struct iphdr *iph;
 	struct nf_conn *ct;
-	__be16 ports[2];
 	u32 br_ifindex = 0;
 	u32 in_br_ifindex = 0;
 	u32 head;
@@ -1503,50 +1772,34 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	/* 开关关掉时第一行就返回：零副作用（P5-TASK §1.8） */
 	if (!READ_ONCE(accel->learn_on))
 		return NF_ACCEPT;
-	/* #1 只处理裸 IPv4（本钩子只挂在 NFPROTO_IPV4 上，这条是防御） */
-	if (skb->protocol != htons(ETH_P_IP))
+	/*
+	 * #1 按注册的协议族选报头解析器（P10）。钩子注册了两次（IPv4/IPv6），
+	 * state->pf 就是注册时的 pf；两族只在这里分叉，之后的 #7 出口、#8
+	 * 入口、#10 本机目的、#11 conntrack、组装、投递**共用同一份代码**。
+	 */
+	if (state->pf == NFPROTO_IPV4) {
+		if (!zx_ffe_learn_parse4(skb, &pkt))
+			return NF_ACCEPT;
+	} else if (state->pf == NFPROTO_IPV6) {
+		if (!zx_ffe_learn_parse6(skb, &pkt))
+			return NF_ACCEPT;
+	} else {
 		return NF_ACCEPT;
+	}
 	/* #2 转发帧的目的 MAC 是本机，pkt_type 必须是 PACKET_HOST */
 	if (skb->pkt_type != PACKET_HOST)
 		return NF_ACCEPT;
 	/*
-	 * #3 GSO（P9 放开）：旧代码在这里就 `if (skb_is_gso(skb)) return`，把
-	 * GRO 合并后的 bulk 回程（实测 7.6–18.5 KB）整片挡住，于是"只有握手小包
-	 * 那些流"能学、"整条流的 bulk"永远学不到。键只取 IP 头与 L4 头，GRO 合并
-	 * skb 的这两层头是合法的（同一 5 元组才会被合并），不该一刀切。
-	 * 真正的边界收在 #5（无分片）、#6（TCP/UDP）、#9（头在线性区）之后，
-	 * 见 #6' 的注释。
+	 * #3 GSO（P9 放开，P10 起 v4/v6 同一口径）：旧代码在这里就
+	 * `if (skb_is_gso(skb)) return`，把 GRO 合并后的 bulk（v4 实测
+	 * 7.6–18.5 KB）整片挡住，于是"只有握手小包那些流"能学、"整条流的 bulk"
+	 * 永远学不到。键只取 IP 头与 L4 头，GRO 合并 skb 的这两层头是合法的
+	 * （同一 5 元组才会被合并），不该一刀切。真正的边界收在 parse4() /
+	 * parse6() 里：TCP/UDP、无分片（v6 还要求无扩展头）、头在线性区。
 	 *
 	 * 数据面完全不受影响：它只吃 <=1514 的帧（#17），GSO 大包永远走栈；
 	 * 学到的条目是给这条流**后续的单帧**用的键——bulk 在驱动 RX 侧是一个个
 	 * 单帧到达的，那时 FFE 已经能命中。
-	 */
-	/*
-	 * 头部必须已经在线性区里。钩子严格不分配：不用 pskb_may_pull()（它可能
-	 * 为了拉平分片数据而分配新 head），也不动 skb 的任何字段。转发的帧在
-	 * POST_ROUTING 一定已经拉平过 IP 头，所以这条判据只在畸形/极端情况下命中。
-	 */
-	if (skb_headlen(skb) < sizeof(*iph))
-		return NF_ACCEPT;
-	iph = ip_hdr(skb);
-	/* #4 版本/IHL：带 IPv4 选项的帧数据面也不收（判据 #5 要求 ihl==5） */
-	if (iph->version != 4 || iph->ihl != 5)
-		return NF_ACCEPT;
-	/* #5 分片：数据面不重组（判据 #7） */
-	if (iph->frag_off & htons(IP_MF | IP_OFFSET))
-		return NF_ACCEPT;
-	/* #6 只学 TCP/UDP */
-	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-		return NF_ACCEPT;
-	if (skb_headlen(skb) < iph->ihl * 4 + (unsigned int)sizeof(ports))
-		return NF_ACCEPT;
-	/*
-	 * #6' GSO 的边界（P9）：走到这里，允许 GSO 的条件已经**全部**满足——
-	 *   - #5 没有 MF/OFFSET（分片的 GSO 不学：键与端口都不完整）；
-	 *   - #6 是 TCP 或 UDP（其它协议的 GSO 在前面就拒了，行为维持原样）；
-	 *   - #9 IP 头与 L4 端口都在 skb_headlen() 里（键与输出只读这两段）。
-	 * 所以这里不再对 GSO 做额外判据：TCP/UDP + 无分片 + 头在线性区 = 可学。
-	 * 数据面 #17 仍然只接受 <=1514 的帧，GSO 大包永远回栈，互不影响。
 	 */
 
 	/*
@@ -1619,15 +1872,23 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	 * 的 daddr 才是本机地址（WAN IP），post-NAT 的 daddr 是内网主机——所以
 	 * 这条判据不会把该加速的 NAT 流挡掉；数据面那边由判据 #13' 的延迟判定
 	 * 放行（见 zx_ffe_forward()）。
+	 *
+	 * v6（P10）与 v4 逐条对应：集合换成本机 IPv6 地址表（数据面 v6 判据
+	 * #10 用的同一个 local_ip6s），v6 没有 NAT66，所以这里就是"终点是本机"。
 	 */
-	if (zx_ffe_is_local_ip(accel, iph->daddr))
+	if (pkt.family == 6) {
+		if (zx_ffe_is_local_ip6(accel, &pkt.daddr.in6))
+			return NF_ACCEPT;
+	} else if (zx_ffe_is_local_ip(accel, pkt.daddr.ip)) {
 		return NF_ACCEPT;
+	}
 
 	/*
 	 * #11 conntrack：**两个方向都学**（P5 修订二 §A，依据见函数头注释）。
 	 * 方向只看 ctinfo 的方向位，元组按方向挑：ORIGINAL 侧取 tuple[ORIGINAL]、
 	 * REPLY 侧取 tuple[REPLY]，两侧存着的都是"该方向报文在链路上的 pre-NAT
-	 * 形态"，正是数据面从帧头拼出来的键。
+	 * 形态"，正是数据面从帧头拼出来的键。v4/v6 的元组结构同构（union
+	 * nf_inet_addr + 同一偏移的 L4 端口），所以只有 l3num 与地址宽度按族取。
 	 *
 	 * 未跟踪/没跟踪的包在 6.18 里是 nf_ct_set(skb, NULL, IP_CT_UNTRACKED)
 	 * （net/netfilter/nf_conntrack_core.c:1981 就是这么判的），所以 ct 为
@@ -1651,39 +1912,41 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT;
 	dir = CTINFO2DIR(ctinfo);
 	ot = &ct->tuplehash[dir].tuple;
-	if (ot->src.l3num != AF_INET || ot->dst.protonum != iph->protocol)
+	if (ot->src.l3num != (pkt.family == 6 ? AF_INET6 : AF_INET) ||
+	    ot->dst.protonum != pkt.proto)
 		return NF_ACCEPT;
-
-	/*
-	 * post-NAT 的 L4 端口：TCP/UDP 头的前 4 字节（线性区已由上面的
-	 * skb_headlen() 判据保证），memcpy 出来，不动 skb。
-	 */
-	memcpy(ports, (const u8 *)iph + iph->ihl * 4, sizeof(ports));
 
 	/*
 	 * 组装候选。先写本地变量、再整体 memcpy 进环：去重要拿整条候选做键，
 	 * 而且"槽位发布"必须排在所有字段写完之后（smp_store_release），本地
 	 * 副本让这两件事都简单。
 	 *
-	 * 整结构先 memset 再逐字段赋值：P9 加了 iiport/src_mac/in_br_ifindex 之后
-	 * 结构里有隐式填充，而去重是**整结构 memcmp**，读未初始化字节会让同一条
-	 * 流的两次候选比较结果不确定。结构是 POD：memset + 赋值，不分配。
+	 * 整结构先 memset 再逐字段赋值：P9 加了 iiport/src_mac/in_br_ifindex、
+	 * P10 把地址加宽到 16 B 之后，结构里有隐式填充与"本族用不到的字节"，
+	 * 而去重是**整结构 memcmp**，读未初始化字节会让同一条流的两次候选比较
+	 * 结果不确定。结构是 POD：memset + 赋值，不分配。
+	 *
+	 * 地址按族只拷 4/16 字节（zx_ffe_learn_addr_cpy）：union nf_inet_addr 是
+	 * 16 B，v4 只用前 4 B；拷满 16 B 会把 v4 元组/报头 union 里的垃圾字节
+	 * 带进候选，去重就失效了。
 	 *
 	 * 键（cand.saddr/daddr/sport/dport）来自上面按方向挑好的元组，输出
-	 * （*_out）永远是当前报头：两个方向用的是同一条规则，没有方向特判。
-	 * 入口坐标（iiport + 桥 ifindex + 源 MAC，P9）只用于同口保护，不进键。
+	 * （*_out）永远是当前报头：两个方向、两个族用的是同一条规则，没有方向
+	 * 特判。入口坐标（iiport + 桥 ifindex + 源 MAC，P9）只用于同口保护，
+	 * 不进键。
 	 */
 	memset(&cand, 0, sizeof(cand));
-	cand.saddr = ot->src.u3.ip;
-	cand.daddr = ot->dst.u3.ip;
-	/* TCP/UDP 时 union 的第一个成员 all 就是端口（同一偏移） */
+	zx_ffe_learn_addr_cpy(&cand.saddr, &ot->src.u3, pkt.family);
+	zx_ffe_learn_addr_cpy(&cand.daddr, &ot->dst.u3, pkt.family);
+	/* TCP/UDP 时 union 的第一个成员 all 就是端口（两族同一偏移） */
 	cand.sport = ot->src.u.all;
 	cand.dport = ot->dst.u.all;
-	cand.saddr_out = iph->saddr;
-	cand.daddr_out = iph->daddr;
-	cand.sport_out = ports[0];
-	cand.dport_out = ports[1];
-	cand.proto = iph->protocol;
+	zx_ffe_learn_addr_cpy(&cand.saddr_out, &pkt.saddr, pkt.family);
+	zx_ffe_learn_addr_cpy(&cand.daddr_out, &pkt.daddr, pkt.family);
+	cand.sport_out = pkt.sport;
+	cand.dport_out = pkt.dport;
+	cand.proto = pkt.proto;
+	cand.family = pkt.family;
 	cand.eport = eport;
 	cand.br_ifindex = br_ifindex;
 	cand.iiport = (iiport < 0) ? ZX_FFE_IPORT_BRIDGE : (u8)iiport;
@@ -1695,10 +1958,16 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	 * 注意对 REPLY 侧来说，"目的地址变了"就是 masquerade 的反向改写
 	 * （键里的 daddr 是 WAN IP、输出是内网主机），数据面要靠 NAT_D 这位
 	 * 才能放行，见 zx_ffe_forward() 的 #13'。
+	 *
+	 * v6（P10）没有 NAT66：tuple 与报头逐字段相同，这两位自然为 0；真出现
+	 * 不一致（只可能是内核加了 v6 NAT），条目会带 NAT 位而 flow->*_out 保持
+	 * 0，数据面判据 #16 会把它回栈——不会改写错包。
 	 */
-	if (cand.saddr != cand.saddr_out || cand.sport != cand.sport_out)
+	if (!zx_ffe_learn_addr_eq(&cand.saddr, &cand.saddr_out, pkt.family) ||
+	    cand.sport != cand.sport_out)
 		cand.nat |= ZX_FFE_FLOW_NAT_S;
-	if (cand.daddr != cand.daddr_out || cand.dport != cand.dport_out)
+	if (!zx_ffe_learn_addr_eq(&cand.daddr, &cand.daddr_out, pkt.family) ||
+	    cand.dport != cand.dport_out)
 		cand.nat |= ZX_FFE_FLOW_NAT_D;
 
 	/*
@@ -1774,21 +2043,6 @@ static void zx_ffe_learn_drain(struct zx_eth_adapter *adapter)
  * ingress op 的返回类型，WiFi 接入时也要看得见。计数仍然集中在
  * zx_ffe_ingress_switch_complete() 的出口做一次——两族的口径只有一份。
  */
-
-/*
- * 两个前缀判据。直接判字节而不 include <net/ipv6.h>：判据在每包热路径上，
- * 两个 bit 测试就够，没必要为一个 ff00::/8 拉进整棵 IPv6 头文件树。
- */
-static inline bool zx_ffe_v6_is_mcast(const struct in6_addr *addr)
-{
-	return addr->s6_addr[0] == 0xff;			/* ff00::/8 */
-}
-
-static inline bool zx_ffe_v6_is_linklocal(const struct in6_addr *addr)
-{
-	return addr->s6_addr[0] == 0xfe &&
-	       (addr->s6_addr[1] & 0xc0) == 0x80;	/* fe80::/10 */
-}
 
 /*
  * IPv4 判据链（设计 §2.2 + 勘误 §1/§2）。通过时填好 key 与 *pkt_len（IPv4 的
@@ -3099,10 +3353,11 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	}
 
 	/*
-	 * 旁路学习的三件套（P5）：每 CPU 候选环 + POST_ROUTING 钩子。
-	 * 环必须在注册钩子之前就位（钩子第一件事就是取 this_cpu 环）；钩子注册
-	 * 失败按 init 失败处理——没有学习能力时驱动其余部分照常可用，但这里
-	 * 选择整体回滚，避免"看起来在跑、其实学不到"的半状态。
+	 * 旁路学习的四件套（P5 三件 + P10 的 v6 钩子）：每 CPU 候选环 + 两条
+	 * POST_ROUTING 钩子（IPv4/IPv6 各一条，共用同一个回调）。
+	 * 环必须在注册钩子之前就位（钩子第一件事就是取 this_cpu 环）；任何一条
+	 * 钩子注册失败都按 init 失败处理——没有学习能力时驱动其余部分照常可用，
+	 * 但这里选择整体回滚，避免"看起来在跑、其实学不到"的半状态。
 	 */
 	accel->learn_rings = alloc_percpu(struct zx_ffe_learn_ring);
 	if (!accel->learn_rings) {
@@ -3110,22 +3365,49 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 		ret = -ENOMEM;
 		goto err_inet6;
 	}
-	/* hook_ops_type 等其余字段必须为零（NF_HOOK_OP_UNDEFINED） */
+	/*
+	 * 两条 hook_ops 的字段逐一填（其余字段必须为零，NF_HOOK_OP_UNDEFINED）。
+	 * nf_hook_ops 是按 pf 注册/注销的，一次注册只能覆盖一个 pf，所以两族
+	 * 各有一条；回调与 priv 相同，state->pf 在钩子里分派。
+	 */
 	memset(&accel->learn_hook, 0, sizeof(accel->learn_hook));
+	memset(&accel->learn_hook6, 0, sizeof(accel->learn_hook6));
 	accel->learn_hook.hook = zx_ffe_learn_hook;
 	accel->learn_hook.pf = NFPROTO_IPV4;
 	accel->learn_hook.hooknum = NF_INET_POST_ROUTING;
+	accel->learn_hook6.hook = zx_ffe_learn_hook;
+	accel->learn_hook6.pf = NFPROTO_IPV6;
+	accel->learn_hook6.hooknum = NF_INET_POST_ROUTING;
 	/*
 	 * NF_IP_PRI_LAST == INT_MAX：在 nf_nat 的 NAT_SRC(100) 之后，也等于
 	 * conntrack confirm 的优先级（同优先级时后注册的先跑，见钩子注释）
 	 */
 	accel->learn_hook.priority = NF_IP_PRI_LAST;
 	accel->learn_hook.priv = adapter;
+	accel->learn_hook6.priority = NF_IP_PRI_LAST;
+	accel->learn_hook6.priv = adapter;
 	ret = nf_register_net_hook(&init_net, &accel->learn_hook);
 	if (ret) {
 		dev_err(adapter->dev,
-			"accel: nf_register_net_hook(POST_ROUTING) failed: %d\n",
+			"accel: nf_register_net_hook(IPv4 POST_ROUTING) failed: %d\n",
 			ret);
+		free_percpu(accel->learn_rings);
+		accel->learn_rings = NULL;
+		goto err_inet6;
+	}
+	ret = nf_register_net_hook(&init_net, &accel->learn_hook6);
+	if (ret) {
+		dev_err(adapter->dev,
+			"accel: nf_register_net_hook(IPv6 POST_ROUTING) failed: %d\n",
+			ret);
+		/*
+		 * 回滚已注册的 IPv4 钩子。nf_unregister_net_hook() 只是把旧
+		 * hook 数组交给 call_rcu，可能有 v4 包正在跑这个回调，所以
+		 * 释放环之前必须等一个 RCU 宽限期（与 zx_accel_exit() 同一条
+		 * 理由）。
+		 */
+		nf_unregister_net_hook(&init_net, &accel->learn_hook);
+		synchronize_rcu();
 		free_percpu(accel->learn_rings);
 		accel->learn_rings = NULL;
 		goto err_inet6;
@@ -3166,6 +3448,12 @@ void zx_accel_exit(struct zx_eth_adapter *adapter)
 	unregister_inetaddr_notifier(&accel->inetaddr_nb);
 	unregister_netdevice_notifier(&accel->netdev_nb);
 	if (accel->learn_rings) {
+		/*
+		 * 注册与注销必须对称（P10 起两条钩子）：先摘 v6、再摘 v4，两条
+		 * 都摘完才等宽限期、释放环。只摘一条会让另一个族的钩子继续跑，
+		 * 访问已释放的环 = UAF。
+		 */
+		nf_unregister_net_hook(&init_net, &accel->learn_hook6);
 		nf_unregister_net_hook(&init_net, &accel->learn_hook);
 		/*
 		 * nf_unregister_net_hook() 只是把旧 hook 数组交给 call_rcu，
@@ -4071,6 +4359,11 @@ const struct file_operations zx_accel_aging_fops = {
  * add_replace 是 ffe_add 的同键替换次数（P5 修订二 §C）；它与学习无关，放在
  * 这一行只是因为 ffe_learn 是唯一常开的计数行（不做额外的 debugfs 文件）。
  * 一行里的 key=value 只做追加，不改已有 key 的名字与顺序。
+ *
+ * P10 起 cand/add/dup/drop/noneigh/nobrport/nonport/dedup 都是**两族合计**
+ * （同一个钩子回调、同一个每 CPU 环、同一张流表）；没有新增字段，这样
+ * ffe_learn 的行格式与 P7 逐字比对时保持一致。要分辨族就看 ffe_flows 里
+ * 条目的地址形态（v4 点分/16 进制，v6 冒号分隔）与键的 family。
  */
 static int zx_accel_learn_show(struct seq_file *s, void *data)
 {
