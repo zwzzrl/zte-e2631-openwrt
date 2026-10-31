@@ -55,15 +55,37 @@ MODULE_PARM_DESC(pool_cacheable, "Map the packet pool cacheable (default: uncach
 /*
  * 零拷贝：接收时把 BMU 池里的槽位直接当成 skb 的数据区交给协议栈，发送时把同一个
  * bp 直接交给硬件，省掉每包两次 payload 搬运。说明见 zx_zc_* 那一节。
- * 默认开（1）：转发场景实测比拷贝路径快（UDP 900M 单流 612 → 741 Mbit/s、
- * 8 流 TCP 565 → 700 Mbit/s），代价只有"本机收包"场景的吞吐下降。改法有两个：
- * 开机默认由 /etc/config/e2631 的 fastpath.zerocopy 决定（e2631-netune 在启动
- * 时写 debugfs，见该脚本），运行态可以用 debugfs 的 zc 文件或
- * /sys/module/zx279128s_eth/parameters/zc_rx 切换，便于同一镜像里做 A/B。
+ * 默认关（0）：这条路径的收益全在转发（UDP 900M 单流 612 → 741 Mbit/s、8 流
+ * TCP 565 → 700 Mbit/s），代价是本机收包吞吐下降。公开版本把软件加速搁置，
+ * 默认交给 PPE 硬件流表（accel_v4=hw），代码保留、参数保留，要 A/B 时开机
+ * 用 zc_rx=1，或运行态写 debugfs 的 zc / accel_ipv4 / accel_ipv6。
  */
-static bool zc_rx = true;
+static bool zc_rx;
 module_param(zc_rx, bool, 0644);
-MODULE_PARM_DESC(zc_rx, "Zero-copy RX/TX over the BMU packet pool (default: on)");
+MODULE_PARM_DESC(zc_rx, "Zero-copy RX/TX over the BMU packet pool (default: off)");
+
+/*
+ * 加速路径的默认值，每条协议族各自独立（设计 §1.1）：
+ *   0 stack、1 ffe、2 hw（仅 IPv4）、3 zc
+ * 默认 v4=hw、v6=stack：v4 放行 PPE 硬件流表（nft flowtable 在喂它），v6 保持
+ * 软件 flowtable + 标准栈（PPE 的 v6 分类表实测不成立）。ffe 是本设计新增的
+ * 驱动内快路，P0 只有骨架，默认不启用。
+ */
+static int accel_v4 = ZX_ACC_HW;
+module_param(accel_v4, int, 0644);
+MODULE_PARM_DESC(accel_v4, "IPv4 acceleration path: 0 stack, 1 ffe, 2 hw, 3 zc (default: 2)");
+
+static int accel_v6 = ZX_ACC_STACK;
+module_param(accel_v6, int, 0644);
+MODULE_PARM_DESC(accel_v6, "IPv6 acceleration path: 0 stack, 1 ffe, 3 zc (default: 0)");
+
+/*
+ * 自动降级：某一族 drop > 0.1% 或 fallback > 50% 持续 10 s 就回 stack
+ * （设计 §9-4）。独立开关，开机默认开，运行态写 debugfs 的 accel_autofallback。
+ */
+static bool accel_autofallback = true;
+module_param(accel_autofallback, bool, 0644);
+MODULE_PARM_DESC(accel_autofallback, "Fall back to the stack when the fast path misbehaves (default: on)");
 
 /* 调试用：给每个 zc 槽位在"交给协议栈"的那一刻存一份前 64 字节快照，等
  * zx_zc_reap() 归还 bp 时比对。改写了就说明槽位在我们手里被别的路径用了
@@ -992,7 +1014,8 @@ static void zx_tx_kick(struct zx_eth_adapter *adapter)
 			      HRTIMER_MODE_REL);
 }
 
-static void zx_tx_reclaim(struct zx_eth_adapter *adapter)
+/* Called with tx_lock held; also from zx_accel_set() while it drains the ring. */
+void zx_tx_reclaim(struct zx_eth_adapter *adapter)
 {
 	u32 done = readl(adapter->base + ZX_DMA_TX_DONE) & 0xffff;
 	u32 n = min(done, adapter->tx_pending);
@@ -1001,7 +1024,12 @@ static void zx_tx_reclaim(struct zx_eth_adapter *adapter)
 		adapter->tx_done_excess += done - adapter->tx_pending;
 	adapter->tx_complete_cnt += n;
 	adapter->tx_pending -= n;
-	if (adapter->tx_pending < ZX_TX_QUEUE_LIMIT) {
+	/*
+	 * 加速模式切换期间不动队列：切换自己会 netif_tx_disable() 所有端口，
+	 * 这里再把队列叫醒就等于开着门切换（设计 §1.4 S2/S6）。
+	 */
+	if (adapter->tx_pending < ZX_TX_QUEUE_LIMIT &&
+	    !READ_ONCE(adapter->accel.quiesce)) {
 		int p;
 
 		for (p = 0; p < ZX_NUM_PORTS; p++)
@@ -1531,8 +1559,11 @@ static void zx_gro_set(struct net_device *nd, bool on)
  * GRO 位只由 zx_gro_set()（即 ndo_open 和这里）写，userspace 别用 ethtool
  * 去改：把 hw_features 里的位清掉之后，`ethtool -K gro off` 走的是
  * wanted_features 那条路，实测反而把 features 位留成 on（"on [fixed]"）。
+ *
+ * 非 static：加速模式切换（zx279128s-accel.c 的 S4/S6）也要用它进/出 zc。
+ * 里面会 rtnl_lock()，所以调用它的路径**不得先持 rtnl**。
  */
-static void zx_zc_set(struct zx_eth_adapter *adapter, bool on)
+void zx_zc_set(struct zx_eth_adapter *adapter, bool on)
 {
 	int i;
 
@@ -1841,6 +1872,26 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			dest_dev = port < ZX_NUM_PORTS ? adapter->ports[port] : NULL;
 
 			/*
+			 * 加速分发点（唯一，设计 §1.2）：描述符已解析、池已
+			 * invalidate、自有源 MAC 已排除，但还没有建任何 skb。
+			 * P0 只判不发——ffe 模式下记一次 miss（lookup/miss
+			 * 各加一），帧照旧走协议栈。P2 在这里换成真转发：命中
+			 * 就把同一个 bp 写进 TX 描述符并 continue。
+			 */
+			if (unlikely(READ_ONCE(adapter->accel.quiesce)))
+				goto accel_slow;
+			{
+				__be16 h_proto = *(__be16 *)((u8 *)adapter->pkt_pool +
+					(u32)bp * ZX_BUF_SIZE + 16 + 2 * ETH_ALEN);
+				int fam = zx_eth_family(h_proto);
+
+				if (fam >= 0 &&
+				    zx_accel_cur_mode(&adapter->accel, fam) ==
+					    ZX_ACC_FFE)
+					zx_accel_count_miss(adapter, fam);
+			}
+accel_slow:
+			/*
 			 * 零拷贝：把槽位本身做成 skb 交给协议栈，bp 先不还。
 			 * 之后由发送路径交给硬件（硬件发完自己归还），或者由
 			 * destructor 在协议栈丢包时放回隔离环。
@@ -2009,6 +2060,8 @@ static int zx_eth_open(struct net_device *netdev)
 	if (adapter->open_count == 0) {
 		napi_enable(&adapter->napi);
 		writel(~ZX_TM_INT_RX, adapter->base + ZX_TM_INT_MASK);
+		/* 加速框架的 0→1 钩子（设计 §1.4 最后一段） */
+		zx_accel_on_open(adapter);
 	}
 	adapter->open_count++;
 
@@ -2037,6 +2090,8 @@ static int zx_eth_stop(struct net_device *netdev)
 		/* a last poll may have unmasked it again */
 		writel(~0, adapter->base + ZX_TM_INT_MASK);
 		synchronize_irq(adapter->irq);
+		/* 加速框架的 →0 钩子：按端口 flush 流表（P0 是空实现） */
+		zx_accel_on_close(adapter);
 	}
 
 	return 0;
@@ -2319,6 +2374,10 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 	seq_printf(s, "bmu_alloc_fail=%u bmu_alloc_late=%u bmu_free_fail=%u bmu_free_slots=%u\n",
 		   adapter->bmu_alloc_fail, adapter->bmu_alloc_late,
 		   adapter->bmu_free_fail, adapter->bmu_free_slots);
+	seq_printf(s, "accel v4=%s v6=%s autofallback=%u\n",
+		   zx_accel_mode_name(READ_ONCE(adapter->accel.v4_mode)),
+		   zx_accel_mode_name(READ_ONCE(adapter->accel.v6_mode)),
+		   READ_ONCE(adapter->accel.autofallback) ? 1u : 0u);
 	seq_printf(s, "zc_rx=%d rx_ok=%llu tx_ok=%llu free_ok=%llu out=%lld fallback=%llu q_ovf=%llu capped=%llu off=%llu\n",
 		   READ_ONCE(adapter->zc_rx), adapter->zc_rx_ok,
 		   adapter->zc_tx_ok, adapter->zc_free_ok,
@@ -2672,6 +2731,15 @@ static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 	debugfs_create_file("zc", 0644, dir, adapter, &zx_eth_zc_fops);
 	debugfs_create_file("zc_ev", 0444, dir, adapter, &zx_eth_zc_ev_fops);
 	debugfs_create_file("txtest", 0200, dir, adapter, &zx_eth_txtest_fops);
+	/* 加速路径（设计 §1.3）：两个族的模式与计数、只读流表、降级开关 */
+	debugfs_create_file("accel_ipv4", 0644, dir, adapter,
+			    &zx_accel_v4_fops);
+	debugfs_create_file("accel_ipv6", 0644, dir, adapter,
+			    &zx_accel_v6_fops);
+	debugfs_create_file("ffe_flows", 0444, dir, adapter,
+			    &zx_accel_flows_fops);
+	debugfs_create_file("accel_autofallback", 0644, dir, adapter,
+			    &zx_accel_autofallback_fops);
 }
 
 static void zx_pkt_pool_free(struct device *dev,
@@ -2749,11 +2817,40 @@ static int zx_eth_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/*
+	 * 加速框架骨架：锁、空流表、计数面、老化/自动降级定时器。它必须在
+	 * 数据面（DMA、中断、网口注册）之前立起来，之后任何一步失败都走
+	 * err_accel 收摊。
+	 */
+	ret = zx_accel_init(adapter);
+	if (ret)
+		goto err_hashtable;	/* accel 没建起来，只销毁 PPE 表 */
+
+	/*
+	 * 初始模式按 module_param 直接写字段，不走 zx_accel_set()：probe 期
+	 * NAPI 还没 enable、端口还没注册，做 quiesce/napi_disable 没有意义，
+	 * 也没有数据面在跑。
+	 */
+	adapter->accel.v4_mode = (unsigned int)accel_v4 <= ZX_ACC_ZC ?
+				 (u8)accel_v4 : (u8)ZX_ACC_STACK;
+	adapter->accel.v6_mode = (unsigned int)accel_v6 <= ZX_ACC_ZC ?
+				 (u8)accel_v6 : (u8)ZX_ACC_STACK;
+	if (adapter->accel.v6_mode == ZX_ACC_HW) {
+		dev_warn(dev, "accel_v6=%d: IPv6 has no hardware path, using stack\n",
+			 accel_v6);
+		adapter->accel.v6_mode = ZX_ACC_STACK;
+	}
+	adapter->accel.autofallback = accel_autofallback;
+	dev_info(dev, "accel: v4=%s v6=%s autofallback=%u\n",
+		 zx_accel_mode_name(adapter->accel.v4_mode),
+		 zx_accel_mode_name(adapter->accel.v6_mode),
+		 adapter->accel.autofallback ? 1u : 0u);
+
 	adapter->buffer_pool = dma_alloc_coherent(dev, ZX_DMA_ARENA_SIZE,
 						  &adapter->buf_pool_dma, GFP_KERNEL);
 	if (!adapter->buffer_pool) {
 		ret = -ENOMEM;
-		goto err_hashtable;
+		goto err_accel;
 	}
 	/*
 	 * Packet buffers: 8 MiB, physically contiguous.  Two mappings are
@@ -3018,6 +3115,8 @@ err_dma:
 	zx_hw_reset(adapter);
 	dma_free_coherent(dev, ZX_DMA_ARENA_SIZE, adapter->buffer_pool,
 			  adapter->buf_pool_dma);
+err_accel:
+	zx_accel_exit(adapter);
 err_hashtable:
 	rhashtable_destroy(&adapter->ppe_flows);
 	return ret;

@@ -9,6 +9,8 @@
 #define ZX279128S_ETH_H
 
 #include <linux/bitmap.h>
+#include <linux/compiler.h>
+#include <linux/fs.h>
 #include <linux/hrtimer.h>
 #include <linux/if_ether.h>
 #include <linux/mutex.h>
@@ -268,6 +270,65 @@
 #define ZX_RX_QUEUES		8
 #define ZX_DMA_TX_DONE		(ZX_DMA_BASE + 0x68)
 
+/* ---- 加速路径框架（stack / ffe / hw / zc）-------------------------- */
+
+/*
+ * 每个协议族各自选一条加速路径，两个模式字段互相独立：
+ *   stack  纯标准栈（默认，驱动什么都不做）
+ *   ffe    驱动内零拷贝快路（本设计；P0 只有骨架，不转发）
+ *   hw     PPE 硬件流表，只有 IPv4 有；驱动侧只表示"放行 PPE 接管"
+ *   zc     既有零拷贝（搁置，参数保留）
+ * 同一族内 ffe 与 hw 互斥（硬件命中后帧根本不上 CPU，两层改写叠加不可证明），
+ * ffe 与 zc 也互斥（两者对同一个 bp 的所有权模型冲突），见设计 §5。
+ */
+enum zx_accel_mode {
+	ZX_ACC_STACK = 0,
+	ZX_ACC_FFE,
+	ZX_ACC_HW,
+	ZX_ACC_ZC,
+};
+
+/* 快路计数：cnt[0] 是 IPv4，cnt[1] 是 IPv6，口径见设计 §1.5 */
+struct zx_ffe_cnt {
+	u64	lookup;		/* 进判据链的帧 */
+	u64	hit;		/* 查表命中 */
+	u64	miss;		/* 查表未命中 */
+	u64	fwd;		/* 真正交给发送硬件 */
+	u64	drop_noport;	/* 命中但出口端口不可用 */
+	u64	drop_local;	/* 命中但目的地址属本机 */
+	u64	fallback;	/* 命中但被某条判据挡回栈 */
+	u64	fallback_qfull;	/* 其中因为 TX 环满而回栈 */
+	u64	csum_err;	/* IPv4 头校验和错 */
+	u64	ttl_err;	/* TTL / Hop-Limit 到期 */
+	u64	bytes;		/* fwd 的字节数 */
+	u32	qlen_peak;	/* 快路占用 TX 环的峰值 */
+};
+
+struct zx_accel {
+	u8			v4_mode;	/* enum zx_accel_mode */
+	u8			v6_mode;	/* enum zx_accel_mode */
+	bool			quiesce;	/* 切换中：数据面一律走栈 */
+	struct mutex		lock;		/* 串行化模式切换（S0） */
+	struct rhashtable	flows;		/* 单表，family 在键里 */
+	struct zx_ffe_cnt	cnt[2];
+	struct delayed_work	age;		/* 1 s：老化 + 自动降级判据 */
+	u64			sw_in;		/* 进入切换的次数 */
+	u64			sw_out;		/* 切换完成（或回滚）的次数 */
+	u64			drain_ms;	/* 最近一次排空的耗时 */
+	u64			drain_frames;	/* 最近一次排空回收的帧数 */
+	bool			autofallback;	/* 允许自动降级回 stack */
+	unsigned long		fb_since[2];	/* 每族越过降级阈值的起点 */
+};
+
+/* 某个族的当前模式。数据面每个包只读这一个字节：切换是单字节写，
+ * 所以只会看到旧模式或新模式，没有半切换（设计 §1.4 S5）。
+ */
+static inline u8 zx_accel_cur_mode(const struct zx_accel *accel, int family)
+{
+	/* READ_ONCE() 要取地址，只能作用在左值上，不能包整个条件表达式 */
+	return family ? READ_ONCE(accel->v6_mode) : READ_ONCE(accel->v4_mode);
+}
+
 struct zx_eth_adapter;
 
 /* One net_device per switch port: ports 0-3 LAN, port 4 WAN */
@@ -447,6 +508,9 @@ struct zx_eth_adapter {
 	u32			ppe_add_skip;	/* flows the hardware cannot take */
 	u32			ppe_add_fail;	/* no free entry, access timeout */
 
+	/* 加速路径框架（见文件上方 enum zx_accel_mode / struct zx_accel） */
+	struct zx_accel		accel;
+
 	/* Hardware LAN switching between the ports of one Linux bridge */
 	spinlock_t		trap_lock;	/* zx_update_traps() */
 	struct mutex		sw_lock;
@@ -491,12 +555,41 @@ bool zx_ppe_has_bound_blocks(struct zx_eth_adapter *adapter);
  */
 void zx_eth_for_each_adapter(void (*fn)(struct zx_eth_adapter *adapter,
 				       void *data), void *data);
+/* Reclaim the sent frames the DMA reported; the caller holds tx_lock. */
+void zx_tx_reclaim(struct zx_eth_adapter *adapter);
+/* Turn the zero-copy path on/off.  It takes rtnl_lock() itself, so the caller
+ * must not hold rtnl (zx_accel_set() relies on that).
+ */
+void zx_zc_set(struct zx_eth_adapter *adapter, bool on);
 
 /* The packet processor engine (zx279128s-ppe.h): the switch driver is built
  * in, the engine is the kmod.  Everything that crosses that boundary - the
  * hooks table, the flow table parameters and the entry type - is declared
  * there.
  */
+
+/* zx279128s-accel.c: one acceleration path per protocol family.  The design
+ * and the phase plan are in docs/ffe-fastpath-design-2026-11-01.md.
+ */
+int zx_accel_init(struct zx_eth_adapter *adapter);
+void zx_accel_exit(struct zx_eth_adapter *adapter);
+const char *zx_accel_mode_name(u8 mode);
+int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode);
+bool zx_accel_autofallback(struct zx_eth_adapter *adapter);
+/* 0→1 / →0 open_count hooks; the caller holds rtnl. */
+void zx_accel_on_open(struct zx_eth_adapter *adapter);
+void zx_accel_on_close(struct zx_eth_adapter *adapter);
+/* Ethernet type to family: 0 = IPv4, 1 = IPv6, -1 = the fast path passes. */
+int zx_eth_family(__be16 proto);
+/* A frame that leaves the ffe mode for the stack: lookup and miss, both +1.
+ * P0 has no forwarding, so this is the only counter the data path touches.
+ */
+void zx_accel_count_miss(struct zx_eth_adapter *adapter, int family);
+/* debugfs: accel_ipv4, accel_ipv6, ffe_flows, accel_autofallback */
+extern const struct file_operations zx_accel_v4_fops;
+extern const struct file_operations zx_accel_v6_fops;
+extern const struct file_operations zx_accel_flows_fops;
+extern const struct file_operations zx_accel_autofallback_fops;
 
 /* zx279128s-switch.c */
 void zx_sw_init(struct zx_eth_adapter *adapter);

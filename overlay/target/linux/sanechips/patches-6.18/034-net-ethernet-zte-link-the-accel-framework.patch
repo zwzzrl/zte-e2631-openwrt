@@ -1,0 +1,18 @@
+From: E2631 port
+Subject: [PATCH] net: ethernet: zte: link the accel framework into the driver
+
+zx279128s-accel.c is the acceleration-path framework (per-family mode
+switch: stack/ffe/hw/zc, debugfs control, S0-S7 quiesce-drain-flush
+switch protocol).  The Makefile of drivers/net/ethernet/zte/ is the one
+file the target's files/ overlay does NOT own: it comes from the base
+tree, and 033 already rewrote it to drop zx279128s-ppe.o.  So the new
+object has to be added here, next to 033.
+
+---
+--- a/drivers/net/ethernet/zte/Makefile
++++ b/drivers/net/ethernet/zte/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ obj-$(CONFIG_ZX279128S_ETH) += zx279128s-eth.o
+-zx279128s-eth-y := zx279128s-main.o zx279128s-switch.o
++zx279128s-eth-y := zx279128s-main.o zx279128s-accel.o zx279128s-switch.o
