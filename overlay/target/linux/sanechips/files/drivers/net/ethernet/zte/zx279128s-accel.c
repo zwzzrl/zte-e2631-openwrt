@@ -211,6 +211,14 @@ struct zx_ffe_key {
  * 区别只在 ffe_flows 行尾打 `L` 而不是 `S`，方便上机时一眼看出这条是谁加的。
  */
 #define ZX_FFE_FLOW_LEARNED	BIT(3)
+/*
+ * 条目的**出口**（P6 分层，design/extensibility.md §1 硬规则 2）：只记"类型 +
+ * 标识"，不假设标识是交换机端口号。0 = switch-port，此时 egress_id 就是
+ * ports[] 的下标（DT reg，与 ffe_add 的 eport 同一套编号）；1 预留给 wifi-tx
+ * （egress_id 是队列/接口号）。判据链与改写只看这两个字段，不认识"交换机端口"。
+ * debugfs 的 add/flows 语法与格式不变：只给端口号的调用就是 type 0。
+ */
+#define ZX_FFE_EGRESS_SWITCH	0
 
 struct zx_ffe_flow {
 	struct rhash_head	node;
@@ -228,7 +236,8 @@ struct zx_ffe_flow {
 	__be32			daddr_out;
 	__be16			sport_out;
 	__be16			dport_out;
-	u8			eport;
+	u8			egress_type;	/* 0 = switch-port，1 = wifi-tx 预留 */
+	u16			egress_id;	/* type 0 时 = 交换机端口号（现为 0..4） */
 	u8			flags;
 	u16			mtu;		/* 出口 MTU 快照（add 时取），0 = 未知 */
 	u64			hits;		/* 真正转发出去的帧数（P2 起 == fwd） */
@@ -552,7 +561,8 @@ static void __zx_ffe_flow_update(struct zx_ffe_flow *flow,
 {
 	ether_addr_copy(flow->dmac, src->dmac);
 	ether_addr_copy(flow->smac, src->smac);
-	flow->eport = src->eport;
+	flow->egress_type = src->egress_type;
+	flow->egress_id = src->egress_id;
 	flow->mtu = src->mtu;
 	if (src->flags & ZX_FFE_FLOW_NAT_S) {
 		flow->saddr_out = src->saddr_out;
@@ -1179,7 +1189,8 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 	/* smac 是 L2 出口的地址：直接口时是那个口，桥出口时是桥的 dev_addr */
 	ether_addr_copy(flow->smac, smac);
 	/* 条目里只存交换机端口号（0..4），桥/无线出口在上面已经被挡掉 */
-	flow->eport = eport;
+	flow->egress_type = ZX_FFE_EGRESS_SWITCH;
+	flow->egress_id = eport;
 	flow->mtu = min_t(u32, out->mtu, 0xffff);
 	flow->flags = ZX_FFE_FLOW_LEARNED |
 		      (cand->nat & ZX_FFE_FLOW_NAT_MASK);
@@ -1486,25 +1497,10 @@ static void zx_ffe_learn_drain(struct zx_eth_adapter *adapter)
 }
 
 /*
- * 判据链的裁决。两条链（v4/v6）只报告"这一帧该被怎么处理"，所有计数集中在
- * zx_ffe_rx() 的出口做一次——两族的口径只有一份，不会出现"v6 的 miss 忘了
- * 加上某个子集"这种对不上的账。
+ * 判据链的裁决（enum zx_ffe_verdict）从 P6 起在 zx279128s-eth.h 里：它是
+ * ingress op 的返回类型，WiFi 接入时也要看得见。计数仍然集中在
+ * zx_ffe_ingress_switch_complete() 的出口做一次——两族的口径只有一份。
  */
-enum zx_ffe_verdict {
-	ZX_FFE_V_OK = 0,	/* 判据链全部通过，可以查表/提交 */
-	ZX_FFE_V_FWD,		/* 已改写并提交给发送硬件（只有 forward 返回它） */
-	ZX_FFE_V_MISS,		/* 普通 miss：某条判据不符或查表未命中 */
-	ZX_FFE_V_CSUM_ERR,	/* 只有 v4：IPv4 头校验和错 */
-	ZX_FFE_V_TTL_ERR,	/* TTL/hop_limit <= 1：由栈回 ICMP(6) Time Exceeded */
-	ZX_FFE_V_DROP_LOCAL,	/* 目的地址属本机：v6 #10 一律终结；v4 只在"命中条目
-				 * 但该条目没有 DNAT 改写"或非 TCP/UDP 的 ICMP 上
-				 * 报（P5 修订二 §B 的延迟判定）
-				 */
-	ZX_FFE_V_DROP_NOPORT,	/* 出口端口不存在 / !running / !carrier */
-	ZX_FFE_V_FALLBACK,	/* 命中但按判据回栈（同口/NAT 缺字段/帧长/出口 MTU） */
-	ZX_FFE_V_QFULL,		/* 命中但发送环满：回栈让 qdisc 背压 */
-	ZX_FFE_V_RX_DROP,	/* 已改写但提交失败，只能丢帧（不可达） */
-};
 
 /*
  * 两个前缀判据。直接判字节而不 include <net/ipv6.h>：判据在每包热路径上，
@@ -1784,10 +1780,97 @@ static void zx_ffe_rewrite(u8 *frame, const struct zx_ffe_flow *flow, int family
 }
 
 /*
+ * 查表薄封装（design/extensibility.md §5 第 2 条）：判据链里只调这一个入口，现在内部
+ * 就是 rhashtable_lookup；将来换成"per-CPU 直接映射缓存 + 回退 rhashtable"，
+ * 调用方零改动。调用者持 rcu_read_lock()（条目由 kfree_rcu 释放）。
+ */
+static struct zx_ffe_flow *zx_ffe_lookup(struct zx_accel *accel,
+					 const struct zx_ffe_key *key)
+{
+	return rhashtable_lookup(&accel->flows, key, zx_ffe_ht_params);
+}
+
+/* ---- 出口（egress）op：现在只有 switch-port ------------------------- */
+
+/*
+ * 交换机出口的 usable()：本驱动端口 + running + carrier。判据与 P2 的 #14
+ * 完全一样（就是 zx_ffe_eport_dev() 的返回值）：数据面不取 rtnl，判不准就
+ * 回栈，不丢包。
+ */
+static bool zx_ffe_egress_switch_usable(struct zx_eth_adapter *adapter, u16 id)
+{
+	return zx_ffe_eport_dev(adapter, id) != NULL;
+}
+
+/*
+ * 交换机出口的提交：写发送描述符 + TX_START + 出口侧记账。
+ *
+ * 调用者（zx_ffe_forward()）已经持 adapter->tx_lock、刚查过环容量、并且已经把
+ * 帧改写成出口形态，所以这里不可能失败；真失败（代码/内存被改坏）就按"丢帧"
+ * 处理：帧已经改过，绝不能回栈，槽位也没交给硬件，由调用方把 bp 还给 BMU
+ * （返回 DROPPED）。
+ *
+ * 现在恒 n == 1（design §5 第 1 条的批量预留）：一批一帧，与 P2 的提交段**逐字节
+ * 等价**——同一个描述符内容、同一次 TX_START、同样的失败返回。将来的批量提交
+ * （一次取锁/一次记账）只改这个函数内部，分层与调用方不变。
+ */
+static int zx_ffe_egress_switch_submit(struct zx_eth_adapter *adapter,
+				       struct zx_ffe_pkt **pkts, int n,
+				       struct zx_ffe_flow *flow)
+{
+	struct zx_ffe_pkt *pkt = pkts[0];
+	struct net_device *nd;
+	u16 bp = (u16)(uintptr_t)pkt->token;
+
+	/* 现在恒 n == 1；批量提交见 design/extensibility.md §5 第 1 条 */
+	(void)n;
+
+	if (!zx_tx_submit_bp(adapter, flow->egress_id, bp, pkt->len)) {
+		dev_warn_ratelimited(adapter->dev,
+			"ffe: TX ring full right after the capacity check (pending=%u), dropping a rewritten frame for eport %u\n",
+			adapter->tx_pending, flow->egress_id);
+		return -ENOSPC;
+	}
+	/*
+	 * 出口侧 /proc/net/dev 记账（慢路径在 zx_eth_xmit() 里记，快路在这里记）。
+	 * 端口号在 usable() 里刚判过；ports[] 只在 probe 里写一次、没有 remove
+	 * 路径，所以直接取同一个 netdev，不再走一次 running/carrier 判定——帧已经
+	 * 发出去了，统计必须落在拍板时那个出口上。
+	 */
+	nd = READ_ONCE(adapter->ports[flow->egress_id]);
+	dev_dstats_tx_add(nd, pkt->len);
+	return 0;
+}
+
+static const struct zx_ffe_egress_ops zx_ffe_egress_ops[] = {
+	{
+		.name		= "switch-port",
+		.type		= ZX_FFE_EGRESS_SWITCH,
+		.usable		= zx_ffe_egress_switch_usable,
+		.submit		= zx_ffe_egress_switch_submit,
+	},
+};
+
+/*
+ * 出口类型 → egress op。未注册的类型返回 NULL：调用方一律回栈（不猜，
+ * design §1 硬规则 3）。
+ */
+static const struct zx_ffe_egress_ops *zx_ffe_egress_lookup(u8 type)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(zx_ffe_egress_ops); i++)
+		if (zx_ffe_egress_ops[i].type == type)
+			return &zx_ffe_egress_ops[i];
+	return NULL;
+}
+
+/*
  * 两族共用的提交段（P4 的硬要求：v4/v6 只走这一份，别复制两份）：
  *
- *   查表 → #13' 本机目的地的延迟判定 → 出口现判 → 同口/NAT 字段/帧长/出口 MTU →
- *   取 tx_lock → 查容量 → 改写 → clean（池可缓存时）→ 提交 → 条目记账 → 解锁
+ *   查表 → #13' 本机目的地的延迟判定 → 出口现判（egress op）→ 同口/NAT 字段/
+ *   帧长/出口 MTU → 取 tx_lock → 查容量 → 改写 → clean（池可缓存时）→
+ *   提交（egress op）→ 条目记账 → 解锁
  *
  * 顺序本身就是不变量（P2-TASK §1）：容量检查必须在改写之前（"回栈"只对没改过
  * 的帧成立），又必须在 tx_lock 里（查完到提交之间不能有别人把环填满：
@@ -1803,26 +1886,33 @@ static void zx_ffe_rewrite(u8 *frame, const struct zx_ffe_flow *flow, int family
  * 端口映射/NAT 回程的 pre-NAT daddr 就是盒子自己的 WAN IP，只有"该条目带
  * DNAT 改写"时这帧才该被转发出去。
  *
- * 返回 ZX_FFE_V_FWD 表示已提交并记完账（/proc/net/dev 的 rx/tx 也在里面补），
- * 其余裁决交回 zx_ffe_rx() 统一计数。
+ * 出口只通过 flow->egress_type + flow->egress_id 决定（P6）：这里不出现"交换机
+ * 端口"的概念，能不能发问 egress op 的 usable()，发出去靠 submit()。
+ *
+ * 返回 ZX_FFE_V_FWD 表示已提交并记完账（/proc/net/dev 的 rx/tx 也在里面补，
+ * tx 那一半在 egress op 的 submit() 里），其余裁决交回 complete() 统一计数。
  */
 static enum zx_ffe_verdict
 zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
-	       u8 *frame, u16 bp, u16 len, int rx_port, int family,
+	       struct zx_ffe_pkt *pkt, int rx_port,
 	       const struct zx_ffe_key *key, u32 pkt_len, bool daddr_local)
 {
 	struct zx_accel *accel = &adapter->accel;
+	const struct zx_ffe_egress_ops *eops;
 	struct zx_ffe_flow *flow;
-	struct net_device *nd_out;
+	struct zx_ffe_pkt *pkts[1];
 	unsigned int clean;
-	u32 eport;
+	u8 *frame = pkt->data;
+	u16 len = pkt->len;
+	u16 bp = (u16)(uintptr_t)pkt->token;	/* switch-port 的 token 就是 RX 的 bp */
+	int family = pkt->family;
 
 	/* #13 查表（自己持 RCU 只读段：条目由 kfree_rcu 释放）。
 	 * 没命中就是普通 miss（P5 修订二起本机目的地在未命中时也算 miss，不再记
 	 * drop_local——这时候它和别的 miss 没有区别，且回栈的决定与 daddr 无关）。
 	 */
 	rcu_read_lock();
-	flow = rhashtable_lookup(&accel->flows, key, zx_ffe_ht_params);
+	flow = zx_ffe_lookup(accel, key);
 	if (!flow) {
 		rcu_read_unlock();
 		return ZX_FFE_V_MISS;
@@ -1846,21 +1936,21 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 		rcu_read_unlock();
 		return ZX_FFE_V_DROP_LOCAL;
 	}
-	/* #14 出口端口现查现判：不存在/down 都回栈。
+	/* #14 出口现查现判（P6 起走 egress op）：类型没注册、或注册了但现在的
+	 * 条件不满足（交换机口：不存在/down/carrier off），都回栈，不猜。
 	 *
-	 * 条目里的 eport 只可能是 0..ZX_NUM_PORTS-1（ffe_add 与旁路学习都按
-	 * zx_eth_is_port() 复核过），所以**桥/无线出口在条目里不存在**：无线帧
-	 * 永远回栈走 mac80211（队列/聚合/功率控制），见 zx_ffe_learn_hook()
-	 * 头的"覆盖范围"。
+	 * 条目里的 egress_type/egress_id 只可能是数据面认识的组合（ffe_add 与
+	 * 旁路学习都按 zx_eth_is_port() 复核过），所以**桥/无线出口在条目里不
+	 * 存在**：无线帧永远回栈走 mac80211（队列/聚合/功率控制），见
+	 * zx_ffe_learn_hook() 头的"覆盖范围"。
 	 */
-	eport = flow->eport;
-	nd_out = zx_ffe_eport_dev(adapter, eport);
-	if (!nd_out) {
+	eops = zx_ffe_egress_lookup(flow->egress_type);
+	if (!eops || !eops->usable(adapter, flow->egress_id)) {
 		rcu_read_unlock();
 		return ZX_FFE_V_DROP_NOPORT;
 	}
 	/* #15 同口进出：不做 hairpin */
-	if ((int)eport == rx_port) {
+	if ((int)flow->egress_id == rx_port) {
 		rcu_read_unlock();
 		return ZX_FFE_V_FALLBACK;
 	}
@@ -1942,16 +2032,15 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 					   (u32)bp * ZX_BUF_SIZE,
 					   clean, DMA_TO_DEVICE);
 	/*
-	 * 提交。tx_lock 在手里、容量刚查过，所以 zx_tx_submit_bp() 不可能返回
-	 * false。真出现（代码/内存被改坏）就按"丢帧"处理：帧已经改过，绝不能
-	 * 回栈；槽位也没交给硬件，所以 bp 由调用方还给 BMU（返回 DROPPED）。
+	 * 提交（n == 1：批量接口现在还只喂一帧，见 design §5 第 1 条）。tx_lock 在
+	 * 手里、容量刚查过，所以 submit() 不可能失败。真出现（代码/内存被改坏）
+	 * 就按"丢帧"处理：帧已经改过，绝不能回栈；槽位也没交给硬件，所以 bp 由
+	 * 调用方还给 BMU（返回 DROPPED）。
 	 */
-	if (!zx_tx_submit_bp(adapter, eport, bp, len)) {
+	pkts[0] = pkt;
+	if (eops->submit(adapter, pkts, 1, flow)) {
 		spin_unlock_bh(&adapter->tx_lock);
 		rcu_read_unlock();
-		dev_warn_ratelimited(adapter->dev,
-			"ffe: TX ring full right after the capacity check (pending=%u), dropping a rewritten frame for eport %u\n",
-			adapter->tx_pending, eport);
 		return ZX_FFE_V_RX_DROP;
 	}
 
@@ -1967,20 +2056,19 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	 * 栈）、在 zx_eth_xmit() 里给出口 netdev 记 tx。快路两边都不经过，但
 	 * /proc/net/dev 必须还是"从 lanX 进、从 lanY 出"（设计 §7 P2 的验收就是
 	 * 看两个端口的计数照涨、而 IpOutForwDatagrams 不涨）。
+	 *
+	 * 出口那一半（dev_dstats_tx_add）在 egress op 的 submit() 里——它才知道
+	 * 出口是谁；这里只管入口。
 	 */
 	dev_dstats_rx_add(nd_in, len);
-	dev_dstats_tx_add(nd_out, len);
 	return ZX_FFE_V_FWD;
 }
 
+/* ---- ingress op：switch-port（RX 环 → BP） --------------------------- */
+
 /*
- * 加速分发点的入口（zx_eth_rx() 调用）：判定 + 真转发。
- *
- * 判据链全部通过以后，把**同一个 bp** 写进发送描述符交给硬件，帧不再进
- * zc/skb/协议栈（P2-TASK §0）。返回值告诉调用方怎么收尾（enum
- * zx_ffe_rx_result）：STACK = 帧一个字节都没动、照原路径走；FORWARDED = 已交给
- * 发送硬件、只做 RX 收尾且**不许还 bp**；DROPPED = 快路里确定丢了、收尾时把 bp
- * 还回 BMU。
+ * 交换机入口（ingress）op 的判据段：入参适配 + 判据链 + 提交。返回裁决，
+ * 计数与"调用方该怎么收尾"交给 complete()。
  *
  * 结构（P4 起按 family 分派，两族共用同一段提交逻辑）：
  *
@@ -1990,32 +2078,28 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
  *     ——各自的判据顺序详见这两个函数的头注释。v4 的判据段只把
  *     "目的地址属本机"算成 daddr_local，裁决在提交段里（#13'）。
  *   提交段（#13-#19 + 改写/提交/记账，两族共用）：zx_ffe_forward()
- *   计数段（只有这一份）：把裁决换算成 cnt[family] 的字段
  *
- * 计数口径（设计 §1.5 / P1-TASK §1）：lookup == hit + miss 恒成立；hit 只统计
- * 真正转发出去的帧（P2 起 hit == fwd）；csum_err/ttl_err/drop_local/
- * drop_noport/fallback/fallback_qfull/rx_drop 都是 miss 的子集，用来区分是哪
- * 条判据把它挡回去的。v6 没有头校验和，所以 csum_err 在 v6 上恒为 0；
- * ttl_err 对 v6 是 hop_limit 到期。drop_local 从 P5 修订二起是"命中条目但该
- * 条目没有 DNAT 改写"（v4）与本机终结（v6、非 TCP/UDP 的 v4），见
- * zx_ffe_forward() 的 #13'——仍是 miss 的子集，只是子集的定义变了。
+ * 以太类型不再由调用方传进来（P6）：switch-port 的帧就在池槽位里，
+ * data + 2*ETH_ALEN 与 zx_eth_rx() 原来看的是同一个地址、同一个值。
  */
-enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
-				int rx_port, int family, __be16 h_proto)
+static enum zx_ffe_verdict
+zx_ffe_ingress_switch_run(struct zx_eth_adapter *adapter,
+			  struct zx_ffe_pkt *pkt)
 {
 	struct zx_accel *accel = &adapter->accel;
-	u8 *frame = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE + 16;
+	u8 *frame = pkt->data;
+	u16 len = pkt->len;
+	int family = pkt->family;
+	int rx_port = (int)pkt->ingress_id;
+	struct zx_ffe_cnt *c = &accel->cnt[family];
 	struct zx_ffe_key key;
-	struct zx_ffe_cnt *c;
 	struct net_device *nd_in;
 	enum zx_ffe_verdict v;
 	u32 pkt_len = 0;
 	bool daddr_local = false;
 	u8 dmac[ETH_ALEN];
+	__be16 h_proto;
 
-	if (family < 0 || family > 1)
-		return ZX_FFE_RX_STACK;
-	c = &accel->cnt[family];
 	c->lookup++;
 
 	dma_rmb();
@@ -2041,6 +2125,9 @@ enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 	if (len < 64)
 		goto plain_miss;
 
+	/* 与 zx_eth_rx() 原来传给这里的 h_proto 同址同值（帧的第 12 字节） */
+	h_proto = *(__be16 *)(frame + 2 * ETH_ALEN);
+
 	/*
 	 * daddr_local 只由 v4 链填写（v6 在 #10 就按本机目的地回栈了，走不到
 	 * 这里），初值 false 保证 v6 与"v4 非本机"两条路完全一致。
@@ -2051,16 +2138,46 @@ enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 	else
 		v = zx_ffe_v6_check(accel, frame, len, h_proto, &key, &pkt_len);
 
-	if (v == ZX_FFE_V_OK)
-		v = zx_ffe_forward(adapter, nd_in, frame, bp, len, rx_port,
-				   family, &key, pkt_len, daddr_local);
+	if (v == ZX_FFE_V_OK) {
+		/* 判据已过、尚未提交（design §5 第 3 条两段式提交的预留位） */
+		pkt->prepared = 1;
+		v = zx_ffe_forward(adapter, nd_in, pkt, rx_port, &key, pkt_len,
+				   daddr_local);
+	}
+	return v;
+
+plain_miss:
+	return ZX_FFE_V_MISS;
+}
+
+/*
+ * 交换机入口（ingress）op 的收尾：裁决 → cnt[family] 的字段 → 调用方要的
+ * RX 结果。原 zx_ffe_rx() 末尾的"统一出口"整段搬到这里，两族口径仍然只有
+ * 这一份。
+ *
+ * 计数口径（设计 §1.5 / P1-TASK §1）：lookup == hit + miss 恒成立；hit 只统计
+ * 真正转发出去的帧（P2 起 hit == fwd）；csum_err/ttl_err/drop_local/
+ * drop_noport/fallback/fallback_qfull/rx_drop 都是 miss 的子集，用来区分是哪
+ * 条判据把它挡回去的。v6 没有头校验和，所以 csum_err 在 v6 上恒为 0；
+ * ttl_err 对 v6 是 hop_limit 到期。drop_local 从 P5 修订二起是"命中条目但该
+ * 条目没有 DNAT 改写"（v4）与本机终结（v6、非 TCP/UDP 的 v4），见
+ * zx_ffe_forward() 的 #13'——仍是 miss 的子集，只是子集的定义变了。
+ *
+ * bp/描述符不在这里动：switch-port 的 RX 收尾（消耗描述符、DROPPED 时把 bp
+ * 还给 BMU）仍由 zx_eth_rx() 按返回值做（见 zx279128s-main.c 的 ffe_done）。
+ */
+static enum zx_ffe_rx_result
+zx_ffe_ingress_switch_complete(struct zx_eth_adapter *adapter,
+			       struct zx_ffe_pkt *pkt, enum zx_ffe_verdict v)
+{
+	struct zx_ffe_cnt *c = &adapter->accel.cnt[pkt->family];
 
 	/* 统一出口：裁决 → 计数 → 返回值（两族口径只有这一份） */
 	switch (v) {
 	case ZX_FFE_V_FWD:
 		c->hit++;
 		c->fwd++;
-		c->bytes += len;
+		c->bytes += pkt->len;
 		return ZX_FFE_RX_FORWARDED;
 	case ZX_FFE_V_RX_DROP:
 		c->rx_drop++;
@@ -2091,10 +2208,59 @@ enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 	}
 	c->miss++;
 	return v == ZX_FFE_V_RX_DROP ? ZX_FFE_RX_DROPPED : ZX_FFE_RX_STACK;
+}
 
-plain_miss:
-	c->miss++;
-	return ZX_FFE_RX_STACK;
+/*
+ * ingress 注册表（design/extensibility.md §1）：现在只有 switch-port 一项，
+ * accel->ingress 指向它（zx_accel_init）。WiFi 接入时往这里加一项
+ * { .name = "wifi-rx", .run = ..., .complete = ... } 就够了：判据链、流表、
+ * 老化、学习全部复用，数据面不用改。
+ */
+static const struct zx_ffe_ingress_ops zx_ffe_ingress_ops[] = {
+	{
+		.name		= "switch-port",
+		.run		= zx_ffe_ingress_switch_run,
+		.complete	= zx_ffe_ingress_switch_complete,
+	},
+};
+
+/*
+ * 加速分发点的入口（zx_eth_rx() 调用）：P6 起只做入参适配，剩下的交给 ingress
+ * op（design/extensibility.md §1）。
+ *
+ * 判据链全部通过以后，把**同一个 bp** 写进发送描述符交给硬件，帧不再进
+ * zc/skb/协议栈（P2-TASK §0）。返回值告诉调用方怎么收尾（enum
+ * zx_ffe_rx_result）：STACK = 帧一个字节都没动、照原路径走；FORWARDED = 已交给
+ * 发送硬件、只做 RX 收尾且**不许还 bp**；DROPPED = 快路里确定丢了、收尾时把 bp
+ * 还回 BMU。
+ *
+ * 包描述符（struct zx_ffe_pkt）是入口无关的那一层：data/len/family 在这里填，
+ * ingress_id/token 留给 ingress op（switch-port 的 token 就是 bp）。以太类型
+ * 也不在这里解析——ingress op 从帧里自己读。
+ */
+enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
+				int rx_port, int family)
+{
+	struct zx_accel *accel = &adapter->accel;
+	const struct zx_ffe_ingress_ops *ops;
+	struct zx_ffe_pkt pkt;
+	enum zx_ffe_verdict v;
+
+	if (family < 0 || family > 1)
+		return ZX_FFE_RX_STACK;
+	ops = READ_ONCE(accel->ingress);
+	if (!ops)	/* 数据面在 probe 之后才跑；NULL 只防御，回栈不崩 */
+		return ZX_FFE_RX_STACK;
+
+	pkt.data = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE + 16;
+	pkt.len = len;
+	pkt.ingress_id = (u16)rx_port;
+	pkt.family = (u8)family;
+	pkt.prepared = 0;
+	pkt.token = (void *)(uintptr_t)bp;
+
+	v = ops->run(adapter, &pkt);
+	return ops->complete(adapter, &pkt, v);
 }
 
 /*
@@ -2421,6 +2587,8 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	int ret;
 
 	mutex_init(&accel->lock);
+	/* 数据面的 ingress 分派（P6 分层）：现在只有 switch-port 一项 */
+	accel->ingress = zx_ffe_ingress_ops;
 	accel->v4_mode = ZX_ACC_STACK;
 	accel->v6_mode = ZX_ACC_STACK;
 	accel->zc_mask = 0;
@@ -3040,7 +3208,8 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 	/* h_source 在 add 时快照，P2 改写不再每包读 dev_addr（6 字节会撕裂） */
 	ether_addr_copy(flow->dmac, dmac);
 	ether_addr_copy(flow->smac, nd->dev_addr);
-	flow->eport = eport;
+	flow->egress_type = ZX_FFE_EGRESS_SWITCH;
+	flow->egress_id = eport;
 	/*
 	 * 出口 MTU 也在 add 时快照：数据面判断据 #18（超 MTU 回栈让栈去分片/发
 	 * ICMP(6)），每包读 nd->mtu 没有意义且要多一次跨 cache 访问。语义是
@@ -3319,7 +3488,7 @@ static int zx_accel_flows_show(struct seq_file *s, void *data)
 					&flow->key.v6[sizeof(struct in6_addr)],
 				   ntohs(flow->key.sport), ntohs(flow->key.dport),
 				   flow->key.proto, flow->key.ipport,
-				   flow->key.vid, flow->eport, flow->dmac,
+				   flow->key.vid, flow->egress_id, flow->dmac,
 				   flow->hits, flow->bytes,
 				   jiffies_to_msecs(jiffies - flow->lastuse),
 				   (flow->flags & ZX_FFE_FLOW_STATIC) ? " S" : "",
@@ -3329,7 +3498,7 @@ static int zx_accel_flows_show(struct seq_file *s, void *data)
 				   &flow->key.v4[0], &flow->key.v4[1],
 				   ntohs(flow->key.sport), ntohs(flow->key.dport),
 				   flow->key.proto, flow->key.ipport,
-				   flow->key.vid, flow->eport, flow->dmac,
+				   flow->key.vid, flow->egress_id, flow->dmac,
 				   flow->hits, flow->bytes,
 				   jiffies_to_msecs(jiffies - flow->lastuse),
 				   (flow->flags & ZX_FFE_FLOW_STATIC) ? " S" : "",

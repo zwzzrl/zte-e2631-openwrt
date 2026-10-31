@@ -1947,16 +1947,16 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			if (fam >= 0) {
 				if (zx_accel_cur_mode(&adapter->accel, fam) ==
 				    ZX_ACC_FFE)
-					ffe = zx_ffe_rx(adapter, bp, len, port, fam,
-							h_proto);
+					ffe = zx_ffe_rx(adapter, bp, len,
+							port, fam);
 			} else {
 				int nfam = zx_accel_cur_mode(&adapter->accel, 0) ==
 					   ZX_ACC_FFE ? 0 : 1;
 
 				if (zx_accel_cur_mode(&adapter->accel, nfam) ==
 				    ZX_ACC_FFE)
-					ffe = zx_ffe_rx(adapter, bp, len, port, nfam,
-							h_proto);
+					ffe = zx_ffe_rx(adapter, bp, len,
+							port, nfam);
 			}
 			if (ffe != ZX_FFE_RX_STACK)
 				goto ffe_done;

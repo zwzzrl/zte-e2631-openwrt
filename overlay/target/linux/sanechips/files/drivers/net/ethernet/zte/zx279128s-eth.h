@@ -341,6 +341,34 @@ struct zx_ffe_cnt {
 };
 
 /*
+ * 快路的包描述符（P6 分层，design/extensibility.md §1.1）：**入口无关**的最小
+ * 集，由 ingress op 填、判据链只读，不认识"帧从哪来、到哪去"。
+ *
+ *   data/len  线性帧（含以太头），与 P2 起一样直接在池槽位里改，不做任何拷贝；
+ *   ingress_id  ingress op 自用：switch-port 是 RX 描述符里的交换机端口号
+ *             （ports[] 下标，即 DT reg），将来 wifi-rx 是接口索引；
+ *   token     ingress op 自用：现在 = RX 的 bp（RX 环描述符持有它，发送由
+ *             zx_tx_submit_bp() 接手，不引入第二条 bp 生命周期），将来
+ *             wifi-rx 是 struct sk_buff *；
+ *   prepared  判据已完成、尚未提交（"先判据、后批量提交"两段式预留，
+ *             现在只置位不读，恒为 0 或 1）。
+ */
+struct zx_ffe_pkt {
+	u8		*data;		/* 线性帧起点（以太头） */
+	u16		len;
+	u16		ingress_id;	/* ingress op 自用：交换机端口号（将来 wifi 接口索引） */
+	u8		family;		/* 0=v4, 1=v6 */
+	u8		prepared;	/* 判据已完成、尚未提交（两段式提交预留） */
+	void		*token;		/* ingress op 自用：现在 = RX 的 bp */
+};
+
+/* 入口/出口 op（定义在文件末尾，要等 enum zx_ffe_rx_result 与 zx_ffe_pkt 就位） */
+struct zx_ffe_ingress_ops;
+struct zx_ffe_egress_ops;
+/* 流表条目（只有 zx279128s-accel.c 碰它） */
+struct zx_ffe_flow;
+
+/*
  * 旁路学习的每 CPU 候选环（P5-TASK §1.4）：结构体定义在
  * zx279128s-accel.c（只有那个文件读写它），这里只需要一个 percpu 指针。
  */
@@ -368,6 +396,13 @@ struct zx_accel {
 	 */
 	struct list_head	flow_list;
 	u32			n_flows;	/* flow_list 的条目数（持 lock） */
+	/*
+	 * 数据面的 ingress 分派表（P6 分层，design/extensibility.md §1）：
+	 * 现在只有 switch-port 一项（zx279128s-accel.c 的 zx_ffe_ingress_ops[]），
+	 * probe 时 zx_accel_init() 指向它。WiFi 接入只需要往那张表里加一项，
+	 * RX 入口（zx_ffe_rx）与判据链都不用改。
+	 */
+	const struct zx_ffe_ingress_ops *ingress;
 	/*
 	 * ffe_migrate 最近一次快照到的 PPE 绑定条数（P3 的 hw→ffe 迁移桥是
 	 * 最小可用版：只统计与打印，不落表，见 zx279128s-accel.c 的
@@ -730,9 +765,73 @@ enum zx_ffe_rx_result {
  * 值做（收尾对账见 zx279128s-main.c 的 ffe_done 标签）。
  *
  * P4 起按 family 分派判据链（v4/v6 各一条），提交段只有一份。
+ * P6 起这一层只剩"建包描述符 + 调 ingress op"（design/extensibility.md §1）：
+ * 判据链、改写、提交在 ingress->run()，裁决→计数/RX 结果在 ingress->complete()。
+ * 帧的以太类型不再由这里转交（ingress op 自己从 data + 2*ETH_ALEN 读，同一个值）。
  */
 enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
-				int rx_port, int family, __be16 h_proto);
+				int rx_port, int family);
+
+/*
+ * 判据链的裁决（P6 起由 ingress op 的 run() 返回）。两条链（v4/v6）只报告
+ * "这一帧该被怎么处理"，所有计数集中在 ingress op 的 complete() 出口做一次
+ * ——两族的口径只有一份，不会出现"v6 的 miss 忘了加上某个子集"这种对不上的账。
+ *
+ * 比 enum zx_ffe_rx_result 细一档是必要的：RX 结果只有三态，而计数要区分是
+ * 哪条判据把人挡回去的（csum_err / ttl_err / drop_local / drop_noport /
+ * fallback / qfull / rx_drop 都是 miss 的子集）。
+ */
+enum zx_ffe_verdict {
+	ZX_FFE_V_OK = 0,	/* 判据链全部通过，可以查表/提交 */
+	ZX_FFE_V_FWD,		/* 已改写并提交给发送硬件（只有 forward 返回它） */
+	ZX_FFE_V_MISS,		/* 普通 miss：某条判据不符或查表未命中 */
+	ZX_FFE_V_CSUM_ERR,	/* 只有 v4：IPv4 头校验和错 */
+	ZX_FFE_V_TTL_ERR,	/* TTL/hop_limit <= 1：由栈回 ICMP(6) Time Exceeded */
+	ZX_FFE_V_DROP_LOCAL,	/* 目的地址属本机：v6 #10 一律终结；v4 只在"命中条目
+				 * 但该条目没有 DNAT 改写"或非 TCP/UDP 的 ICMP 上
+				 * 报（P5 修订二 §B 的延迟判定）
+				 */
+	ZX_FFE_V_DROP_NOPORT,	/* 出口端口不存在 / !running / !carrier */
+	ZX_FFE_V_FALLBACK,	/* 命中但按判据回栈（同口/NAT 缺字段/帧长/出口 MTU） */
+	ZX_FFE_V_QFULL,		/* 命中但发送环满：回栈让 qdisc 背压 */
+	ZX_FFE_V_RX_DROP,	/* 已改写但提交失败，只能丢帧（不可达） */
+};
+
+/*
+ * 入口（ingress）op（design/extensibility.md §1.1）：**谁把帧交进来**。
+ *   run()      入参适配 + 判据链 + 改写 + 提交，返回裁决；
+ *   complete() 收尾：裁决 → cnt[family] 的字段 → 调用方要的 RX 结果。switch-port
+ *              的 bp/描述符仍由调用方（zx_eth_rx）持有，complete() 不碰它；
+ *              将来 wifi-rx 的"消费描述符 / 释放 skb"就在这一层做。
+ *
+ * 现在只注册 switch-port 一项（zx279128s-accel.c 的 zx_ffe_ingress_ops[]），
+ * accel->ingress 指向它。WiFi 接入时加一项即可：判据链、流表、老化、学习全部复用。
+ */
+struct zx_ffe_ingress_ops {
+	const char *name;
+	enum zx_ffe_verdict (*run)(struct zx_eth_adapter *adapter,
+				   struct zx_ffe_pkt *pkt);
+	enum zx_ffe_rx_result (*complete)(struct zx_eth_adapter *adapter,
+					  struct zx_ffe_pkt *pkt,
+					  enum zx_ffe_verdict verdict);
+};
+
+/*
+ * 出口（egress）op（design/extensibility.md §1.1/§5 第 1 条）：**谁把帧发出去**。
+ * 流表条目只记 type + id，提交按 type 分派；未注册的类型一律回栈（不猜）。
+ *   usable()  这个出口现在能不能发（交换机口 = 存在 + running + carrier）；
+ *   submit()  按批提交（现在恒 n == 1，见 §5 第 1 条）。调用者已经持 tx_lock、把帧
+ *             改写完，并做过容量检查；返回非 0 = 这一帧已经改过、但提交不
+ *             出去，只能丢（调用方返回 DROPPED，把 bp 还给 BMU）。
+ */
+struct zx_ffe_egress_ops {
+	const char *name;
+	u8	type;
+	bool	(*usable)(struct zx_eth_adapter *adapter, u16 id);
+	int	(*submit)(struct zx_eth_adapter *adapter,
+			  struct zx_ffe_pkt **pkts, int n,
+			  struct zx_ffe_flow *flow);
+};
 /* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, ffe_aging,
  * ffe_migrate, ffe_learn, accel_autofallback
  */
