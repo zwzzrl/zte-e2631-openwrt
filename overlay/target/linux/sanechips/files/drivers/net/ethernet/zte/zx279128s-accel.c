@@ -1222,8 +1222,10 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
  * 投递只做 memcpy + 环写，所有分配/邻居查询都在 work 里。
  *
  * ctinfo 方向（P5 修订二 §A 改成两侧都学）：conntrack 给两个方向的 tuple，与
- * 包的方向无关，方向只看 ctinfo 的 IP_CT_IS_REPLY 位（CTINFO2DIR() 就是这么
- * 定义的，include/uapi/linux/netfilter/nf_conntrack_tuple_common.h:44）：
+ * 包的方向无关，方向只看 ctinfo 落在枚举的哪一侧：CTINFO2DIR(ctinfo) 判的是
+ * `ctinfo >= IP_CT_IS_REPLY`（定义见
+ * include/uapi/linux/netfilter/nf_conntrack_tuple_common.h:44；**不是位与**，
+ * 理由见本函数 #11 的注释）：
  *
  *   ORIGINAL 侧：键 = ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple（pre-NAT），
  *               输出 = ip_hdr(skb) + L4 端口（post-NAT）。这就是 P5 的行为。
@@ -1378,13 +1380,23 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	 * （net/netfilter/nf_conntrack_core.c:1981 就是这么判的），所以 ct 为
 	 * NULL；下面那条 ctinfo 判据纯属防御（枚举本身是给用户态兼容留的）。
 	 * 只学已 confirm 的连接：首包在 confirm 之前，本来也不该学。
+	 *
+	 * 方向判据必须用内核的 CTINFO2DIR()（定义见
+	 * include/uapi/linux/netfilter/nf_conntrack_tuple_common.h:44，经
+	 * include/net/netfilter/nf_conntrack_tuple.h 引入）——它比的是 **>=**，
+	 * 不是位与：IP_CT_ESTABLISHED=0 / RELATED=1 / NEW=2 / IS_REPLY=3，且
+	 * *_REPLY = 基值 + 3。P7 上机前这里写成 `ctinfo & IP_CT_IS_REPLY`，于是
+	 * NEW(2)、RELATED(1) 被当成回程方向、RELATED_REPLY(4) 被当成原始方向：
+	 * 新 UDP 流的首包（NEW）学出来的是"键 = tuple[REPLY]、输出 = 原始方向
+	 * 的报头"，回程帧命中这条错条目后被 #15 同口保护打回栈，回程条目 hits
+	 * 恒 0（-R 反向只有 58.9 Mbit/s）。
 	 */
 	ct = nf_ct_get(skb, &ctinfo);
 	if (!ct || ctinfo == IP_CT_UNTRACKED)
 		return NF_ACCEPT;
 	if (!nf_ct_is_confirmed(ct) || nf_ct_is_dying(ct))
 		return NF_ACCEPT;
-	dir = (ctinfo & IP_CT_IS_REPLY) ? IP_CT_DIR_REPLY : IP_CT_DIR_ORIGINAL;
+	dir = CTINFO2DIR(ctinfo);
 	ot = &ct->tuplehash[dir].tuple;
 	if (ot->src.l3num != AF_INET || ot->dst.protonum != iph->protocol)
 		return NF_ACCEPT;
