@@ -2883,6 +2883,9 @@ static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 	/* hw→ffe 迁移桥（P3）：写 1 取 PPE 快照，读回统计与样例 cookie */
 	debugfs_create_file("ffe_migrate", 0644, dir, adapter,
 			    &zx_accel_migrate_fops);
+	/* 旁路学习（P5）：读回开关与计数，写 0/1 开关（默认 0） */
+	debugfs_create_file("ffe_learn", 0644, dir, adapter,
+			    &zx_accel_learn_fops);
 	debugfs_create_file("accel_autofallback", 0644, dir, adapter,
 			    &zx_accel_autofallback_fops);
 }

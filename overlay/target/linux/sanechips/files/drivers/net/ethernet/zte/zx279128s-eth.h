@@ -15,6 +15,7 @@
 #include <linux/if_ether.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
+#include <linux/netfilter.h>
 #include <linux/notifier.h>
 #include <linux/phylink.h>
 #include <linux/rhashtable.h>
@@ -324,6 +325,12 @@ struct zx_ffe_cnt {
 	u32	qlen_peak;	/* 快路占用 TX 环的峰值 */
 };
 
+/*
+ * 旁路学习的每 CPU 候选环（P5-TASK §1.4）：结构体定义在
+ * zx279128s-accel.c（只有那个文件读写它），这里只需要一个 percpu 指针。
+ */
+struct zx_ffe_learn_ring;
+
 struct zx_accel {
 	u8			v4_mode;	/* enum zx_accel_mode */
 	u8			v6_mode;	/* enum zx_accel_mode */
@@ -354,6 +361,22 @@ struct zx_accel {
 	 */
 	u32			mig_ppe_flows;
 	u64			tbl_full;	/* 表满（1024）拒绝的 add 次数 */
+	/*
+	 * 旁路学习（P5-TASK §1）：POST_ROUTING 钩子只看不抓帧，把"可学的流"
+	 * 写进每 CPU 的无锁环（learn_rings），由 age work 每秒排空、查邻居、
+	 * 落表。开关默认关（learn_on = 0）：不开时钩子第一行就返回，零副作用。
+	 *
+	 * learn_cand/add/dup/drop/noneigh 五个计数全是"尽力而为"的裸 u64++：
+	 * 钩子在软中断里跑、可能并发，丢几个计数不影响语义（与 cnt[] 同一口径）。
+	 */
+	struct zx_ffe_learn_ring __percpu	*learn_rings;
+	struct nf_hook_ops	learn_hook;	/* pf=IPv4, POST_ROUTING, NF_IP_PRI_LAST */
+	u8			learn_on;	/* debugfs ffe_learn：0/1，默认 0 */
+	u64			learn_cand;	/* 钩子看到的候选（含被丢的） */
+	u64			learn_add;	/* 真正插进表的学习条目 */
+	u64			learn_dup;	/* 同 key 已存在：只刷新 dmac/MTU/lastuse */
+	u64			learn_drop;	/* 环满丢掉的候选（绝不阻塞数据面） */
+	u64			learn_noneigh;	/* 候选拿不到下一跳 MAC */
 	struct zx_ffe_cnt	cnt[2];
 	/*
 	 * 本机地址集合，只服务于判据 #2（目的 MAC）、#13（目的 IPv4）与 v6 判据
@@ -675,7 +698,7 @@ enum zx_ffe_rx_result {
 enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 				int rx_port, int family, __be16 h_proto);
 /* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, ffe_aging,
- * ffe_migrate, accel_autofallback
+ * ffe_migrate, ffe_learn, accel_autofallback
  */
 extern const struct file_operations zx_accel_v4_fops;
 extern const struct file_operations zx_accel_v6_fops;
@@ -685,6 +708,7 @@ extern const struct file_operations zx_accel_del_fops;
 extern const struct file_operations zx_accel_flush_fops;
 extern const struct file_operations zx_accel_aging_fops;
 extern const struct file_operations zx_accel_migrate_fops;
+extern const struct file_operations zx_accel_learn_fops;
 extern const struct file_operations zx_accel_autofallback_fops;
 
 /* zx279128s-switch.c */

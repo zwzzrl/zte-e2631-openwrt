@@ -38,6 +38,14 @@
  * 只统计 PPE 已绑定条数并打印样例，不落表（原因见 zx_accel_migrate_store()
  * 的头注释）。
  *
+ * P5 加**旁路学习**：在 NF_INET_POST_ROUTING（NF_IP_PRI_LAST，NAT 之后）挂一个
+ * NFPROTO_IPV4 钩子，把"本机转发出去、目的不是本机、TCP/UDP"的流从 conntrack
+ * 的 ORIGINAL 元组（pre-NAT，就是快路键）与当前报头（post-NAT，就是要写回的
+ * 地址/端口）拼成一条候选，写进**每 CPU 的无锁环**；age work 每秒排空一次，
+ * 查邻居 MAC、按 ffe_add 的等价路径落表。钩子恒返回 NF_ACCEPT、只做 memcpy +
+ * 环写，任何分配都留在 work 里——学习失败不影响转发。开关是 debugfs
+ * `ffe_learn`（默认 0），计数也在那里。
+ *
  * 锁与顺序约定（很重要）：
  *   - accel->lock 串行化模式切换。持有它时**可以**调 zx_zc_set()；
  *     zx_zc_set() 自己会 rtnl_lock()，所以本文件在调它之前不得先持 rtnl。
@@ -51,6 +59,7 @@
  * 只包含 linux/byteorder/generic.h 会缺 __cpu_to_le16 那些底层宏。
  */
 #include <linux/types.h>
+#include <asm/barrier.h>
 #include <asm/byteorder.h>
 #include <asm/checksum.h>
 #include <linux/debugfs.h>
@@ -61,6 +70,7 @@
 #include <linux/etherdevice.h>
 #include <linux/hex.h>
 #include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <linux/in.h>
 #include <linux/inet.h>
 #include <linux/inetdevice.h>
@@ -77,7 +87,10 @@
 #include <linux/module.h>
 #include <linux/net_namespace.h>
 #include <linux/netdevice.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
 #include <linux/notifier.h>
+#include <linux/percpu.h>
 #include <linux/rcupdate.h>
 #include <linux/rhashtable.h>
 #include <linux/rtnetlink.h>
@@ -89,9 +102,13 @@
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <net/addrconf.h>
+#include <net/arp.h>
 #include <net/checksum.h>
 #include <net/if_inet6.h>
 #include <net/ip.h>
+#include <net/neighbour.h>
+#include <net/netfilter/nf_conntrack.h>
+#include <net/route.h>
 
 #include "zx279128s-eth.h"
 /* ffe_migrate 要读 adapter->ppe_flows 的条目（struct zx_ppe_entry/cookie） */
@@ -163,6 +180,12 @@ struct zx_ffe_key {
 #define ZX_FFE_FLOW_NAT_S	BIT(1)
 #define ZX_FFE_FLOW_NAT_D	BIT(2)
 #define ZX_FFE_FLOW_NAT_MASK	(ZX_FFE_FLOW_NAT_S | ZX_FFE_FLOW_NAT_D)
+/*
+ * 条目是旁路学习（P5）插进来的，不是 ffe_add 下发的。两位互斥地描述来源：
+ * 静态条目老化、命中、改写的规则与学习条目完全一样（P5-TASK §1.5），
+ * 区别只在 ffe_flows 行尾打 `L` 而不是 `S`，方便上机时一眼看出这条是谁加的。
+ */
+#define ZX_FFE_FLOW_LEARNED	BIT(3)
 
 struct zx_ffe_flow {
 	struct rhash_head	node;
@@ -199,6 +222,41 @@ struct zx_ffe_nat {
 	__be32			daddr_out;
 	__be16			sport_out;
 	__be16			dport_out;
+};
+
+/* ---- 旁路学习（P5-TASK §1）：每 CPU 候选环 -------------------------- */
+
+/*
+ * 一条候选就是"钩子看到的一条可学的流"，字段已经拆成 pre-NAT（键）与
+ * post-NAT（改写目标）两套，work 里只剩查邻居 + 落表两件事。
+ * 钩子里不许分配：这个结构必须是 POD，只 memcpy。
+ */
+struct zx_ffe_learn_cand {
+	__be32	saddr;		/* pre-NAT：conntrack ORIGINAL 元组 */
+	__be32	daddr;
+	__be16	sport;
+	__be16	dport;
+	__be32	saddr_out;	/* post-NAT：ip_hdr(skb) 与 L4 端口 */
+	__be32	daddr_out;
+	__be16	sport_out;
+	__be16	dport_out;
+	u8	proto;
+	u8	eport;		/* 出口端口（DT reg 编号，与 ffe_add 的 eport 同一套） */
+	u8	nat;		/* ZX_FFE_FLOW_NAT_S / _D */
+	u8	pad;
+};
+
+/*
+ * 每 CPU 一个环：head 只有本 CPU 的钩子写（smp_store_release 发布，槽位填完
+ * 才可见），tail 只有 age work 的 drain 写，所以数据面**无锁、无原子指令**。
+ * 环满只丢候选（learn_drop++），绝不阻塞转发——学习失败不影响数据面。
+ */
+#define ZX_FFE_LEARN_RING	256	/* 必须是 2 的幂（下标用 & 取模） */
+
+struct zx_ffe_learn_ring {
+	u32			head;
+	u32			tail;
+	struct zx_ffe_learn_cand cand[ZX_FFE_LEARN_RING];
 };
 
 /*
@@ -357,6 +415,29 @@ static u32 __zx_ffe_flush(struct zx_eth_adapter *adapter, int family)
 		n++;
 	}
 	return n;
+}
+
+/*
+ * 把一个已经填好字段的条目挂进表（rhashtable + flow_list 同时加）。
+ * 调用者持 accel->lock，并且已经做过容量检查；失败时条目没进任何结构，
+ * 由调用者 kfree。
+ *
+ * P5 把这段从 ffe_add 里抽出来给旁路学习复用（P5-TASK §2 的接口要求）：
+ * 静态条目与学习条目在表里的存在形式必须一模一样，差别只在 flags。
+ */
+static int __zx_ffe_insert(struct zx_eth_adapter *adapter,
+			   struct zx_ffe_flow *flow)
+{
+	struct zx_accel *accel = &adapter->accel;
+	int ret;
+
+	ret = rhashtable_insert_fast(&accel->flows, &flow->node,
+				     zx_ffe_ht_params);
+	if (ret)
+		return ret;
+	list_add_rcu(&flow->list, &accel->flow_list);
+	accel->n_flows++;
+	return 0;
 }
 
 /* ---- 本机地址集合（判据 #2 / #13 / v6 链 #10）---------------------- */
@@ -704,6 +785,339 @@ static void zx_ffe_age(struct zx_eth_adapter *adapter)
 		__zx_ffe_flow_del(adapter, flow);
 	}
 	mutex_unlock(&accel->lock);
+}
+
+/* ---- 旁路学习：POST_ROUTING 钩子 → 每 CPU 环 → age work 落表 -------- */
+
+/*
+ * 下一跳 MAC。先在出口 dev 上按**目的地址**查 ARP 邻居；查不到说明这个目的
+ * 不直连，要用出口 dev 做一次路由查询、拿网关地址再查一次。只在 work 里调
+ * （进程上下文，可以睡眠），钩子里一步都不能碰。
+ *
+ * neigh_lookup() 不创建邻居（那是 __neigh_lookup/neigh_create 的事）：邻居表
+ * 是转发路径自己填的，我们只是抄。拿不到 = 不学，绝不为了学习去触发 ARP。
+ * n->ha 由 ha_lock（seqlock）保护，读侧用 read_seqbegin/retry 复制，
+ * nud_state 必须落在 NUD_VALID 里，否则 ha 还是全 0（INCOMPLETE）。
+ */
+static bool zx_ffe_learn_neigh(struct net_device *out, __be32 daddr, u8 *dmac)
+{
+	struct neighbour *n;
+	unsigned int seq;
+	bool ok = false;
+
+	n = neigh_lookup(&arp_tbl, &daddr, out);
+	if (!n)
+		return false;
+	if (READ_ONCE(n->nud_state) & NUD_VALID) {
+		do {
+			seq = read_seqbegin(&n->ha_lock);
+			memcpy(dmac, n->ha, ETH_ALEN);
+		} while (read_seqretry(&n->ha_lock, seq));
+		ok = !is_zero_ether_addr(dmac);
+	}
+	neigh_release(n);
+	return ok;
+}
+
+/*
+ * 一条候选的下一跳：直连目的先查，查不到再按出口 dev 查路由取网关。
+ * flowi4_oif 钉住出口，保证拿到的是"这一帧真会走的那条路由"的网关。
+ */
+static bool zx_ffe_learn_mac(struct net_device *out, __be32 daddr, u8 *dmac)
+{
+	struct flowi4 fl4;
+	struct rtable *rt;
+	__be32 nh;
+
+	if (zx_ffe_learn_neigh(out, daddr, dmac))
+		return true;
+
+	memset(&fl4, 0, sizeof(fl4));
+	fl4.daddr = daddr;
+	fl4.flowi4_oif = out->ifindex;
+	rt = ip_route_output_key(dev_net(out), &fl4);
+	if (IS_ERR(rt))
+		return false;
+	nh = rt->rt_gw4;
+	ip_rt_put(rt);
+	if (!nh || nh == daddr)
+		return false;
+	return zx_ffe_learn_neigh(out, nh, dmac);
+}
+
+/*
+ * 一条候选落表（P5-TASK §1.4）：与 ffe_add 走同一个 __zx_ffe_insert，区别只在
+ * 字段来源——键来自 pre-NAT 元组、出口/NAT 来自 post-NAT 报头、dmac 来自上面
+ * 的邻居查询。
+ *
+ * 已存在（同 key）：只刷新 dmac/MTU/lastuse 并计 learn_dup，**不碰** flags 与
+ * NAT 字段——静态条目的 NAT 语义是用户下发的，学习不能悄悄改它。dmac 的更新
+ * 没有加锁：数据面可能在同一条目上读到一个撕裂的 6 字节 MAC，代价是那一帧发
+ * 到错 MAC 被交换机丢掉（不是发错内容）；邻居 MAC 变化本身极罕见，接受。
+ */
+static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
+			     const struct zx_ffe_learn_cand *cand)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_flow *flow;
+	struct net_device *out;
+	struct zx_ffe_key key;
+	__be32 nh;
+	u8 dmac[ETH_ALEN];
+	int ret;
+
+	out = READ_ONCE(adapter->ports[cand->eport]);
+	if (!out || !netif_running(out))
+		return;
+	/* DNAT 之后的目的地址才是链路上的目标；SNAT 不动目的地址 */
+	nh = (cand->nat & ZX_FFE_FLOW_NAT_D) ? cand->daddr_out : cand->daddr;
+	if (!zx_ffe_learn_mac(out, nh, dmac)) {
+		accel->learn_noneigh++;
+		return;
+	}
+
+	memset(&key, 0, sizeof(key));
+	key.v4[0] = cand->saddr;
+	key.v4[1] = cand->daddr;
+	key.sport = cand->sport;
+	key.dport = cand->dport;
+	key.proto = cand->proto;
+	key.family = 4;
+	/*
+	 * ipport/vid 保持 0：数据面 zx_ffe_v4_check() 建键时只填 v4/sport/dport/
+	 * proto/family（memset 之后），键按字节比较，填别的值这条永远不命中。
+	 */
+
+	mutex_lock(&accel->lock);
+	rcu_read_lock();
+	flow = rhashtable_lookup(&accel->flows, &key, zx_ffe_ht_params);
+	rcu_read_unlock();
+	if (flow) {
+		ether_addr_copy(flow->dmac, dmac);
+		flow->mtu = min_t(u32, out->mtu, 0xffff);
+		flow->lastuse = jiffies;
+		accel->learn_dup++;
+		mutex_unlock(&accel->lock);
+		return;
+	}
+	/* 表满不驱逐（与 ffe_add 同一条规矩）：记 tbl_full，等老化腾位置 */
+	if (accel->n_flows >= ZX_FFE_FLOWS_MAX) {
+		accel->tbl_full++;
+		mutex_unlock(&accel->lock);
+		return;
+	}
+	flow = kzalloc(sizeof(*flow), GFP_KERNEL);
+	if (!flow) {
+		mutex_unlock(&accel->lock);
+		return;
+	}
+	flow->key = key;
+	ether_addr_copy(flow->dmac, dmac);
+	ether_addr_copy(flow->smac, out->dev_addr);
+	flow->eport = cand->eport;
+	flow->mtu = min_t(u32, out->mtu, 0xffff);
+	flow->flags = ZX_FFE_FLOW_LEARNED |
+		      (cand->nat & ZX_FFE_FLOW_NAT_MASK);
+	flow->saddr_out = cand->saddr_out;
+	flow->daddr_out = cand->daddr_out;
+	flow->sport_out = cand->sport_out;
+	flow->dport_out = cand->dport_out;
+	flow->lastuse = jiffies;
+	ret = __zx_ffe_insert(adapter, flow);
+	if (ret) {
+		kfree(flow);
+		mutex_unlock(&accel->lock);
+		return;
+	}
+	accel->learn_add++;
+	mutex_unlock(&accel->lock);
+}
+
+/*
+ * 学习钩子（P5-TASK §1.1/§1.2）：NFPROTO_IPV4 + POST_ROUTING + NF_IP_PRI_LAST，
+ * 也就是 NAT（nf_nat 的 POST_ROUTING 在 NF_IP_PRI_NAT_SRC=100）之后，所以
+ * `ip_hdr(skb)` 里已经是 NAT 后的地址；pre-NAT 的元组只能从 conntrack 取。
+ *
+ * 语义：**只旁听，不做任何决定**，恒返回 NF_ACCEPT。过滤不通过就直接返回，
+ * 投递只做 memcpy + 环写，所有分配/邻居查询都在 work 里。
+ *
+ * ctinfo 方向：conntrack 给两个方向的 tuple，与包的方向无关；这里只处理
+ * ctinfo < IP_CT_IS_REPLY（= 0/1/2，ORIGINAL 方向）的包，REPLY 方向的包跳过。
+ * 也就是说**一条连接只学它自己的原始方向**（回程是另一条"方向"，本版不学，
+ * 也不合成反向条目，见 P5-TASK §2 与报告里的说明）。
+ *
+ * 为什么在钩子里能看到 confirmed：本驱动是 builtin（probe 早于 conntrack 模块
+ * 加载），而 nf_hook_entries_grow() 对同优先级是"后注册的排前面"，ipv4_confirm
+ * 也是 INT_MAX 且注册更晚，所以它先跑、这里的 IPS_CONFIRMED 已经置位。
+ */
+static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
+				      const struct nf_hook_state *state)
+{
+	struct zx_eth_adapter *adapter = priv;
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_learn_ring *ring;
+	struct zx_ffe_learn_cand *cand;
+	const struct nf_conntrack_tuple *ot;
+	enum ip_conntrack_info ctinfo;
+	const struct iphdr *iph;
+	struct nf_conn *ct;
+	__be16 ports[2];
+	u32 head;
+	int eport = -1;
+	int iiport = -1;
+	int i;
+
+	/* 开关关掉时第一行就返回：零副作用（P5-TASK §1.8） */
+	if (!READ_ONCE(accel->learn_on))
+		return NF_ACCEPT;
+	/* #1 只处理裸 IPv4（本钩子只挂在 NFPROTO_IPV4 上，这条是防御） */
+	if (skb->protocol != htons(ETH_P_IP))
+		return NF_ACCEPT;
+	/* #2 转发帧的目的 MAC 是本机，pkt_type 必须是 PACKET_HOST */
+	if (skb->pkt_type != PACKET_HOST)
+		return NF_ACCEPT;
+	/* #3 GSO 大包不进快路（数据面判据 #17 只接受 <=1514 的帧） */
+	if (skb_is_gso(skb))
+		return NF_ACCEPT;
+	/*
+	 * 头部必须已经在线性区里。钩子严格不分配：不用 pskb_may_pull()（它可能
+	 * 为了拉平分片数据而分配新 head），也不动 skb 的任何字段。转发的帧在
+	 * POST_ROUTING 一定已经拉平过 IP 头，所以这条判据只在畸形/极端情况下命中。
+	 */
+	if (skb_headlen(skb) < sizeof(*iph))
+		return NF_ACCEPT;
+	iph = ip_hdr(skb);
+	/* #4 版本/IHL：带 IPv4 选项的帧数据面也不收（判据 #5 要求 ihl==5） */
+	if (iph->version != 4 || iph->ihl != 5)
+		return NF_ACCEPT;
+	/* #5 分片：数据面不重组（判据 #7） */
+	if (iph->frag_off & htons(IP_MF | IP_OFFSET))
+		return NF_ACCEPT;
+	/* #6 只学 TCP/UDP */
+	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
+		return NF_ACCEPT;
+	if (skb_headlen(skb) < iph->ihl * 4 + (unsigned int)sizeof(ports))
+		return NF_ACCEPT;
+
+	/*
+	 * #7 出口必须是本驱动的交换机口。ports[] 只在 probe 里写一次，READ_ONCE
+	 * 足够；桥/ppp/无线口的 eport 与 dmac 对不上，一律不学。
+	 * #8 入口：skb->skb_iif 是收包口的 ifindex（桥接只改 skb->dev，不改它），
+	 * 必须能对上 ports[]；#9 同口进出不学（数据面判据 #15 会回栈）。
+	 */
+	if (!state->out || !zx_eth_is_port(state->out))
+		return NF_ACCEPT;
+	for (i = 0; i < ZX_NUM_PORTS; i++) {
+		struct net_device *nd = READ_ONCE(adapter->ports[i]);
+
+		if (!nd)
+			continue;
+		if (nd == state->out)
+			eport = i;
+		if (nd->ifindex == skb->skb_iif)
+			iiport = i;
+	}
+	if (eport < 0 || iiport < 0 || eport == iiport)
+		return NF_ACCEPT;
+	/* #10 目的地址属本机：本机终结，回栈（判据 #13） */
+	if (zx_ffe_is_local_ip(accel, iph->daddr))
+		return NF_ACCEPT;
+
+	/*
+	 * #11 conntrack：ctinfo >= IP_CT_IS_REPLY(3) 是 REPLY 方向（含
+	 * IP_CT_UNTRACKED=7），跳过；只学已 confirm 的连接（首包在 confirm
+	 * 之前，本来也不该学）。
+	 */
+	ct = nf_ct_get(skb, &ctinfo);
+	if (!ct || ctinfo >= IP_CT_IS_REPLY)
+		return NF_ACCEPT;
+	if (!nf_ct_is_confirmed(ct) || nf_ct_is_dying(ct))
+		return NF_ACCEPT;
+	/* 原始元组（pre-NAT）：源/目的地址 + proto 都取 conntrack 的 */
+	ot = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
+	if (ot->src.l3num != AF_INET || ot->dst.protonum != iph->protocol)
+		return NF_ACCEPT;
+
+	/*
+	 * post-NAT 的 L4 端口：TCP/UDP 头的前 4 字节（线性区已由上面的
+	 * skb_headlen() 判据保证），memcpy 出来，不动 skb。
+	 */
+	memcpy(ports, (const u8 *)iph + iph->ihl * 4, sizeof(ports));
+
+	/*
+	 * 投递：本 CPU 的环。get_cpu_ptr() 关抢占，保证整个"填槽位 + 发布 head"
+	 * 不会被迁移打断；环满（head - tail == 容量）就丢候选，绝不等待。
+	 */
+	ring = get_cpu_ptr(accel->learn_rings);
+	head = READ_ONCE(ring->head);
+	if (head - READ_ONCE(ring->tail) >= ZX_FFE_LEARN_RING) {
+		accel->learn_drop++;
+		put_cpu_ptr(accel->learn_rings);
+		return NF_ACCEPT;
+	}
+	cand = &ring->cand[head & (ZX_FFE_LEARN_RING - 1)];
+	cand->saddr = ot->src.u3.ip;
+	cand->daddr = ot->dst.u3.ip;
+	/* TCP/UDP 时 union 的第一个成员 all 就是端口（同一偏移） */
+	cand->sport = ot->src.u.all;
+	cand->dport = ot->dst.u.all;
+	cand->saddr_out = iph->saddr;
+	cand->daddr_out = iph->daddr;
+	cand->sport_out = ports[0];
+	cand->dport_out = ports[1];
+	cand->proto = iph->protocol;
+	cand->eport = eport;
+	cand->nat = 0;
+	cand->pad = 0;
+	/* NAT 位：pre 与 post 不一致就是这一维被 NAT 改写（纯路由流两位都不置） */
+	if (cand->saddr != cand->saddr_out || cand->sport != cand->sport_out)
+		cand->nat |= ZX_FFE_FLOW_NAT_S;
+	if (cand->daddr != cand->daddr_out || cand->dport != cand->dport_out)
+		cand->nat |= ZX_FFE_FLOW_NAT_D;
+	smp_store_release(&ring->head, head + 1);
+	/* 裸 ++：并发下可能丢几个计数，不影响语义（同 cnt[] 的口径） */
+	accel->learn_cand++;
+	put_cpu_ptr(accel->learn_rings);
+	return NF_ACCEPT;
+}
+
+/*
+ * 排空每 CPU 的环（age work 的 1 s 节拍里调，进程上下文）。
+ * 一次最多处理一个环的容量：环是"尽力而为"的，剩下的下一拍继续，绝不让
+ * 单个 work 占着 CPU 太久。
+ *
+ * 开关关掉时只把环清空、不落表：否则 `echo 0 > ffe_learn` 之后环里剩的
+ * 候选还会在下一拍进表（P5-TASK §1.8 "新流不再进表"）。
+ */
+static void zx_ffe_learn_drain(struct zx_eth_adapter *adapter)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_learn_ring *ring;
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		u32 head, tail, n = 0;
+
+		ring = per_cpu_ptr(accel->learn_rings, cpu);
+		head = smp_load_acquire(&ring->head);
+		tail = READ_ONCE(ring->tail);
+		if (!READ_ONCE(accel->learn_on)) {
+			WRITE_ONCE(ring->tail, head);
+			continue;
+		}
+		while (tail != head && n++ < ZX_FFE_LEARN_RING) {
+			struct zx_ffe_learn_cand cand;
+
+			/*
+			 * 先复制再推进 tail：处理期间生产侧仍在写同一个环，
+			 * 槽位随时可能被覆盖；候选允许丢，但不许读半个。
+			 */
+			memcpy(&cand, &ring->cand[tail & (ZX_FFE_LEARN_RING - 1)],
+			       sizeof(cand));
+			WRITE_ONCE(ring->tail, ++tail);
+			zx_ffe_learn_one(adapter, &cand);
+		}
+	}
 }
 
 /*
@@ -1558,13 +1972,15 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
 	return degraded;
 }
 
-/* 每秒一拍：流表老化 + 自动降级判据（设计 §4.1 / §9-4）。 */
+/* 每秒一拍：流表老化 + 自动降级判据（设计 §4.1 / §9-4）+ 学习环排空（P5）。 */
 static void zx_accel_age_work(struct work_struct *work)
 {
 	struct zx_eth_adapter *adapter =
 		container_of(to_delayed_work(work), struct zx_eth_adapter,
 			     accel.age);
 
+	/* 先落表再老化：新学的条目不该在同一个节拍里被老化的时间边界伤到 */
+	zx_ffe_learn_drain(adapter);
 	zx_ffe_age(adapter);
 	zx_accel_autofallback(adapter);
 	schedule_delayed_work(&adapter->accel.age,
@@ -1591,6 +2007,13 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->n_flows = 0;
 	accel->mig_ppe_flows = 0;
 	accel->tbl_full = 0;
+	accel->learn_rings = NULL;
+	accel->learn_on = 0;
+	accel->learn_cand = 0;
+	accel->learn_add = 0;
+	accel->learn_dup = 0;
+	accel->learn_drop = 0;
+	accel->learn_noneigh = 0;
 	accel->ffe_last[0] = 0;
 	INIT_LIST_HEAD(&accel->flow_list);
 	INIT_LIST_HEAD(&accel->local_mac_list);
@@ -1657,9 +2080,44 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 		goto err_inetaddr;
 	}
 
+	/*
+	 * 旁路学习的三件套（P5）：每 CPU 候选环 + POST_ROUTING 钩子。
+	 * 环必须在注册钩子之前就位（钩子第一件事就是取 this_cpu 环）；钩子注册
+	 * 失败按 init 失败处理——没有学习能力时驱动其余部分照常可用，但这里
+	 * 选择整体回滚，避免"看起来在跑、其实学不到"的半状态。
+	 */
+	accel->learn_rings = alloc_percpu(struct zx_ffe_learn_ring);
+	if (!accel->learn_rings) {
+		dev_err(adapter->dev, "accel: alloc_percpu(learn) failed\n");
+		ret = -ENOMEM;
+		goto err_inet6;
+	}
+	/* hook_ops_type 等其余字段必须为零（NF_HOOK_OP_UNDEFINED） */
+	memset(&accel->learn_hook, 0, sizeof(accel->learn_hook));
+	accel->learn_hook.hook = zx_ffe_learn_hook;
+	accel->learn_hook.pf = NFPROTO_IPV4;
+	accel->learn_hook.hooknum = NF_INET_POST_ROUTING;
+	/*
+	 * NF_IP_PRI_LAST == INT_MAX：在 nf_nat 的 NAT_SRC(100) 之后，也等于
+	 * conntrack confirm 的优先级（同优先级时后注册的先跑，见钩子注释）
+	 */
+	accel->learn_hook.priority = NF_IP_PRI_LAST;
+	accel->learn_hook.priv = adapter;
+	ret = nf_register_net_hook(&init_net, &accel->learn_hook);
+	if (ret) {
+		dev_err(adapter->dev,
+			"accel: nf_register_net_hook(POST_ROUTING) failed: %d\n",
+			ret);
+		free_percpu(accel->learn_rings);
+		accel->learn_rings = NULL;
+		goto err_inet6;
+	}
+
 	schedule_delayed_work(&accel->age, msecs_to_jiffies(ZX_FFE_TICK_MS));
 	return 0;
 
+err_inet6:
+	unregister_inet6addr_notifier(&accel->inet6addr_nb);
 err_inetaddr:
 	unregister_inetaddr_notifier(&accel->inetaddr_nb);
 err_netdev:
@@ -1677,8 +2135,8 @@ err_flows:
 
 /*
  * 收摊：先停两个 work（老化会动流表，端口清表 work 会取 accel->lock），再摘
- * 通知链，最后按条目释放三张表。本驱动是 builtin、正常没有 rmmod，但 probe
- * 失败与将来加 remove 都必须走这里，不能漏。
+ * 通知链与 netfilter 钩子，最后按条目释放三张表。本驱动是 builtin、正常没有
+ * rmmod，但 probe 失败与将来加 remove 都必须走这里，不能漏。
  */
 void zx_accel_exit(struct zx_eth_adapter *adapter)
 {
@@ -1689,6 +2147,18 @@ void zx_accel_exit(struct zx_eth_adapter *adapter)
 	unregister_inet6addr_notifier(&accel->inet6addr_nb);
 	unregister_inetaddr_notifier(&accel->inetaddr_nb);
 	unregister_netdevice_notifier(&accel->netdev_nb);
+	if (accel->learn_rings) {
+		nf_unregister_net_hook(&init_net, &accel->learn_hook);
+		/*
+		 * nf_unregister_net_hook() 只是把旧 hook 数组交给 call_rcu，
+		 * 并不保证此刻没有钩子正在别的 CPU 上跑；环是 free_percpu
+		 * 释放的，所以必须自己等一个 RCU 宽限期（钩子都在
+		 * rcu_read_lock 里执行）。
+		 */
+		synchronize_rcu();
+		free_percpu(accel->learn_rings);
+		accel->learn_rings = NULL;
+	}
 	rhashtable_free_and_destroy(&accel->flows, zx_ffe_free_flow, NULL);
 	rhashtable_free_and_destroy(&accel->local_macs, zx_ffe_free_lmac, NULL);
 	rhashtable_free_and_destroy(&accel->local_ips, zx_ffe_free_lip, NULL);
@@ -2149,8 +2619,7 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 	flow->sport_out = nat.sport_out;
 	flow->dport_out = nat.dport_out;
 	flow->lastuse = jiffies;
-	ret = rhashtable_insert_fast(&accel->flows, &flow->node,
-				     zx_ffe_ht_params);
+	ret = __zx_ffe_insert(adapter, flow);
 	if (ret) {
 		kfree(flow);
 		snprintf(accel->ffe_last, sizeof(accel->ffe_last),
@@ -2158,8 +2627,6 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 		mutex_unlock(&accel->lock);
 		return ret;
 	}
-	list_add_rcu(&flow->list, &accel->flow_list);
-	accel->n_flows++;
 	zx_ffe_key_print(accel->ffe_last, sizeof(accel->ffe_last), "add",
 			 &key, eport, accel->n_flows);
 	zx_ffe_nat_print(accel->ffe_last, sizeof(accel->ffe_last), &nat);
@@ -2367,6 +2834,9 @@ const struct file_operations zx_accel_flush_fops = {
  * 只在对应位有效时追加；纯路由条目（P2 形态）的行一点不变，老的解析脚本
  * 不受影响。字母用 SNAT/DNAT 而不单是 S/D：末尾那个 ` S` 从 P1 起就表示
  * "静态条目"，再让 S 表示 SNAT 会读错。
+ *
+ * P5 再加一个行尾标记：` L` = 旁路学习插进来的条目（两种标记互斥，静态条目
+ * 不会被学习改写 flags）。位置在 lastuse 之后、SNAT/DNAT 之前，与 ` S` 并列。
  */
 static int zx_accel_flows_show(struct seq_file *s, void *data)
 {
@@ -2378,7 +2848,7 @@ static int zx_accel_flows_show(struct seq_file *s, void *data)
 	rcu_read_lock();
 	list_for_each_entry_rcu(flow, &accel->flow_list, list) {
 		if (flow->key.family == 6) {
-			seq_printf(s, "6 %pI6c %pI6c %u %u %u %u %u -> %u %pM %llu %llu %u%s",
+			seq_printf(s, "6 %pI6c %pI6c %u %u %u %u %u -> %u %pM %llu %llu %u%s%s",
 				   (const struct in6_addr *)&flow->key.v6[0],
 				   (const struct in6_addr *)
 					&flow->key.v6[sizeof(struct in6_addr)],
@@ -2387,16 +2857,18 @@ static int zx_accel_flows_show(struct seq_file *s, void *data)
 				   flow->key.vid, flow->eport, flow->dmac,
 				   flow->hits, flow->bytes,
 				   jiffies_to_msecs(jiffies - flow->lastuse),
-				   (flow->flags & ZX_FFE_FLOW_STATIC) ? " S" : "");
+				   (flow->flags & ZX_FFE_FLOW_STATIC) ? " S" : "",
+				   (flow->flags & ZX_FFE_FLOW_LEARNED) ? " L" : "");
 		} else {
-			seq_printf(s, "4 %pI4 %pI4 %u %u %u %u %u -> %u %pM %llu %llu %u%s",
+			seq_printf(s, "4 %pI4 %pI4 %u %u %u %u %u -> %u %pM %llu %llu %u%s%s",
 				   &flow->key.v4[0], &flow->key.v4[1],
 				   ntohs(flow->key.sport), ntohs(flow->key.dport),
 				   flow->key.proto, flow->key.ipport,
 				   flow->key.vid, flow->eport, flow->dmac,
 				   flow->hits, flow->bytes,
 				   jiffies_to_msecs(jiffies - flow->lastuse),
-				   (flow->flags & ZX_FFE_FLOW_STATIC) ? " S" : "");
+				   (flow->flags & ZX_FFE_FLOW_STATIC) ? " S" : "",
+				   (flow->flags & ZX_FFE_FLOW_LEARNED) ? " L" : "");
 			/* NAT 后的输出字段（P3）：v6 没有 NAT66，只有 v4 行会有 */
 			if (flow->flags & ZX_FFE_FLOW_NAT_S)
 				seq_printf(s, " SNAT=%pI4:%u", &flow->saddr_out,
@@ -2515,6 +2987,94 @@ const struct file_operations zx_accel_aging_fops = {
 	.open		= zx_accel_aging_open,
 	.read		= seq_read,
 	.write		= zx_accel_aging_store,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+/* ---- 旁路学习的 debugfs 入口（P5-TASK §1.6/§1.8）------------------- */
+
+/*
+ * ffe_learn：既是开关也是读数（P5-TASK §1.6 二选一里的"单独 debugfs"）。
+ *
+ * 读：
+ *   第 1 行  开关 0/1
+ *   第 2 行  cand=.. add=.. dup=.. drop=.. noneigh=.. flows=.. tbl_full=..
+ *   第 3 行  每 CPU 环的占用（还没落表的候选数，逗号分隔）
+ * 写 0/1（也认 off/on）：
+ *   0 = 不再把新流写进环（环里剩的候选在下一拍清掉），已有条目照常工作到老化；
+ *   1 = 开始学。默认 0，避免一上线就改变行为。
+ *
+ * 计数口径：learn_cand 是钩子"看到并投递"的候选数，learn_drop 是环满没投递
+ * 的（所以 cand 不含 drop），learn_noneigh 是候选在 work 里取不到下一跳 MAC
+ * 的，learn_dup 是同 key 已存在只刷新字段的，learn_add 才是真正新增的条目。
+ */
+static int zx_accel_learn_show(struct seq_file *s, void *data)
+{
+	struct zx_eth_adapter *adapter = s->private;
+	struct zx_accel *accel = &adapter->accel;
+	int cpu;
+
+	(void)data;
+	seq_printf(s, "%u\n", READ_ONCE(accel->learn_on) ? 1u : 0u);
+	seq_printf(s, "cand=%llu add=%llu dup=%llu drop=%llu noneigh=%llu flows=%u tbl_full=%llu\n",
+		   READ_ONCE(accel->learn_cand), READ_ONCE(accel->learn_add),
+		   READ_ONCE(accel->learn_dup), READ_ONCE(accel->learn_drop),
+		   READ_ONCE(accel->learn_noneigh), READ_ONCE(accel->n_flows),
+		   READ_ONCE(accel->tbl_full));
+	if (!accel->learn_rings) {
+		seq_puts(s, "ring=n/a\n");
+		return 0;
+	}
+	seq_puts(s, "ring=");
+	for_each_possible_cpu(cpu) {
+		struct zx_ffe_learn_ring *ring =
+			per_cpu_ptr(accel->learn_rings, cpu);
+
+		seq_printf(s, "%s%u", cpu ? "," : "",
+			   READ_ONCE(ring->head) - READ_ONCE(ring->tail));
+	}
+	seq_putc(s, '\n');
+	return 0;
+}
+
+static int zx_accel_learn_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_accel_learn_show, inode->i_private);
+}
+
+static ssize_t zx_accel_learn_store(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct zx_eth_adapter *adapter = s->private;
+	char buf[8];
+	char *cmd;
+
+	if (count == 0 || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = 0;
+	cmd = strim(buf);
+
+	/* 只在写的那一刻切；钩子与 work 都走 READ_ONCE 读这一个字节 */
+	if (!strcmp(cmd, "1") || !strcmp(cmd, "on"))
+		WRITE_ONCE(adapter->accel.learn_on, 1);
+	else if (!strcmp(cmd, "0") || !strcmp(cmd, "off"))
+		WRITE_ONCE(adapter->accel.learn_on, 0);
+	else
+		return -EINVAL;
+
+	dev_info(adapter->dev, "accel: ffe_learn %s\n",
+		 READ_ONCE(adapter->accel.learn_on) ? "enabled" : "disabled");
+	return count;
+}
+
+const struct file_operations zx_accel_learn_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_accel_learn_open,
+	.read		= seq_read,
+	.write		= zx_accel_learn_store,
 	.llseek		= seq_lseek,
 	.release	= single_release,
 };
