@@ -448,6 +448,12 @@ struct zx_accel {
 	 * tuple[ORIGINAL]、REPLY 取 tuple[REPLY]），所以家庭流量的下载方向
 	 * （REPLY，WAN→LAN 的 bulk）现在也能进表；依据见
 	 * zx279128s-accel.c 的 zx_ffe_learn_hook() 头注释。
+	 *
+	 * 回程方向学不到的两个阻塞（P9）：桥端口进来的帧 skb_iif 已被改写成
+	 * 桥的 ifindex，钩子的入口快路径对不上 ports[]；GRO 合并后的 bulk 回程
+	 * 是 GSO skb，旧代码一律拒绝。现在入口改成"源 MAC + 桥 ifindex → drain
+	 * 里 FDB 反查"，GSO 放开成"TCP/UDP + 无分片 + 头在线性区"。**没有新增
+	 * 计数**：入口反查失败并入 learn_nonport（口径见下）。
 	 */
 	struct zx_ffe_learn_ring __percpu	*learn_rings;
 	struct nf_hook_ops	learn_hook;	/* pf=IPv4, POST_ROUTING, NF_IP_PRI_LAST */
@@ -458,7 +464,8 @@ struct zx_accel {
 	u64			learn_drop;	/* 环满丢掉的候选（绝不阻塞数据面） */
 	u64			learn_noneigh;	/* 候选拿不到下一跳 MAC */
 	u64			learn_nobrport;	/* 桥出口解析不出本驱动端口：FDB 未命中/要泛洪/桥已不在 */
-	u64			learn_nonport;	/* FDB 命中的是无线口等非本驱动端口（如 phy0-ap0） */
+	u64			learn_nonport;	/* 命中的不是本驱动交换机口：出口 FDB 命中无线口等（P5），
+						 * 以及 P9 起**入口**桥的源 MAC 反查失败/命中无线口 */
 	u64			learn_dedup;	/* 1 s 内同一五元组的重复候选，未再投递 */
 	/*
 	 * ffe_add 命中同 key 的次数（P5 修订二 §C 的幂等化）：这次 add 走的是

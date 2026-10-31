@@ -69,6 +69,27 @@
  *      flags 合并/lastuse）并返回成功，不再 -EEXIST、不再产生重复行；学习
  *      路径的"已存在就刷新"与它共用 __zx_ffe_store()。见该函数的注释。
  *
+ * P9（回程方向学习修复，**数据面零改动**）：P7 上机确认"回程方向永远学不到"
+ * 是学习这一侧的两处阻塞，不是数据面问题（手工 ffe_add 一条回程条目后
+ * hits 立刻涨到 119359/168 MB，转发完全正常）。三处改动：
+ *   1. **入口端口反查**：回程帧从桥端口（lan2/lan3）进来，桥做本地投递，
+ *      br_pass_frame_up() 把 skb->dev 换成 brdev，__netif_receive_skb_core()
+ *      再把 skb_iif 改写成 brdev->ifindex，于是钩子里"skb_iif 对得上 ports[]"
+ *      永远不成立、候选被**静默丢弃**（连计数都不涨）。现在钩子不命中时再判
+ *      一次"这一帧是不是从我们的桥端口进来的"（state->in / skb_iif 对上
+ *      某个端口的上层桥），是就记下**源 MAC + 桥 ifindex**；drain 在 rtnl 下用
+ *      br_fdb_find_port() 反查源 MAC 得到物理端口（P5.1 出口反查的同一套，
+ *      只是方向相反）。反查不到/命中无线口 → learn_nonport++、丢弃。
+ *   2. **GSO 放开**：GRO 合并后的 bulk 回程是 GSO skb（实测 7.6–18.5 KB），
+ *      旧代码在 #3 一律 return。键只取 IP 头与 L4 头，GRO 合并 skb 的这两层
+ *      头逐字段合法；现在的允许条件就是 #5/#6/#9（无分片、TCP/UDP、头在线性
+ *      区），见钩子 #6' 的注释。数据面 #17 仍然只吃 <=1514，GSO 大包永远走栈。
+ *   3. **出口兜底**：出口先看 state->out（交换机口/桥），都不是时退回
+ *      skb_dst(skb)->dev（POST_ROUTING 时路由已定）；仍然解析不出就不落表。
+ * 同口保护（数据面 #15）改用**解析后的**入口端口判：回程向入口 lan2、出口
+ * lan1，不会被误判成"进=出"。计数与 ffe_learn 的行格式一个字段都没动
+ * （learn_nonport 的口径扩到"入口解析不出交换机端口"，语义见 -eth.h）。
+ *
  * 锁与顺序约定（很重要）：
  *   - accel->lock 串行化模式切换。持有它时**可以**调 zx_zc_set()；
  *     zx_zc_set() 自己会 rtnl_lock()，所以本文件在调它之前不得先持 rtnl。
@@ -277,13 +298,18 @@ struct zx_ffe_nat {
 
 /*
  * 一条候选就是"钩子看到的一条可学的流"，字段已经拆成 pre-NAT（键）与
- * post-NAT（改写目标）两套，work 里只剩查邻居 + 落表两件事。
- * 钩子里不许分配：这个结构必须是 POD，只 memcpy。
+ * post-NAT（改写目标）两套，work 里只剩"解析入口/出口 + 查邻居 + 落表"。
+ * 钩子里不许分配：这个结构必须是 POD，只 memcpy（整结构先 memset 再赋值，
+ * 见 zx_ffe_learn_hook() 的组装段——去重是整结构 memcmp）。
  *
  * 两个方向共用这个结构（P5 修订二 §A）：**键永远是"这一方向的报文在链路上
  * 的 pre-NAT 形态"**（也就是数据面从帧头拼出来的那个键），输出永远是"同一
  * 报文 NAT 之后的形态"（也就是要写到对端的形态）。钩子按 ctinfo 的方向位挑
  * 元组，其它字段的来源不变，所以 drain 与判据链对方向一无所知。
+ *
+ * 入口（P9）：iiport 是"这一帧从哪个交换机端口进来"，只用来做同口保护
+ * （数据面 #15 的预判），不进键。快路径由钩子用 skb_iif 直接对出来；桥端口
+ * 进来的帧只有源 MAC 与桥的 ifindex，留给 drain 反查 FDB。
  */
 struct zx_ffe_learn_cand {
 	__be32	saddr;		/* pre-NAT：conntrack 该方向的元组（ORIGINAL 或 REPLY） */
@@ -297,13 +323,10 @@ struct zx_ffe_learn_cand {
 	u8	proto;
 	u8	eport;		/* 出口端口（DT reg 编号，与 ffe_add 的 eport 同一套） */
 	u8	nat;		/* ZX_FFE_FLOW_NAT_S / _D（键与输出不一致的那几维） */
-	u8	pad;
-	/*
-	 * eport == ZX_FFE_EPORT_BRIDGE 时有效：出口是桥，钩子只记桥的
-	 * ifindex（软中断里不能查 FDB，见 zx_ffe_learn_brport()），真正的
-	 * 交换机端口号由 drain 里的 FDB 反查得出。直接走交换机口时是 0。
-	 */
-	u32	br_ifindex;
+	u8	iiport;		/* 入口端口 0..4；ZX_FFE_IPORT_BRIDGE = 桥、待反查 */
+	u32	br_ifindex;	/* 出口桥 ifindex：eport == ZX_FFE_EPORT_BRIDGE 时有效 */
+	u32	in_br_ifindex;	/* 入口桥 ifindex：iiport == ZX_FFE_IPORT_BRIDGE 时有效 */
+	u8	src_mac[ETH_ALEN]; /* 入口 FDB 反查键：iiport == ZX_FFE_IPORT_BRIDGE 时有效 */
 };
 
 /*
@@ -311,6 +334,13 @@ struct zx_ffe_learn_cand {
  * 只表示"出口是桥、eport 待定"，**不**表示任何具体端口。
  */
 #define ZX_FFE_EPORT_BRIDGE	0xff
+
+/*
+ * cand->iiport 的哨兵值：入口是桥端口、物理端口号待 drain 里的 FDB 反查
+ * （P9）。与 ZX_FFE_EPORT_BRIDGE 数值相同但语义相反（那是出口、这是入口），
+ * 同一条候选里两位各管一头，互不干扰。
+ */
+#define ZX_FFE_IPORT_BRIDGE	0xff
 
 /*
  * 每 CPU 一个环：head 只有本 CPU 的钩子写（smp_store_release 发布，槽位填完
@@ -1034,7 +1064,11 @@ static bool zx_ffe_learn_mac(struct net_device *out, __be32 daddr, u8 *dmac)
 }
 
 /*
- * 桥出口 → 真正的交换机端口号（FDB 反查）。只在 drain（进程上下文）里调。
+ * 桥 + 一个 MAC → 真正的交换机端口号（FDB 反查）。只在 drain（进程上下文）
+ * 里调。**两个方向共用**：出口查**目的** MAC（P5.1：WAN→LAN 的目的主机在桥
+ * 的 FDB 里），入口查**源** MAC（P9：桥端口进来的回程帧，skb_iif 已经被改写
+ * 成桥的 ifindex，只能靠源 MAC 反查它是从哪个物理口进的）。方向由调用者
+ * 决定，函数只做"MAC → 端口"。
  *
  * 钩子在软中断里，**不能**自己查 FDB：linux-6.18.55 的
  *   struct net_device *br_fdb_find_port(const struct net_device *br_dev,
@@ -1042,16 +1076,17 @@ static bool zx_ffe_learn_mac(struct net_device *out, __be32 daddr, u8 *dmac)
  * （include/linux/if_bridge.h:177）开头就是 ASSERT_RTNL()，之后才进
  * rcu_read_lock() 查 fdb 哈希（net/bridge/br_fdb.c:235）。也就是说它虽然只
  * 做 RCU 读，但当前实现要求调用者持 rtnl——软中断里拿 rtnl 等于睡眠，不
- * 行。所以钩子只把桥的 ifindex 记进候选，这里补查，且 rtnl 只在这几行里。
+ * 行。所以钩子只把桥的 ifindex（+ 需要时的 MAC）记进候选，这里补查，且
+ * rtnl 只在这几行里。
  *
  * vid 用 0：OpenWrt 默认 br-lan 的 vlan_filtering=0，FDB 条目都是 vid 0；
  * 开了 VLAN filtering 的桥上多半查不到 → NOFDB，整条放弃。不猜的理由：
- * 要查对 vid 得先知道**出口** VLAN，钩子里拿不到（WAN 侧收到帧的 tag 不是
- * LAN 侧的 tag）。
+ * 要查对 vid 得先知道帧所属的 VLAN，而钩子拿不到（出口方向的 tag 由路由/
+ * 桥决定，入口方向的 vid 在 br_allowed_ingress() 里算完就丢了）。
  *
  * 返回 0..ZX_NUM_PORTS-1 是真端口；ZX_FFE_BRPORT_NOFDB = FDB 没命中（还没
- * 学到 / 这一帧本来要被泛洪）；ZX_FFE_BRPORT_NONPORT = 命中的不是本驱动
- * 交换机口（无线 phy0-ap0、macvlan 等）。
+ * 学到 / 这一帧本来要被泛洪 / 目标是桥自己的地址）；ZX_FFE_BRPORT_NONPORT =
+ * 命中的不是本驱动交换机口（无线 phy0-ap0、macvlan 等）。
  *
  * 无线口必须挡住：br_fdb_find_port() 对 phy0-ap0 照样返回非空 netdev，但那
  * 个 netdev 的 netdev_priv 不是本驱动私有结构，不存在 0..4 的 TX 队列语义；
@@ -1099,12 +1134,18 @@ static int zx_ffe_learn_brport(struct zx_eth_adapter *adapter,
  * 的邻居查询。**方向无关**：两个方向的候选在钩子里就已经归一成"键=线上 pre-NAT
  * 形态、输出=NAT 后形态"，这里不需要知道它来自连接的哪一侧。
  *
+ * 入口（P9）：桥端口进来的候选只带"源 MAC + 入口桥 ifindex"，这里在 rtnl 下
+ * 用 FDB 反查物理端口；反查不出/命中无线口 → learn_nonport++、丢弃。入口端口
+ * 不进帧键，只用于同口保护（数据面 #15 的预判）：同口进出的流数据面会回栈，
+ * 学了也用不上。
+ *
  * 出口分两种（P5 修订一）：
  *   - 钩子直接拿到交换机口：out = ports[cand->eport]，邻居按这个口查；
  *   - 钩子拿到桥（WAN→LAN 的常态）：先用**桥**查下一跳 MAC（LAN 主机的 ARP
  *     邻居挂在 br-lan 上，不在 lanX 上），再拿这个 MAC 查桥 FDB 得到真正的
  *     出口端口；smac 必须是**桥**的 dev_addr（对端 ARP 表里网关就是桥的
  *     MAC），MTU 取出口端口的。
+ *   两条路的出口都必须解析成 0..4 的真端口才落表（解析失败不猜、不落表）。
  *
  * 已存在（同 key）：交给 __zx_ffe_flow_update() 原地刷新，计 learn_dup。字段
  * 与 flags 的合并规则写在那个函数头上（NAT 位只增不减、STATIC 只增不减）；
@@ -1124,10 +1165,49 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 	__be32 nh;
 	u8 dmac[ETH_ALEN];
 	int eport = cand->eport;
+	int iiport = cand->iiport;
 	int ret;
 
 	/* DNAT 之后的目的地址才是链路上的目标；SNAT 不动目的地址 */
 	nh = (cand->nat & ZX_FFE_FLOW_NAT_D) ? cand->daddr_out : cand->daddr;
+
+	/*
+	 * 入口（P9）：快路径的 iiport 是钩子用 skb_iif 直接对出来的；桥端口
+	 * 进来的帧只有"源 MAC + 桥 ifindex"，这里在 rtnl 下反查（与出口反查
+	 * 同一个 zx_ffe_learn_brport()，只是这次查的是**源** MAC）。
+	 *
+	 * 反查不到 / 命中的不是本驱动交换机口（无线口等）→ 整条放弃并计
+	 * learn_nonport（P9 起这个计数的口径含"入口解析不出交换机端口"）：
+	 * 数据面只从交换机端口的 RX 环进来，入口不在交换机端口上的流学了也
+	 * 永远命中不了；猜一个端口只会把同口保护判错，所以宁可放弃。
+	 *
+	 * 桥被删/ifindex 被复用同样计 learn_nonport：这条候选已经没有可用的
+	 * 入口坐标，下一拍同一条流会重新生成候选。
+	 */
+	if (iiport == ZX_FFE_IPORT_BRIDGE) {
+		struct net_device *inbr;
+		int p;
+
+		inbr = dev_get_by_index(&init_net, cand->in_br_ifindex);
+		if (!inbr || !netif_is_bridge_master(inbr)) {
+			accel->learn_nonport++;
+			if (inbr)
+				dev_put(inbr);
+			return;
+		}
+		p = zx_ffe_learn_brport(adapter, inbr, cand->src_mac);
+		dev_put(inbr);
+		if (p < 0) {
+			accel->learn_nonport++;
+			return;
+		}
+		iiport = p;
+	}
+	if (iiport < 0 || iiport >= ZX_NUM_PORTS) {
+		/* 钩子只会填 0..4 或 ZX_FFE_IPORT_BRIDGE；越界说明候选坏了 */
+		accel->learn_nonport++;
+		return;
+	}
 
 	if (eport == ZX_FFE_EPORT_BRIDGE) {
 		br = dev_get_by_index(&init_net, cand->br_ifindex);
@@ -1175,6 +1255,15 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 		}
 		ether_addr_copy(smac, out->dev_addr);
 	}
+
+	/*
+	 * #15 同口进出（P9）：用**解析后的**入口端口判，而不是钩子里的
+	 * skb_iif。回程向的入口是 lan2、出口是 lan1，这里不会误判；反过来，
+	 * 从同一个交换机口进出（L3 hairpin）的帧数据面 #15 也会回栈，学了也
+	 * 用不上，直接放弃（与钩子快路径一样不计数）。
+	 */
+	if (eport == iiport)
+		return;
 
 	memset(&key, 0, sizeof(key));
 	key.v4[0] = cand->saddr;
@@ -1229,6 +1318,87 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 }
 
 /*
+ * 出口设备 → 候选的出口坐标（P9 抽出来给"state->out + skb_dst(skb)->dev"
+ * 两次判共用）。返回：
+ *   0..ZX_NUM_PORTS-1   = 本驱动交换机口，返回值就是 eport；
+ *   ZX_FFE_EPORT_BRIDGE = 桥出口，*br_ifindex 填桥的 ifindex；
+ *   -1                  = 不是我们要的出口（这条不学）。
+ *
+ * 只做指针比较与读 ifindex：调用者若在 RCU 只读段里（dst 兜底那一路），
+ * 出段之后只保留这个整数结果，不把 net_device 指针带出去。
+ */
+static int zx_ffe_learn_outport(struct zx_eth_adapter *adapter,
+				struct net_device *out, u32 *br_ifindex)
+{
+	int i;
+
+	if (!out)
+		return -1;
+	if (zx_eth_is_port(out)) {
+		for (i = 0; i < ZX_NUM_PORTS; i++)
+			if (READ_ONCE(adapter->ports[i]) == out)
+				return i;
+		return -1;
+	}
+	if (netif_is_bridge_master(out)) {
+		/*
+		 * 桥出口：钩子只记 ifindex、置哨兵，真正的端口号由 drain 里的
+		 * FDB 反查得出（br_fdb_find_port() 要 rtnl，软中断里不能查）。
+		 * CONFIG_BRIDGE=n 时这里不可能命中，属于死代码。
+		 */
+		*br_ifindex = out->ifindex;
+		return ZX_FFE_EPORT_BRIDGE;
+	}
+	return -1;
+}
+
+/*
+ * 这一帧是不是从"我们的桥端口"进来的？是就返回入口桥的 ifindex，否则 0。
+ * 只在 skb_iif 快路径对不上 ports[] 时调（软中断；可能已经在 RCU 只读段里，
+ * 这里再套一层 rcu_read_lock() 是允许的）。
+ *
+ * 为什么需要它：回程帧从 br-lan 的 lan2/lan3 进来，桥做本地投递，
+ * br_pass_frame_up() 把 skb->dev 换成 brdev，__netif_receive_skb_core() 再把
+ * skb_iif 改写成 brdev->ifindex；物理端口号在钩子里已经不可得了。
+ *
+ * 判据（两个来源任一命中即可，并且都要求该桥是 adapter->ports[] 里某个端口
+ * 的 master——不是我们的桥就不学）：
+ *   - in：POST_ROUTING 的入口设备。ip_output() 先 `indev = skb->dev`（此时
+ *     是 brdev）再 `skb->dev = dst_dev`，然后把 indev 作为 NF_HOOK 的 in
+ *     传进来（net/ipv4/ip_output.c:430-439），所以 state->in 才是入口设备；
+ *   - skb_iif：brdev->ifindex（__netif_receive_skb_core 在 skb->dev 换成
+ *     brdev 之后无条件写入）。即使某些路径没把入口设备通过 in 传进来，
+ *     这个值也对得上桥。
+ *
+ * RCU：netdev_master_upper_dev_get_rcu() 要求 RCU 只读段，返回的 master 只在
+ * 段内有效；这里只取 ifindex，不把指针带出去。
+ */
+static u32 zx_ffe_learn_inbridge(struct zx_eth_adapter *adapter,
+				 struct sk_buff *skb, struct net_device *in)
+{
+	u32 br_ifindex = 0;
+	int i;
+
+	rcu_read_lock();
+	for (i = 0; i < ZX_NUM_PORTS; i++) {
+		struct net_device *nd = READ_ONCE(adapter->ports[i]);
+		struct net_device *master;
+
+		if (!nd)
+			continue;
+		master = netdev_master_upper_dev_get_rcu(nd);
+		if (!master)
+			continue;
+		if (master == in || master->ifindex == READ_ONCE(skb->skb_iif)) {
+			br_ifindex = master->ifindex;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return br_ifindex;
+}
+
+/*
  * 学习钩子（P5-TASK §1.1/§1.2）：NFPROTO_IPV4 + POST_ROUTING + NF_IP_PRI_LAST，
  * 也就是 NAT（nf_nat 的 POST_ROUTING 在 NF_IP_PRI_NAT_SRC=100）之后，所以
  * `ip_hdr(skb)` 里已经是 NAT 后的地址；pre-NAT 的元组只能从 conntrack 取。
@@ -1279,6 +1449,27 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
  * 加载），而 nf_hook_entries_grow() 对同优先级是"后注册的排前面"，ipv4_confirm
  * 也是 INT_MAX 且注册更晚，所以它先跑、这里的 IPS_CONFIRMED 已经置位。
  *
+ * P9 入口反查（回程方向学不到的第一个阻塞）：回程帧（WAN→LAN 的 bulk、LAN
+ * 主机的回包）从 br-lan 的 lan2/lan3 进来，桥做本地投递，br_pass_frame_up()
+ * 把 skb->dev 换成 brdev，__netif_receive_skb_core() 再把 skb_iif 改写成
+ * brdev->ifindex，于是 "skb_iif 对上 ports[]" 永远不成立、候选被静默丢弃
+ * （连计数都不涨，P7 上机看到的就是 learn_cand 只 +连接数）。现在不命中时再判
+ * 一次"是不是从我们的桥端口进来的"（zx_ffe_learn_inbridge()），是就记**源
+ * MAC + 桥 ifindex**，物理端口留给 drain 里的 br_fdb_find_port() 反查。
+ *
+ * 注意：POST_ROUTING 的入口设备只能从 state->in 拿。ip_output()
+ * （net/ipv4/ip_output.c:428-444）先把 `skb->dev` 改成**出口**设备、再把原来的
+ * skb->dev 作为 NF_HOOK 的 in 传进来，所以在这个钩子里 skb->dev 是 lan1，不是
+ * br-lan（别按直觉写 skb->dev）。
+ *
+ * P9 GSO（第二个阻塞）：GRO 合并后的 bulk 回程是 GSO skb（实测 7.6–18.5 KB），
+ * 旧代码在 #3 一律 return。键只取 IP 头与 L4 头，GRO 合并 skb 的这两层头逐字段
+ * 合法；现在的允许条件就是 #5/#6/#9（无分片、TCP/UDP、头在线性区），见 #6'。
+ *
+ * 同口保护（数据面 #15）改用**解析后的**入口端口判：钩子快路径能当场判
+ * （skb_iif 对得上 ports[]），桥入口那一路只能等 drain 反查完再判——回程向
+ * 入口 lan2、出口 lan1，不会误判成"进=出"。
+ *
  * 覆盖范围（WiFi 预留，别踩）：
  *   - 本设计只加速"**从交换机端口进、从交换机端口出**"的路由帧。
  *   - **WiFi 客户端的上行流量入口是 mac80211，不经过本驱动的 RX 环**，所以
@@ -1302,10 +1493,12 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	struct nf_conn *ct;
 	__be16 ports[2];
 	u32 br_ifindex = 0;
+	u32 in_br_ifindex = 0;
 	u32 head;
 	int eport = -1;
 	int iiport = -1;
 	int i;
+	u8 src_mac[ETH_ALEN];
 
 	/* 开关关掉时第一行就返回：零副作用（P5-TASK §1.8） */
 	if (!READ_ONCE(accel->learn_on))
@@ -1316,9 +1509,18 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	/* #2 转发帧的目的 MAC 是本机，pkt_type 必须是 PACKET_HOST */
 	if (skb->pkt_type != PACKET_HOST)
 		return NF_ACCEPT;
-	/* #3 GSO 大包不进快路（数据面判据 #17 只接受 <=1514 的帧） */
-	if (skb_is_gso(skb))
-		return NF_ACCEPT;
+	/*
+	 * #3 GSO（P9 放开）：旧代码在这里就 `if (skb_is_gso(skb)) return`，把
+	 * GRO 合并后的 bulk 回程（实测 7.6–18.5 KB）整片挡住，于是"只有握手小包
+	 * 那些流"能学、"整条流的 bulk"永远学不到。键只取 IP 头与 L4 头，GRO 合并
+	 * skb 的这两层头是合法的（同一 5 元组才会被合并），不该一刀切。
+	 * 真正的边界收在 #5（无分片）、#6（TCP/UDP）、#9（头在线性区）之后，
+	 * 见 #6' 的注释。
+	 *
+	 * 数据面完全不受影响：它只吃 <=1514 的帧（#17），GSO 大包永远走栈；
+	 * 学到的条目是给这条流**后续的单帧**用的键——bulk 在驱动 RX 侧是一个个
+	 * 单帧到达的，那时 FFE 已经能命中。
+	 */
 	/*
 	 * 头部必须已经在线性区里。钩子严格不分配：不用 pskb_may_pull()（它可能
 	 * 为了拉平分片数据而分配新 head），也不动 skb 的任何字段。转发的帧在
@@ -1338,43 +1540,79 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT;
 	if (skb_headlen(skb) < iph->ihl * 4 + (unsigned int)sizeof(ports))
 		return NF_ACCEPT;
+	/*
+	 * #6' GSO 的边界（P9）：走到这里，允许 GSO 的条件已经**全部**满足——
+	 *   - #5 没有 MF/OFFSET（分片的 GSO 不学：键与端口都不完整）；
+	 *   - #6 是 TCP 或 UDP（其它协议的 GSO 在前面就拒了，行为维持原样）；
+	 *   - #9 IP 头与 L4 端口都在 skb_headlen() 里（键与输出只读这两段）。
+	 * 所以这里不再对 GSO 做额外判据：TCP/UDP + 无分片 + 头在线性区 = 可学。
+	 * 数据面 #17 仍然只接受 <=1514 的帧，GSO 大包永远回栈，互不影响。
+	 */
 
 	/*
-	 * #7 出口。本驱动的交换机口 → 直接得到 eport；桥口（br-lan，WAN→LAN
-	 * 的常态）→ 只记下桥的 ifindex、打哨兵，FDB 反查留到 drain 里做：6.18
-	 * 的 br_fdb_find_port() 要求持 rtnl（ASSERT_RTNL），软中断里拿不到。
-	 * 其它出口（ppp/无线/物理网卡）一律不学。
-	 * #8 入口：skb->skb_iif 是收包口的 ifindex（桥接只改 skb->dev，不改它），
-	 * 必须能对上 ports[]；#9 同口进出不学（数据面判据 #15 会回栈）。
+	 * #7 出口。先看 state->out：
+	 *   本驱动交换机口           → 直接得到 eport；
+	 *   桥（br-lan，WAN→LAN 常态）→ 只记桥 ifindex + 哨兵，FDB 反查留到
+	 *                               drain 里做（br_fdb_find_port() 要 rtnl，
+	 *                               软中断里拿不到）；
+	 *   其它（虚拟口/空）         → P9 兜底：POST_ROUTING 时路由已定，
+	 *                               skb_dst(skb)->dev 才是真正要发出去的设备，
+	 *                               再判一次（是交换机口/桥才要）。
+	 * 出口解析不出来就整条不学——绝不猜。
+	 *
 	 * ports[] 只在 probe 里写一次，READ_ONCE 足够。
 	 */
-	if (!state->out)
-		return NF_ACCEPT;
-	if (zx_eth_is_port(state->out)) {
-		for (i = 0; i < ZX_NUM_PORTS; i++)
-			if (READ_ONCE(adapter->ports[i]) == state->out)
-				eport = i;
+	eport = zx_ffe_learn_outport(adapter, state->out, &br_ifindex);
+	if (eport < 0) {
+		struct net_device *dst_dev = NULL;
+
+		/*
+		 * skb_dst() 可能带 SKB_DST_NOREF（转发帧的 dst 是
+		 * skb_dst_set_noref() 挂上的），读它要求 RCU；这里在锁内只做
+		 * 指针比较/取 ifindex，出锁后不再碰 dst_dev（设备随时可能被
+		 * 注销，指针不能带出 RCU 只读段）。
+		 */
+		rcu_read_lock();
+		if (skb_dst(skb))
+			dst_dev = skb_dst(skb)->dev;
+		eport = zx_ffe_learn_outport(adapter, dst_dev, &br_ifindex);
+		rcu_read_unlock();
 		if (eport < 0)
 			return NF_ACCEPT;
-	} else if (netif_is_bridge_master(state->out)) {
-		/*
-		 * CONFIG_BRIDGE=n 时不可能存在桥设备，这条分支是死代码；这里
-		 * 什么也不查，只置哨兵——桥还在不在、FDB 有没有、端口是不是
-		 * 本驱动的，全部在 drain 里判，钩子绝不猜。
-		 */
-		eport = ZX_FFE_EPORT_BRIDGE;
-		br_ifindex = state->out->ifindex;
-	} else {
-		return NF_ACCEPT;
 	}
+	/*
+	 * #8 入口。快路径：skb->skb_iif 是收包口的 ifindex，对得上 ports[] 就
+	 * 直接得到 iiport（WAN 口 lan1 不在桥里，进来的帧走这条）。
+	 *
+	 * 慢路径（P9）：回程帧从桥端口进来时 skb_iif 已经被改写成桥的 ifindex
+	 * （见函数头），这里再判"是不是从我们的桥端口进来的"。是就记源 MAC +
+	 * 桥 ifindex，真正的端口号交给 drain 的 FDB 反查（桥把源 MAC 写进 FDB
+	 * 是在 br_pass_frame_up() **之前** 做的，见 br_handle_frame_finish()，
+	 * 所以钩子看到这一帧时 FDB 里已经有它了）。不是我们的桥端口就不学。
+	 *
+	 * #8' 同口进出不学（数据面判据 #15 会回栈）：快路径能当场判；慢路径的
+	 * 入口端口在 drain 里才知道，那条判定搬到了 zx_ffe_learn_one()。
+	 */
 	for (i = 0; i < ZX_NUM_PORTS; i++) {
 		struct net_device *nd = READ_ONCE(adapter->ports[i]);
 
 		if (nd && nd->ifindex == skb->skb_iif)
 			iiport = i;
 	}
-	if (iiport < 0 || eport == iiport)
+	eth_zero_addr(src_mac);
+	if (iiport < 0) {
+		in_br_ifindex = zx_ffe_learn_inbridge(adapter, skb, state->in);
+		/*
+		 * skb_mac_header_was_set() 只是防御：这条路走到的帧都是从交换机
+		 * 端口收上来的，eth_type_trans/br_handle_frame 已经在同一个 skb
+		 * 上读过 eth_hdr(skb)->h_source。
+		 */
+		if (!in_br_ifindex || !skb_mac_header_was_set(skb))
+			return NF_ACCEPT;
+		ether_addr_copy(src_mac, eth_hdr(skb)->h_source);
+	} else if (eport == iiport) {
 		return NF_ACCEPT;
+	}
 	/*
 	 * #10 目的地址属本机（看的是 **post-NAT** 的 daddr，即这一帧真正要去的
 	 * 地址）：本机终结的流学了也没用。注意端口映射 / NAT 回程的帧，pre-NAT
@@ -1425,11 +1663,17 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	/*
 	 * 组装候选。先写本地变量、再整体 memcpy 进环：去重要拿整条候选做键，
 	 * 而且"槽位发布"必须排在所有字段写完之后（smp_store_release），本地
-	 * 副本让这两件事都简单。结构是 POD，只赋值不分配。
+	 * 副本让这两件事都简单。
+	 *
+	 * 整结构先 memset 再逐字段赋值：P9 加了 iiport/src_mac/in_br_ifindex 之后
+	 * 结构里有隐式填充，而去重是**整结构 memcmp**，读未初始化字节会让同一条
+	 * 流的两次候选比较结果不确定。结构是 POD：memset + 赋值，不分配。
 	 *
 	 * 键（cand.saddr/daddr/sport/dport）来自上面按方向挑好的元组，输出
 	 * （*_out）永远是当前报头：两个方向用的是同一条规则，没有方向特判。
+	 * 入口坐标（iiport + 桥 ifindex + 源 MAC，P9）只用于同口保护，不进键。
 	 */
+	memset(&cand, 0, sizeof(cand));
 	cand.saddr = ot->src.u3.ip;
 	cand.daddr = ot->dst.u3.ip;
 	/* TCP/UDP 时 union 的第一个成员 all 就是端口（同一偏移） */
@@ -1442,8 +1686,10 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	cand.proto = iph->protocol;
 	cand.eport = eport;
 	cand.br_ifindex = br_ifindex;
+	cand.iiport = (iiport < 0) ? ZX_FFE_IPORT_BRIDGE : (u8)iiport;
+	cand.in_br_ifindex = in_br_ifindex;
+	ether_addr_copy(cand.src_mac, src_mac);
 	cand.nat = 0;
-	cand.pad = 0;
 	/*
 	 * NAT 位：键与输出不一致 = 这一维被 NAT 改写过（纯路由流两位都不置）。
 	 * 注意对 REPLY 侧来说，"目的地址变了"就是 masquerade 的反向改写
@@ -3815,10 +4061,12 @@ const struct file_operations zx_accel_aging_fops = {
  * 计数口径：learn_cand 是钩子"看到并投递"的候选数，learn_drop 是环满没投递
  * 的（所以 cand 不含 drop），learn_noneigh 是候选在 work 里取不到下一跳 MAC
  * 的，learn_dup 是同 key 已存在、字段被并进旧条目的（P5 修订二起不只是刷新
- * dmac/MTU），learn_add 才是真正新增的条目。learn_nobrport 是桥出口在 work
- * 里解不出本驱动端口的（FDB 未命中/要泛洪/桥已不在），learn_nonport 是 FDB
- * 命中的端口不是本驱动交换机口的（无线口等），learn_dedup 是被 1 s 去重挡下
- * 的重复候选——这三种都是"主动放弃"，不是错误。
+ * dmac/MTU），learn_add 才是真正新增的条目。learn_nobrport 是**出口**桥在
+ * work 里解不出本驱动端口的（FDB 未命中/要泛洪/桥已不在），learn_nonport 是
+ * "命中的不是交换机口"这类放弃——**两个方向都算**：出口 FDB 命中无线口等
+ * （P5），以及 P9 起**入口**桥的源 MAC 反查失败/命中无线口（`非交换机口`这
+ * 条线没变，只是入口方向也归到这里）。learn_dedup 是被 1 s 去重挡下的重复
+ * 候选。这几种都是"主动放弃"，不是错误。
  *
  * add_replace 是 ffe_add 的同键替换次数（P5 修订二 §C）；它与学习无关，放在
  * 这一行只是因为 ffe_learn 是唯一常开的计数行（不做额外的 debugfs 文件）。
