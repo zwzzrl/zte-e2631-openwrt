@@ -322,7 +322,13 @@ struct zx_ffe_cnt {
 	u64	csum_err;	/* miss 的子集：IPv4 头校验和错（v6 恒 0） */
 	u64	ttl_err;	/* miss 的子集：TTL / hop_limit 到期 */
 	u64	bytes;		/* fwd 的字节数 */
-	u32	qlen_peak;	/* 快路占用 TX 环的峰值 */
+	/*
+	 * 整环（v4 与 v6 共用）占用峰值：只由 zx279128s-main.c 的
+	 * zx_tx_submit_bp() 写进 cnt[0]——那一层拿不到 family，而环本来就
+	 * 是两族共享的，按族拆没有意义。所以 cnt[1].qlen_peak 恒 0 是设计
+	 * 如此，不是漏写；debugfs 的 ffe_v6 一行也显示 cnt[0] 的值。
+	 */
+	u32	qlen_peak;
 };
 
 /*
@@ -366,8 +372,14 @@ struct zx_accel {
 	 * 写进每 CPU 的无锁环（learn_rings），由 age work 每秒排空、查邻居、
 	 * 落表。开关默认关（learn_on = 0）：不开时钩子第一行就返回，零副作用。
 	 *
-	 * learn_cand/add/dup/drop/noneigh 五个计数全是"尽力而为"的裸 u64++：
-	 * 钩子在软中断里跑、可能并发，丢几个计数不影响语义（与 cnt[] 同一口径）。
+	 * learn_cand/add/dup/drop/noneigh/nobrport/nonport/dedup 八个计数全是
+	 * "尽力而为"的裸 u64++：钩子在软中断里跑、可能并发，丢几个计数不影响
+	 * 语义（与 cnt[] 同一口径）。
+	 *
+	 * 桥出口（P5 修订一）：WAN→LAN 的出口是 br-lan 而不是 lanX，钩子只看
+	 * 到桥、拿不到交换机端口号，所以候选里带一个哨兵 + 桥的 ifindex，
+	 * FDB 反查（要 rtnl）留到 age work 的 drain 里做；解析不出本驱动端口
+	 * 就整条放弃，绝不猜（无线口也在"放弃"里，见 learn_nonport）。
 	 */
 	struct zx_ffe_learn_ring __percpu	*learn_rings;
 	struct nf_hook_ops	learn_hook;	/* pf=IPv4, POST_ROUTING, NF_IP_PRI_LAST */
@@ -377,6 +389,9 @@ struct zx_accel {
 	u64			learn_dup;	/* 同 key 已存在：只刷新 dmac/MTU/lastuse */
 	u64			learn_drop;	/* 环满丢掉的候选（绝不阻塞数据面） */
 	u64			learn_noneigh;	/* 候选拿不到下一跳 MAC */
+	u64			learn_nobrport;	/* 桥出口解析不出本驱动端口：FDB 未命中/要泛洪/桥已不在 */
+	u64			learn_nonport;	/* FDB 命中的是无线口等非本驱动端口（如 phy0-ap0） */
+	u64			learn_dedup;	/* 1 s 内同一五元组的重复候选，未再投递 */
 	struct zx_ffe_cnt	cnt[2];
 	/*
 	 * 本机地址集合，只服务于判据 #2（目的 MAC）、#13（目的 IPv4）与 v6 判据

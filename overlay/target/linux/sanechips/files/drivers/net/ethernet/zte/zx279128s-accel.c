@@ -46,6 +46,11 @@
  * 环写，任何分配都留在 work 里——学习失败不影响转发。开关是 debugfs
  * `ffe_learn`（默认 0），计数也在那里。
  *
+ * P5 修订一（桥出口）：WAN→LAN 的出口是 br-lan 而不是 lanX，钩子原来那条
+ * "出口必须是本驱动端口"把整个方向挡住了。现在钩子允许桥出口、只记桥的
+ * ifindex，FDB 反查（br_fdb_find_port()，要求持 rtnl）留到 drain 里做；查到
+ * 的端口再用 zx_eth_is_port() 复核，无线口/查不到一律放弃，绝不猜。
+ *
  * 锁与顺序约定（很重要）：
  *   - accel->lock 串行化模式切换。持有它时**可以**调 zx_zc_set()；
  *     zx_zc_set() 自己会 rtnl_lock()，所以本文件在调它之前不得先持 rtnl。
@@ -70,6 +75,7 @@
 #include <linux/etherdevice.h>
 #include <linux/hex.h>
 #include <linux/if_ether.h>
+#include <linux/if_bridge.h>
 #include <linux/if_packet.h>
 #include <linux/in.h>
 #include <linux/inet.h>
@@ -80,6 +86,7 @@
 #include <linux/ipv6.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/kconfig.h>
 #include <linux/kstrtox.h>
 #include <linux/list.h>
 #include <linux/rculist.h>
@@ -244,7 +251,19 @@ struct zx_ffe_learn_cand {
 	u8	eport;		/* 出口端口（DT reg 编号，与 ffe_add 的 eport 同一套） */
 	u8	nat;		/* ZX_FFE_FLOW_NAT_S / _D */
 	u8	pad;
+	/*
+	 * eport == ZX_FFE_EPORT_BRIDGE 时有效：出口是桥，钩子只记桥的
+	 * ifindex（软中断里不能查 FDB，见 zx_ffe_learn_brport()），真正的
+	 * 交换机端口号由 drain 里的 FDB 反查得出。直接走交换机口时是 0。
+	 */
+	u32	br_ifindex;
 };
+
+/*
+ * cand->eport 的哨兵值（ZX_NUM_PORTS 是 5，0xff 不会与真端口号冲突）。
+ * 只表示"出口是桥、eport 待定"，**不**表示任何具体端口。
+ */
+#define ZX_FFE_EPORT_BRIDGE	0xff
 
 /*
  * 每 CPU 一个环：head 只有本 CPU 的钩子写（smp_store_release 发布，槽位填完
@@ -253,11 +272,56 @@ struct zx_ffe_learn_cand {
  */
 #define ZX_FFE_LEARN_RING	256	/* 必须是 2 的幂（下标用 & 取模） */
 
+/*
+ * 投递去重：同一五元组 1 s 内只投一次（P5 修订一的可选优化）。
+ *
+ * 一条大流每秒会投上千条一模一样的候选，把每 CPU 的 256 槽环挤满
+ * （learn_drop 涨），drain 里还要做上千次重复的邻居查询/落表。数据面命中时
+ * 自己会刷新 lastuse，所以 dmac/MTU 每 1 s 刷新一次完全够用。
+ *
+ * 16 槽 × 36 B 的线性比（memcmp 整键 32 B）+ 一个 jiffies，只在**已经确认环有
+ * 空位**之后才做；不分配、不取锁，表满就覆盖最老的一格（dedup_idx 轮转）。
+ * 同一 CPU 的软中断理论上可能嵌套，最坏结果是偶尔多投/漏投一条候选；计数
+ * 本来就是"尽力而为"的口径，接受。
+ */
+#define ZX_FFE_DEDUP_SLOTS	16	/* 必须是 2 的幂（下标用 & 取模） */
+#define ZX_FFE_DEDUP_MS		1000
+
+struct zx_ffe_learn_dedup {
+	unsigned long		ts;	/* 上次投递的 jiffies */
+	struct zx_ffe_learn_cand cand;	/* 整键：同一条流的字段完全一致 */
+};
+
 struct zx_ffe_learn_ring {
 	u32			head;
 	u32			tail;
+	u32			dedup_idx;	/* 只有本 CPU 的钩子写 */
+	struct zx_ffe_learn_dedup dedup[ZX_FFE_DEDUP_SLOTS];
 	struct zx_ffe_learn_cand cand[ZX_FFE_LEARN_RING];
 };
+
+/* 1 s 内同一条流已经投过 → true（调用方计 learn_dedup 并直接返回）。 */
+static bool zx_ffe_learn_dup(struct zx_ffe_learn_ring *ring,
+			     const struct zx_ffe_learn_cand *cand)
+{
+	unsigned long now = jiffies;
+	unsigned long ttl = msecs_to_jiffies(ZX_FFE_DEDUP_MS);
+	int i;
+
+	for (i = 0; i < ZX_FFE_DEDUP_SLOTS; i++) {
+		struct zx_ffe_learn_dedup *d = &ring->dedup[i];
+
+		/* time_before() 自带 jiffies 回绕处理 */
+		if (time_before(now, d->ts + ttl) &&
+		    !memcmp(&d->cand, cand, sizeof(*cand)))
+			return true;
+	}
+	i = ring->dedup_idx & (ZX_FFE_DEDUP_SLOTS - 1);
+	ring->dedup_idx++;
+	ring->dedup[i].ts = now;
+	memcpy(&ring->dedup[i].cand, cand, sizeof(*cand));
+	return false;
+}
 
 /*
  * 本机地址集合的条目。判据 #2 查 MAC、#13 查 IPv4、v6 链的 #10 查 IPv6；dev
@@ -846,9 +910,76 @@ static bool zx_ffe_learn_mac(struct net_device *out, __be32 daddr, u8 *dmac)
 }
 
 /*
+ * 桥出口 → 真正的交换机端口号（FDB 反查）。只在 drain（进程上下文）里调。
+ *
+ * 钩子在软中断里，**不能**自己查 FDB：linux-6.18.55 的
+ *   struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ *                                       const unsigned char *addr, __u16 vid)
+ * （include/linux/if_bridge.h:177）开头就是 ASSERT_RTNL()，之后才进
+ * rcu_read_lock() 查 fdb 哈希（net/bridge/br_fdb.c:235）。也就是说它虽然只
+ * 做 RCU 读，但当前实现要求调用者持 rtnl——软中断里拿 rtnl 等于睡眠，不
+ * 行。所以钩子只把桥的 ifindex 记进候选，这里补查，且 rtnl 只在这几行里。
+ *
+ * vid 用 0：OpenWrt 默认 br-lan 的 vlan_filtering=0，FDB 条目都是 vid 0；
+ * 开了 VLAN filtering 的桥上多半查不到 → NOFDB，整条放弃。不猜的理由：
+ * 要查对 vid 得先知道**出口** VLAN，钩子里拿不到（WAN 侧收到帧的 tag 不是
+ * LAN 侧的 tag）。
+ *
+ * 返回 0..ZX_NUM_PORTS-1 是真端口；ZX_FFE_BRPORT_NOFDB = FDB 没命中（还没
+ * 学到 / 这一帧本来要被泛洪）；ZX_FFE_BRPORT_NONPORT = 命中的不是本驱动
+ * 交换机口（无线 phy0-ap0、macvlan 等）。
+ *
+ * 无线口必须挡住：br_fdb_find_port() 对 phy0-ap0 照样返回非空 netdev，但那
+ * 个 netdev 的 netdev_priv 不是本驱动私有结构，不存在 0..4 的 TX 队列语义；
+ * 把无线 MAC 写进描述符 = 发错地方，而且绕过了 mac80211 的队列/聚合/功率
+ * 控制。zx_eth_is_port() 只比 netdev_ops 指针，对任意 netdev 都安全。
+ *
+ * CONFIG_BRIDGE=n：没有桥设备，静态退化成 NOFDB（调用方计数放弃），
+ * #else 分支不引用 br_fdb_find_port。
+ */
+#define ZX_FFE_BRPORT_NOFDB	(-1)
+#define ZX_FFE_BRPORT_NONPORT	(-2)
+
+static int zx_ffe_learn_brport(struct zx_eth_adapter *adapter,
+			       struct net_device *br, const u8 *dmac)
+{
+#if IS_ENABLED(CONFIG_BRIDGE)
+	struct net_device *port;
+	int eport = ZX_FFE_BRPORT_NOFDB;
+	int i;
+
+	rtnl_lock();
+	port = br_fdb_find_port(br, dmac, 0);
+	if (port) {
+		/* 先复核"是不是本驱动端口"，再做 ports[] 反查 */
+		eport = ZX_FFE_BRPORT_NONPORT;
+		if (zx_eth_is_port(port)) {
+			for (i = 0; i < ZX_NUM_PORTS; i++)
+				if (READ_ONCE(adapter->ports[i]) == port)
+					eport = i;
+		}
+	}
+	rtnl_unlock();
+	return eport;
+#else
+	(void)adapter;
+	(void)br;
+	(void)dmac;
+	return ZX_FFE_BRPORT_NOFDB;	/* 没编桥：桥出口不可能存在 */
+#endif
+}
+
+/*
  * 一条候选落表（P5-TASK §1.4）：与 ffe_add 走同一个 __zx_ffe_insert，区别只在
  * 字段来源——键来自 pre-NAT 元组、出口/NAT 来自 post-NAT 报头、dmac 来自上面
  * 的邻居查询。
+ *
+ * 出口分两种（P5 修订一）：
+ *   - 钩子直接拿到交换机口：out = ports[cand->eport]，邻居按这个口查；
+ *   - 钩子拿到桥（WAN→LAN 的常态）：先用**桥**查下一跳 MAC（LAN 主机的 ARP
+ *     邻居挂在 br-lan 上，不在 lanX 上），再拿这个 MAC 查桥 FDB 得到真正的
+ *     出口端口；smac 必须是**桥**的 dev_addr（对端 ARP 表里网关就是桥的
+ *     MAC），MTU 取出口端口的。
  *
  * 已存在（同 key）：只刷新 dmac/MTU/lastuse 并计 learn_dup，**不碰** flags 与
  * NAT 字段——静态条目的 NAT 语义是用户下发的，学习不能悄悄改它。dmac 的更新
@@ -860,20 +991,63 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 {
 	struct zx_accel *accel = &adapter->accel;
 	struct zx_ffe_flow *flow;
-	struct net_device *out;
+	struct net_device *out;		/* 真正的交换机出口口：决定 eport 与 MTU */
+	struct net_device *br = NULL;	/* 桥出口：决定 smac，也是 FDB 反查的入口 */
 	struct zx_ffe_key key;
+	u8 smac[ETH_ALEN];
 	__be32 nh;
 	u8 dmac[ETH_ALEN];
+	int eport = cand->eport;
 	int ret;
 
-	out = READ_ONCE(adapter->ports[cand->eport]);
-	if (!out || !netif_running(out))
-		return;
 	/* DNAT 之后的目的地址才是链路上的目标；SNAT 不动目的地址 */
 	nh = (cand->nat & ZX_FFE_FLOW_NAT_D) ? cand->daddr_out : cand->daddr;
-	if (!zx_ffe_learn_mac(out, nh, dmac)) {
-		accel->learn_noneigh++;
-		return;
+
+	if (eport == ZX_FFE_EPORT_BRIDGE) {
+		br = dev_get_by_index(&init_net, cand->br_ifindex);
+		if (!br || !netif_is_bridge_master(br)) {
+			/* 桥被删了/ifindex 被复用：本拍不学，下一拍重新判断 */
+			accel->learn_nobrport++;
+			if (br)
+				dev_put(br);
+			return;
+		}
+		if (!zx_ffe_learn_mac(br, nh, dmac)) {
+			accel->learn_noneigh++;
+			dev_put(br);
+			return;
+		}
+		eport = zx_ffe_learn_brport(adapter, br, dmac);
+		if (eport == ZX_FFE_BRPORT_NOFDB) {
+			/* FDB 没命中：还没学到或这一帧要被泛洪 → 不学，别猜 */
+			accel->learn_nobrport++;
+			dev_put(br);
+			return;
+		}
+		if (eport < 0) {
+			/* 命中的是无线口等非本驱动端口：桥→无线的帧必须回栈 */
+			accel->learn_nonport++;
+			dev_put(br);
+			return;
+		}
+		out = READ_ONCE(adapter->ports[eport]);
+		if (!out || !netif_running(out)) {
+			dev_put(br);
+			return;
+		}
+		ether_addr_copy(smac, br->dev_addr);
+		dev_put(br);
+	} else {
+		if (eport < 0 || eport >= ZX_NUM_PORTS)
+			return;
+		out = READ_ONCE(adapter->ports[eport]);
+		if (!out || !netif_running(out))
+			return;
+		if (!zx_ffe_learn_mac(out, nh, dmac)) {
+			accel->learn_noneigh++;
+			return;
+		}
+		ether_addr_copy(smac, out->dev_addr);
 	}
 
 	memset(&key, 0, sizeof(key));
@@ -913,8 +1087,10 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 	}
 	flow->key = key;
 	ether_addr_copy(flow->dmac, dmac);
-	ether_addr_copy(flow->smac, out->dev_addr);
-	flow->eport = cand->eport;
+	/* smac 是 L2 出口的地址：直接口时是那个口，桥出口时是桥的 dev_addr */
+	ether_addr_copy(flow->smac, smac);
+	/* 条目里只存交换机端口号（0..4），桥/无线出口在上面已经被挡掉 */
+	flow->eport = eport;
 	flow->mtu = min_t(u32, out->mtu, 0xffff);
 	flow->flags = ZX_FFE_FLOW_LEARNED |
 		      (cand->nat & ZX_FFE_FLOW_NAT_MASK);
@@ -949,6 +1125,15 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
  * 为什么在钩子里能看到 confirmed：本驱动是 builtin（probe 早于 conntrack 模块
  * 加载），而 nf_hook_entries_grow() 对同优先级是"后注册的排前面"，ipv4_confirm
  * 也是 INT_MAX 且注册更晚，所以它先跑、这里的 IPS_CONFIRMED 已经置位。
+ *
+ * 覆盖范围（WiFi 预留，别踩）：
+ *   - 本设计只加速"**从交换机端口进、从交换机端口出**"的路由帧。
+ *   - **WiFi 客户端的上行流量入口是 mac80211，不经过本驱动的 RX 环**，所以
+ *     本路径天然覆盖不到；要加速得另做"发送侧快路"（skb → 池 → 描述符的
+ *     直提交通道），未来的新加速模式（例如 ZX_ACC_FFE_TX）应该挂在那里。
+ *   - 桥 → 无线口（phy0-ap0 / phy1-ap0 等）的帧必须回栈：mac80211 的队列/
+ *     聚合/功率控制不能绕过。所以 FDB 命中的端口不是本驱动交换机口时，候选
+ *     直接丢弃（learn_nonport++），绝不把无线 MAC 当交换机端口写描述符。
  */
 static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 				      const struct nf_hook_state *state)
@@ -956,12 +1141,13 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	struct zx_eth_adapter *adapter = priv;
 	struct zx_accel *accel = &adapter->accel;
 	struct zx_ffe_learn_ring *ring;
-	struct zx_ffe_learn_cand *cand;
+	struct zx_ffe_learn_cand cand;
 	const struct nf_conntrack_tuple *ot;
 	enum ip_conntrack_info ctinfo;
 	const struct iphdr *iph;
 	struct nf_conn *ct;
 	__be16 ports[2];
+	u32 br_ifindex = 0;
 	u32 head;
 	int eport = -1;
 	int iiport = -1;
@@ -1000,24 +1186,40 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT;
 
 	/*
-	 * #7 出口必须是本驱动的交换机口。ports[] 只在 probe 里写一次，READ_ONCE
-	 * 足够；桥/ppp/无线口的 eport 与 dmac 对不上，一律不学。
+	 * #7 出口。本驱动的交换机口 → 直接得到 eport；桥口（br-lan，WAN→LAN
+	 * 的常态）→ 只记下桥的 ifindex、打哨兵，FDB 反查留到 drain 里做：6.18
+	 * 的 br_fdb_find_port() 要求持 rtnl（ASSERT_RTNL），软中断里拿不到。
+	 * 其它出口（ppp/无线/物理网卡）一律不学。
 	 * #8 入口：skb->skb_iif 是收包口的 ifindex（桥接只改 skb->dev，不改它），
 	 * 必须能对上 ports[]；#9 同口进出不学（数据面判据 #15 会回栈）。
+	 * ports[] 只在 probe 里写一次，READ_ONCE 足够。
 	 */
-	if (!state->out || !zx_eth_is_port(state->out))
+	if (!state->out)
 		return NF_ACCEPT;
+	if (zx_eth_is_port(state->out)) {
+		for (i = 0; i < ZX_NUM_PORTS; i++)
+			if (READ_ONCE(adapter->ports[i]) == state->out)
+				eport = i;
+		if (eport < 0)
+			return NF_ACCEPT;
+	} else if (netif_is_bridge_master(state->out)) {
+		/*
+		 * CONFIG_BRIDGE=n 时不可能存在桥设备，这条分支是死代码；这里
+		 * 什么也不查，只置哨兵——桥还在不在、FDB 有没有、端口是不是
+		 * 本驱动的，全部在 drain 里判，钩子绝不猜。
+		 */
+		eport = ZX_FFE_EPORT_BRIDGE;
+		br_ifindex = state->out->ifindex;
+	} else {
+		return NF_ACCEPT;
+	}
 	for (i = 0; i < ZX_NUM_PORTS; i++) {
 		struct net_device *nd = READ_ONCE(adapter->ports[i]);
 
-		if (!nd)
-			continue;
-		if (nd == state->out)
-			eport = i;
-		if (nd->ifindex == skb->skb_iif)
+		if (nd && nd->ifindex == skb->skb_iif)
 			iiport = i;
 	}
-	if (eport < 0 || iiport < 0 || eport == iiport)
+	if (iiport < 0 || eport == iiport)
 		return NF_ACCEPT;
 	/* #10 目的地址属本机：本机终结，回栈（判据 #13） */
 	if (zx_ffe_is_local_ip(accel, iph->daddr))
@@ -1045,6 +1247,31 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 	memcpy(ports, (const u8 *)iph + iph->ihl * 4, sizeof(ports));
 
 	/*
+	 * 组装候选。先写本地变量、再整体 memcpy 进环：去重要拿整条候选做键，
+	 * 而且"槽位发布"必须排在所有字段写完之后（smp_store_release），本地
+	 * 副本让这两件事都简单。结构是 POD，只赋值不分配。
+	 */
+	cand.saddr = ot->src.u3.ip;
+	cand.daddr = ot->dst.u3.ip;
+	/* TCP/UDP 时 union 的第一个成员 all 就是端口（同一偏移） */
+	cand.sport = ot->src.u.all;
+	cand.dport = ot->dst.u.all;
+	cand.saddr_out = iph->saddr;
+	cand.daddr_out = iph->daddr;
+	cand.sport_out = ports[0];
+	cand.dport_out = ports[1];
+	cand.proto = iph->protocol;
+	cand.eport = eport;
+	cand.br_ifindex = br_ifindex;
+	cand.nat = 0;
+	cand.pad = 0;
+	/* NAT 位：pre 与 post 不一致就是这一维被 NAT 改写（纯路由流两位都不置） */
+	if (cand.saddr != cand.saddr_out || cand.sport != cand.sport_out)
+		cand.nat |= ZX_FFE_FLOW_NAT_S;
+	if (cand.daddr != cand.daddr_out || cand.dport != cand.dport_out)
+		cand.nat |= ZX_FFE_FLOW_NAT_D;
+
+	/*
 	 * 投递：本 CPU 的环。get_cpu_ptr() 关抢占，保证整个"填槽位 + 发布 head"
 	 * 不会被迁移打断；环满（head - tail == 容量）就丢候选，绝不等待。
 	 */
@@ -1055,25 +1282,17 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 		put_cpu_ptr(accel->learn_rings);
 		return NF_ACCEPT;
 	}
-	cand = &ring->cand[head & (ZX_FFE_LEARN_RING - 1)];
-	cand->saddr = ot->src.u3.ip;
-	cand->daddr = ot->dst.u3.ip;
-	/* TCP/UDP 时 union 的第一个成员 all 就是端口（同一偏移） */
-	cand->sport = ot->src.u.all;
-	cand->dport = ot->dst.u.all;
-	cand->saddr_out = iph->saddr;
-	cand->daddr_out = iph->daddr;
-	cand->sport_out = ports[0];
-	cand->dport_out = ports[1];
-	cand->proto = iph->protocol;
-	cand->eport = eport;
-	cand->nat = 0;
-	cand->pad = 0;
-	/* NAT 位：pre 与 post 不一致就是这一维被 NAT 改写（纯路由流两位都不置） */
-	if (cand->saddr != cand->saddr_out || cand->sport != cand->sport_out)
-		cand->nat |= ZX_FFE_FLOW_NAT_S;
-	if (cand->daddr != cand->daddr_out || cand->dport != cand->dport_out)
-		cand->nat |= ZX_FFE_FLOW_NAT_D;
+	/*
+	 * 去重：同一五元组 1 s 内只投一次。放在容量检查之后——去重位只记
+	 * "已经真的进了环"的候选，环满丢掉的那条不会被记住，环一有空位就能
+	 * 再投。
+	 */
+	if (zx_ffe_learn_dup(ring, &cand)) {
+		accel->learn_dedup++;
+		put_cpu_ptr(accel->learn_rings);
+		return NF_ACCEPT;
+	}
+	memcpy(&ring->cand[head & (ZX_FFE_LEARN_RING - 1)], &cand, sizeof(cand));
 	smp_store_release(&ring->head, head + 1);
 	/* 裸 ++：并发下可能丢几个计数，不影响语义（同 cnt[] 的口径） */
 	accel->learn_cand++;
@@ -1433,7 +1652,13 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 		rcu_read_unlock();
 		return ZX_FFE_V_MISS;
 	}
-	/* #14 出口端口现查现判：不存在/down 都回栈 */
+	/* #14 出口端口现查现判：不存在/down 都回栈。
+	 *
+	 * 条目里的 eport 只可能是 0..ZX_NUM_PORTS-1（ffe_add 与旁路学习都按
+	 * zx_eth_is_port() 复核过），所以**桥/无线出口在条目里不存在**：无线帧
+	 * 永远回栈走 mac80211（队列/聚合/功率控制），见 zx_ffe_learn_hook()
+	 * 头的"覆盖范围"。
+	 */
 	eport = flow->eport;
 	nd_out = zx_ffe_eport_dev(adapter, eport);
 	if (!nd_out) {
@@ -2014,6 +2239,9 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->learn_dup = 0;
 	accel->learn_drop = 0;
 	accel->learn_noneigh = 0;
+	accel->learn_nobrport = 0;
+	accel->learn_nonport = 0;
+	accel->learn_dedup = 0;
 	accel->ffe_last[0] = 0;
 	INIT_LIST_HEAD(&accel->flow_list);
 	INIT_LIST_HEAD(&accel->local_mac_list);
@@ -2225,6 +2453,7 @@ static void zx_accel_show(struct seq_file *s, int family)
 	struct zx_eth_adapter *adapter = s->private;
 	struct zx_accel *accel = &adapter->accel;
 	const struct zx_ffe_cnt *c = &accel->cnt[family];
+	u32 qlen_peak;
 	bool bound;
 
 	/* 读 flow_block 列表要持 rtnl（TC 绑定/解绑时持着它） */
@@ -2232,12 +2461,20 @@ static void zx_accel_show(struct seq_file *s, int family)
 	bound = zx_ppe_has_bound_blocks(adapter);
 	rtnl_unlock();
 
+	/*
+	 * qlen_peak 是**整环共享**统计：v4/v6 共用一个 TX 环，峰值只在
+	 * zx279128s-main.c 的 zx_tx_submit_bp() 里写进 cnt[0]（那一层拿不到
+	 * family），所以 cnt[1].qlen_peak 恒 0。v6 这一行也显示 cnt[0] 的值，
+	 * 免得读成"v6 快路从没占用过 TX 环"；cnt[1] 那个 0 没有意义。
+	 */
+	qlen_peak = READ_ONCE(accel->cnt[0].qlen_peak);
+
 	seq_printf(s, "%s\n",
 		   zx_accel_mode_name(zx_accel_cur_mode(accel, family)));
 	seq_printf(s, "lookup=%llu hit=%llu miss=%llu fwd=%llu fallback=%llu fallback_qfull=%llu drop_noport=%llu drop_local=%llu csum_err=%llu ttl_err=%llu bytes=%llu qlen_peak=%u rx_drop=%llu\n",
 		   c->lookup, c->hit, c->miss, c->fwd, c->fallback,
 		   c->fallback_qfull, c->drop_noport, c->drop_local,
-		   c->csum_err, c->ttl_err, c->bytes, c->qlen_peak,
+		   c->csum_err, c->ttl_err, c->bytes, qlen_peak,
 		   c->rx_drop);
 	/*
 	 * 第 3 行是给人和脚本看的状态行。hint 是"下一步该做什么"的机器可读
@@ -2998,7 +3235,8 @@ const struct file_operations zx_accel_aging_fops = {
  *
  * 读：
  *   第 1 行  开关 0/1
- *   第 2 行  cand=.. add=.. dup=.. drop=.. noneigh=.. flows=.. tbl_full=..
+ *   第 2 行  cand=.. add=.. dup=.. drop=.. noneigh=.. nobrport=.. nonport=..
+ *            dedup=.. flows=.. tbl_full=..
  *   第 3 行  每 CPU 环的占用（还没落表的候选数，逗号分隔）
  * 写 0/1（也认 off/on）：
  *   0 = 不再把新流写进环（环里剩的候选在下一拍清掉），已有条目照常工作到老化；
@@ -3007,6 +3245,10 @@ const struct file_operations zx_accel_aging_fops = {
  * 计数口径：learn_cand 是钩子"看到并投递"的候选数，learn_drop 是环满没投递
  * 的（所以 cand 不含 drop），learn_noneigh 是候选在 work 里取不到下一跳 MAC
  * 的，learn_dup 是同 key 已存在只刷新字段的，learn_add 才是真正新增的条目。
+ * learn_nobrport 是桥出口在 work 里解不出本驱动端口的（FDB 未命中/要泛洪/
+ * 桥已不在），learn_nonport 是 FDB 命中的端口不是本驱动交换机口的（无线口
+ * 等），learn_dedup 是被 1 s 去重挡下的重复候选——这三种都是"主动放弃"，
+ * 不是错误。
  */
 static int zx_accel_learn_show(struct seq_file *s, void *data)
 {
@@ -3016,10 +3258,13 @@ static int zx_accel_learn_show(struct seq_file *s, void *data)
 
 	(void)data;
 	seq_printf(s, "%u\n", READ_ONCE(accel->learn_on) ? 1u : 0u);
-	seq_printf(s, "cand=%llu add=%llu dup=%llu drop=%llu noneigh=%llu flows=%u tbl_full=%llu\n",
+	seq_printf(s, "cand=%llu add=%llu dup=%llu drop=%llu noneigh=%llu nobrport=%llu nonport=%llu dedup=%llu flows=%u tbl_full=%llu\n",
 		   READ_ONCE(accel->learn_cand), READ_ONCE(accel->learn_add),
 		   READ_ONCE(accel->learn_dup), READ_ONCE(accel->learn_drop),
-		   READ_ONCE(accel->learn_noneigh), READ_ONCE(accel->n_flows),
+		   READ_ONCE(accel->learn_noneigh),
+		   READ_ONCE(accel->learn_nobrport),
+		   READ_ONCE(accel->learn_nonport),
+		   READ_ONCE(accel->learn_dedup), READ_ONCE(accel->n_flows),
 		   READ_ONCE(accel->tbl_full));
 	if (!accel->learn_rings) {
 		seq_puts(s, "ring=n/a\n");
