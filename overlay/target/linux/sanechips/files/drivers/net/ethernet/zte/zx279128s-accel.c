@@ -162,9 +162,16 @@ MODULE_PARM_DESC(ffe_aging, "Age out FFE flows after this many seconds (0 = neve
  *
  * P7 上机后改口径（design/extensibility.md §6.6）：drop 只算 drop_noport，
  * 因为 drop_local 是"目的地址属本机、帧正常回栈、一帧没丢"，语义上不是失败；
- * 而且分子分母都用**窗口增量**（当前 cnt[] 减去切入 ffe 时的基线 fb_base[]），
- * 不再拿开机累计值判——累计口径下一次 ping -f 就能永久污染判据。窗口小于
+ * 而且分子分母都用增量（当前 cnt[] 减去窗口起点的快照 fb_base[]），不再拿
+ * 开机累计值判——累计口径下一次 ping -f 就能永久污染判据。窗口小于
  * ZX_FFE_FB_MIN_LOOKUP 帧时不判定（见 zx_accel_degraded()）。
+ *
+ * P8 C（复审 B/C/D）：上面这个"增量"原先是从**进入 ffe** 那一刻算起的累计
+ * （fb_since 只在谓词为假时清零），于是"1 秒抖动 + 之后 10 秒都正常"照样
+ * 会在第 10 秒触发降级，和设计 §9-4 的"持续 10 s"不是一回事。现在改成真
+ * 10 s 固定窗口：窗口起点的计数快照放在 fb_base[]，起点时刻放在 fb_since[]，
+ * 只有窗口到点才判一次，未达阈值就关窗、下一拍从新起点重开。见
+ * zx_accel_fb_window_open() 与 zx_accel_autofallback()。
  */
 #define ZX_FFE_FB_DROP_PERMILLE		1
 #define ZX_FFE_FB_FALLBACK_PERMILLE	500
@@ -2345,20 +2352,61 @@ static void zx_accel_quiesce_leave(struct zx_eth_adapter *adapter)
 }
 
 /*
- * 把某一族的降级基线重置为当前 cnt[] 快照（design/extensibility.md §6.6）。
- * 只在 zx_accel_set() 成功切入 ffe 之后、仍持 accel->lock 时调用：这样自动
- * 降级判据看的是"这次进 ffe 之后"的增量，不背开机以来的历史计数。
+ * 无锁读某一族的三个 64 位计数（P8 D）。32 位 ARM 上 u64 读是两条 ldr，
+ * 数据面又是裸 u64++（见 struct zx_ffe_cnt 的注释），两者并发时可能读到
+ * "半新半旧"的组合值：增量因此可能被算小（漏判）也可能被算大（提前降级）。
+ * 偏漏判不致命——下一拍/下一窗还会再判；偏提前降级也只是回 stack，不丢包，
+ * 属于安全侧。为了把这个窗口压到最小，这里连读两遍，两遍相等才认；不等就
+ * 返回 false，由调用者"本拍不判"，不拿可疑值去比 0.1% 的阈值。
+ *
+ * 计数只增，所以两遍相等即视为一致快照（不追求与数据面原子，只求不拿一个
+ * 明显撕裂的值当判据）。读失败的代价只是本拍不判，绝不会卡死判据：
+ * 窗口起点读失败 → 下一次 tick 再开窗；窗口到点读失败 → 窗口保持，下一拍
+ * 再判。
  */
-static void zx_accel_fb_base_reset(struct zx_accel *accel, int family)
+static bool zx_accel_fb_cnt_read(const struct zx_accel *accel, int family,
+				 struct zx_ffe_fb_base *out)
 {
 	const struct zx_ffe_cnt *c = &accel->cnt[family];
-	struct zx_ffe_fb_base *b = &accel->fb_base[family];
+	struct zx_ffe_fb_base a, b;
 
-	b->lookup = READ_ONCE(c->lookup);
-	b->drop = READ_ONCE(c->drop_noport);
-	b->fallback = READ_ONCE(c->fallback);
-	/* 同一时刻清掉"10 s 持续"的起点：新窗口从这一刻算起 */
-	accel->fb_since[family] = 0;
+	a.lookup = READ_ONCE(c->lookup);
+	a.drop = READ_ONCE(c->drop_noport);
+	a.fallback = READ_ONCE(c->fallback);
+	b.lookup = READ_ONCE(c->lookup);
+	b.drop = READ_ONCE(c->drop_noport);
+	b.fallback = READ_ONCE(c->fallback);
+
+	if (a.lookup != b.lookup || a.drop != b.drop ||
+	    a.fallback != b.fallback)
+		return false;
+
+	*out = a;
+	return true;
+}
+
+/*
+ * 开一个 10 s 的降级判定窗口（P8 C）：把 fb_base[] 快照成当前 cnt[]、把
+ * fb_since[] 记成窗口起点 now。窗口到点后由 zx_accel_degraded() 用
+ * "当前 - fb_base" 判一次；没到阈值就关窗（fb_since = 0），下一拍再由本函数
+ * 从新起点重开。
+ *
+ * 所以 fb_base 现在是"**窗口**起点的基线"，不再是"进入 ffe 以来的基线"。
+ * 进入 ffe 时（zx_accel_set() 的 S5.1）也会调一次，因此第一个窗口从入场那
+ * 一刻算起；窗口与入场基线的差别只在这里：入场那一次的起点是入场时刻，
+ * 之后每次关窗重开的起点是重开时刻。两者都不背开机以来的历史计数。
+ *
+ * 返回 false 表示读到不一致的 64 位计数（见 zx_accel_fb_cnt_read()），本拍
+ * 不开窗；调用者按"下一拍再来"处理，fb_since 保持 0。
+ */
+static bool zx_accel_fb_window_open(struct zx_accel *accel, int family,
+				    unsigned long now)
+{
+	if (!zx_accel_fb_cnt_read(accel, family, &accel->fb_base[family]))
+		return false;
+
+	accel->fb_since[family] = now;
+	return true;
 }
 
 /*
@@ -2513,12 +2561,14 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 	/* S5 切点：单字节写，数据面只会看到旧模式或新模式 */
 	WRITE_ONCE(*slot, new_mode);
 	/*
-	 * S5.1 切入 ffe 成功，重设这一族的降级基线：判据只看"进去之后"的增量，
-	 * 不背开机以来的历史计数（design/extensibility.md §6.6）。与 S4 的清表
-	 * 同一持锁区，所以数据面/age work 都不会看到半新半旧的基线。
+	 * S5.1 切入 ffe 成功，开第一个降级窗口：fb_base[] 与 fb_since[] 都重置
+	 * 到这一刻，第一个 10 s 从入场算起，不背开机以来的历史计数
+	 * （design/extensibility.md §6.6；P8 C 起 fb_base 是窗口起点，见
+	 * zx_accel_fb_window_open()）。读不到一致的 64 位快照时 fb_since 保持
+	 * 0，下一次 age tick 会重新开窗，不影响切换本身。
 	 */
 	if (new_mode == ZX_ACC_FFE)
-		zx_accel_fb_base_reset(accel, family);
+		(void)zx_accel_fb_window_open(accel, family, jiffies);
 
 	/* S6 目标 zc 打开零拷贝，然后恢复数据面。全局开关只在 0->非0 时开一次
 	 * （mask 已置位，所以 zc_rx 打开时不变式立刻成立），另一族本来就在 zc
@@ -2564,42 +2614,75 @@ unlock:
  *   1. 分子去掉 drop_local。它是"目的地址属本机、帧正常回栈"（complete() 里
  *      计完仍返回 STACK），一帧没丢，不是失败；管理面 ping -f 打盒子不再
  *      能把它算成快路故障。drop_local 照旧在 cnt[]/debugfs 里显示。
- *   2. 分子分母都是**窗口增量**：当前 cnt[] 减去切入 ffe 时的基线 fb_base[]
- *      （zx_accel_set() 的 S5 之后写入）。累计口径下一次 ping -f 就永久污染，
- *      此后每次进 ffe 10 s 内被踢回 stack 并清空流表。
+ *   2. 分子分母都改用增量（当前 cnt[] 减去窗口起点的快照 fb_base[]），不再
+ *      用开机累计值：累计口径下一次 ping -f 就永久污染，此后每次进 ffe 10 s
+ *      内被踢回 stack 并清空流表。
  *   3. 窗口内帧数太少（< ZX_FFE_FB_MIN_LOOKUP）不判定；Δlookup 为零时直接
- *      返回 false（判据用乘法比而不是除法，这里也没有除零）。
+ *      返回 ZX_FFE_FB_CLEAR（判据用乘法比而不是除法，这里也没有除零）。
  *
- * dmesg 仍打印累计值（drop 是 drop_noport + drop_local 的老口径合计，字段名
- * 不变），只是判据基于增量。
+ * P8 C（复审 B/C/D）：这里的"窗口"改成真 10 s 固定窗口，和"进入 ffe 以来"
+ * 彻底分开——窗口起点的计数快照与时刻由 zx_accel_fb_window_open() 写进
+ * fb_base[]/fb_since[]，本函数只在**窗口到点后**被调用（开窗、等窗都在
+ * zx_accel_autofallback() 里）：
+ *   - 只有"当前 - 窗口起点"的增量进判据，窗口之外的历史一概不算；
+ *   - 未达阈值就关窗，下一拍从新起点重开，所以"1 秒抖动 + 之后 9 秒干净"
+ *     不会被旧抖动的累计值在第 10 秒踢回 stack；反过来，持续故障的每个窗
+ *     都超阈值，最多 10~11 s 就降级（既不会永不降级，也不会一切进就降级）。
+ *   - Δlookup < ZX_FFE_FB_MIN_LOOKUP 视同"未达阈值"：关窗重开，帧太少时
+ *     0.1% 的置信度不够，也保证乘法比里没有除零。
+ *
+ * 判为降级时顺便打印 dmesg —— 打印的就是判据用的那份窗口增量（不另算
+ * 一遍，避免"日志"和"判据"对不上），另外附上开机累计值便于和历史日志
+ * 对照（P7 的脚本只 grep "fell back" 这个子串，格式变化不影响解析）：
+ *   d_drop     = Δdrop_noport（与判据同一个分子，**不含** drop_local）
+ *   d_fallback = Δfallback
+ *   d_lookup   = Δlookup（判据的分母）
+ *   cum …      = 老口径的累计值（drop 仍是 drop_noport + drop_local）
  */
-static bool zx_accel_degraded(const struct zx_eth_adapter *adapter, int family)
+enum zx_ffe_fb_verdict {
+	ZX_FFE_FB_RETRY = -1,	/* 本拍读到的 64 位计数不一致：不判，窗口保持 */
+	ZX_FFE_FB_CLEAR = 0,	/* 未达阈值 / 窗口太小：关窗，下拍重开 */
+	ZX_FFE_FB_DEGRADE = 1,	/* 判为降级 */
+};
+
+static int zx_accel_degraded(const struct zx_eth_adapter *adapter, int family)
 {
 	const struct zx_accel *accel = &adapter->accel;
-	const struct zx_ffe_cnt *c = &accel->cnt[family];
 	const struct zx_ffe_fb_base *b = &accel->fb_base[family];
-	u64 lookup = READ_ONCE(c->lookup);
+	struct zx_ffe_fb_base now;
 	u64 base_lookup = READ_ONCE(b->lookup);
 	u64 base_drop = READ_ONCE(b->drop);
 	u64 base_fb = READ_ONCE(b->fallback);
-	u64 drop = READ_ONCE(c->drop_noport);
-	u64 fallback = READ_ONCE(c->fallback);
 	u64 dlookup, ddrop, dfb;
 
-	/* 基线在持锁区取快照、计数只增，正常不会倒挂；倒了说明快照写坏，不判 */
-	if (lookup <= base_lookup)
-		return false;
-	dlookup = lookup - base_lookup;
-	/* 窗口太小：不看，避免几帧抖动就把一条正常流判成故障 */
+	/*
+	 * P8 D：cnt[] 的 64 位计数是无锁读（32 位 ARM 上两条 ldr，可能撕裂），
+	 * 读两遍不一致就本拍不判，取舍见 zx_accel_fb_cnt_read()。基线
+	 * fb_base[] 同样是 64 位无锁读，但它只在开窗时写（每窗一次），且下面
+	 * 有"计数只增"的守卫，最坏是本窗判不出来、下一窗重来，不会永久错判。
+	 */
+	if (!zx_accel_fb_cnt_read(accel, family, &now))
+		return ZX_FFE_FB_RETRY;
+
+	/* 计数只增；倒挂说明快照/读被写坏，不判，关窗重开 */
+	if (now.lookup <= base_lookup)
+		return ZX_FFE_FB_CLEAR;
+	dlookup = now.lookup - base_lookup;
+	/* 窗口里帧太少：不判，关窗重开（下一窗重新计时） */
 	if (dlookup < ZX_FFE_FB_MIN_LOOKUP)
-		return false;
-	ddrop = drop > base_drop ? drop - base_drop : 0;
-	dfb = fallback > base_fb ? fallback - base_fb : 0;
-	if (ddrop * 1000 > dlookup * ZX_FFE_FB_DROP_PERMILLE)
-		return true;
-	if (dfb * 1000 > dlookup * ZX_FFE_FB_FALLBACK_PERMILLE)
-		return true;
-	return false;
+		return ZX_FFE_FB_CLEAR;
+	ddrop = now.drop > base_drop ? now.drop - base_drop : 0;
+	dfb = now.fallback > base_fb ? now.fallback - base_fb : 0;
+	if (ddrop * 1000 <= dlookup * ZX_FFE_FB_DROP_PERMILLE &&
+	    dfb * 1000 <= dlookup * ZX_FFE_FB_FALLBACK_PERMILLE)
+		return ZX_FFE_FB_CLEAR;
+
+	dev_info(adapter->dev,
+		 "accel: IPv%d fell back to stack: d_drop=%llu d_fallback=%llu of d_lookup=%llu (cum %llu drop, %llu fallback of %llu lookups)\n",
+		 family ? 6 : 4, ddrop, dfb, dlookup,
+		 now.drop + READ_ONCE(accel->cnt[family].drop_local),
+		 now.fallback, now.lookup);
+	return ZX_FFE_FB_DEGRADE;
 }
 
 bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
@@ -2608,30 +2691,45 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
 	bool degraded = false;
 	int family;
 
-	if (!READ_ONCE(accel->autofallback))
+	if (!READ_ONCE(accel->autofallback)) {
+		/*
+		 * 关掉期间窗口一律作废（每秒都清一次）：重新打开时下一拍从
+		 * 那一刻开新窗，不拿关闭期间的旧起点判一个超长窗口——否则
+		 * 关掉几分钟再打开，第一拍就会用几分钟的增量去比 0.1%。
+		 */
+		accel->fb_since[0] = 0;
+		accel->fb_since[1] = 0;
 		return false;
+	}
 
 	for (family = 0; family < 2; family++) {
-		if (zx_accel_cur_mode(accel, family) != ZX_ACC_FFE ||
-		    !zx_accel_degraded(adapter, family)) {
+		int verdict;
+
+		/* 不在 ffe 里就没有窗口；下次切入时由 S5.1 重新开 */
+		if (zx_accel_cur_mode(accel, family) != ZX_ACC_FFE) {
 			accel->fb_since[family] = 0;
 			continue;
 		}
+		/* 还没有窗口（刚切入，或上一窗已关）：现在开一个 */
 		if (!accel->fb_since[family]) {
-			accel->fb_since[family] = jiffies;
+			/* 读不到一致快照时 fb_since 保持 0，下一拍再试 */
+			(void)zx_accel_fb_window_open(accel, family, jiffies);
 			continue;
 		}
+		/* 窗口未满 10 s：这一拍什么都不判 */
 		if (time_before(jiffies, accel->fb_since[family] +
 				msecs_to_jiffies(ZX_FFE_FB_WINDOW_MS)))
 			continue;
 
-		dev_info(adapter->dev,
-			 "accel: IPv%d fell back to stack: %llu drop, %llu fallback of %llu lookups\n",
-			 family ? 6 : 4,
-			 READ_ONCE(accel->cnt[family].drop_noport) +
-				 READ_ONCE(accel->cnt[family].drop_local),
-			 READ_ONCE(accel->cnt[family].fallback),
-			 READ_ONCE(accel->cnt[family].lookup));
+		verdict = zx_accel_degraded(adapter, family);
+		if (verdict == ZX_FFE_FB_RETRY)
+			continue;	/* 本拍不判：窗口保持，下一拍再判 */
+		if (verdict == ZX_FFE_FB_CLEAR) {
+			accel->fb_since[family] = 0;	/* 关窗，下拍重开 */
+			continue;
+		}
+
+		/* 已判为降级（dmesg 在 zx_accel_degraded() 里打过了） */
 		accel->fb_since[family] = 0;
 		if (!zx_accel_set(adapter, family, ZX_ACC_STACK))
 			degraded = true;
@@ -2667,7 +2765,7 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->zc_mask = 0;
 	WRITE_ONCE(accel->quiesce, false);
 	memset(accel->cnt, 0, sizeof(accel->cnt));
-	/* 降级基线与 cnt[] 一起归零：首次进 ffe 会再取一次快照（S5.1） */
+	/* 降级窗口与 cnt[] 一起归零：首次进 ffe 时由 S5.1 开窗、取起点快照 */
 	memset(accel->fb_base, 0, sizeof(accel->fb_base));
 	accel->sw_in = 0;
 	accel->sw_out = 0;

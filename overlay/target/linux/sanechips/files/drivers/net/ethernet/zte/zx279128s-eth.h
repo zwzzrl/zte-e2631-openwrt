@@ -341,12 +341,16 @@ struct zx_ffe_cnt {
 };
 
 /*
- * 自动降级的窗口基线（P7 上机后改口径，design/extensibility.md §6.6）：三
- * 个字段都是 cnt[] 里对应计数的快照，由 zx_accel_set() 成功切入 ffe 时写入
- * （持 accel->lock），zx_accel_degraded() 只比"当前 - 基线"。
+ * 自动降级的窗口起点（P7 上机后改口径，design/extensibility.md §6.6；P8 C
+ * 改成真 10 s 窗口）：三个字段都是 cnt[] 里对应计数的快照，由
+ * zx_accel_fb_window_open() 在"开窗"那一刻写入（进入 ffe 的 S5.1，以及每
+ * 次关窗后的下一拍），zx_accel_degraded() 只比"当前 - 窗口起点"。
  *
- * 只有 drop_noport 进基线：drop_local（目的地址属本机、帧正常回栈、一帧没
+ * 只有 drop_noport 进快照：drop_local（目的地址属本机、帧正常回栈、一帧没
  * 丢）语义上不是失败，不能当降级依据；它照旧在 cnt[]/debugfs 里计数。
+ *
+ * 注意这里的"基线"是**窗口**起点，不是"进入 ffe 以来"的起点：窗口到点判过
+ * 之后会被下一窗覆盖，历史上限是 ZX_FFE_FB_WINDOW_MS 而不是整段 ffe 时间。
  */
 struct zx_ffe_fb_base {
 	u64	lookup;
@@ -464,11 +468,13 @@ struct zx_accel {
 	u64			add_replace;
 	struct zx_ffe_cnt	cnt[2];
 	/*
-	 * 自动降级的窗口基线（P7 上机后改口径，design/extensibility.md §6.6）：
-	 * 只由 zx_accel_set() 成功切入 ffe 时取 cnt[] 的快照（持 accel->lock），
-	 * zx_accel_degraded() 用"当前 - 基线"判降级，所以切进去不再背开机以来
-	 * 的历史计数。drop 只对 drop_noport 取基线：drop_local 是"目的地址属
-	 * 本机、帧正常回栈"，不是失败，不进分子。
+	 * 自动降级的窗口起点（P7 上机后改口径，design/extensibility.md §6.6；
+	 * P8 C 改成真 10 s 窗口）：fb_base[] 是该窗口起点的 cnt[] 快照，
+	 * fb_since[] 是窗口起点时刻，两者一起由 zx_accel_fb_window_open() 写
+	 * （进入 ffe 的 S5.1 以及每次关窗后的下一拍）。zx_accel_degraded() 用
+	 * "当前 - fb_base"判降级，所以判据只看最近一个 10 s 窗口，不背开机
+	 * 以来、也不背进入 ffe 以来的历史计数。drop 只对 drop_noport 取快照：
+	 * drop_local 是"目的地址属本机、帧正常回栈"，不是失败，不进分子。
 	 */
 	struct zx_ffe_fb_base	fb_base[2];
 	/*
@@ -497,7 +503,12 @@ struct zx_accel {
 	u64			drain_ms;	/* 最近一次排空的耗时 */
 	u64			drain_frames;	/* 最近一次排空回收的帧数 */
 	bool			autofallback;	/* 允许自动降级回 stack */
-	unsigned long		fb_since[2];	/* 每族越过降级阈值的起点 */
+	/*
+	 * 每族当前降级窗口的起点（jiffies），0 = 现在没有在跑的窗口，下一次
+	 * age tick 会开一个（P8 C）。只有 zx_accel_fb_window_open() 写、只有
+	 * zx_accel_autofallback() 清零（切换离开 ffe / 窗口判完），都无锁。
+	 */
+	unsigned long		fb_since[2];
 };
 
 /* 某个族的当前模式。数据面每个包只读这一个字节：切换是单字节写，
