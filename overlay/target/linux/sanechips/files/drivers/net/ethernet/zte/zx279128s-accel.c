@@ -3925,3 +3925,324 @@ const struct file_operations zx_accel_migrate_fops = {
 	.llseek		= seq_lseek,
 	.release	= single_release,
 };
+
+/* ---- SoC 温度（debugfs soc_temp，只读）-------------------------------- */
+
+/*
+ * 传感器在 0x94100034：原厂 DTB soc/temp@94100034 { compatible =
+ * "zxic,tempsensor"; reg = <0x94100034 0x0c>; }，原厂驱动是
+ * drivers/tempsensor/temp_zx.c，用户态口 /proc/tempsensor。
+ *
+ * ★ 下面每一条寄存器语义都**由原厂 vmlinux 反汇编得出**，不是猜的，也不是
+ *   照抄哪个文档。取证对象：工作文件/out/scratch/npu/vendor-vmlinux.elf
+ *   （未 strip，nm 有全符号）。复现命令必须带 -m armv7：
+ *     arm-openwrt-linux-objdump -m armv7 -d --start-address=0xc02ad1d8 \
+ *         --stop-address=0xc02ad3c8 vendor-vmlinux.elf
+ *   不带 -m armv7 时这份 binutils 按老 ARM 解码：movw/movt 显示成 tst/cmp、
+ *   blx r3 显示成 msr SP_hyp，照着它读会得出完全错误的结论。
+ *
+ * 关键符号（vmlinux VMA，nm 确认）：
+ *   temp_ctrl_read_zxic 0xc02ad1d8  "触发 + 采样 + 换算"的主体（static）
+ *   temp_ctrl_read      0xc02ad3f0  EXPORT_SYMBOL，mode=0：100°C 拐点 + 110°C 钳位
+ *   temp_ctrl_read_real 0xc02ad440  EXPORT_SYMBOL，mode=1：不拐点不钳位
+ *   bsp_temp_start      0xc02add98  上电使能时序（zx_temp_probe 调）
+ *   zx_temp_probe       0xc02ade30  devm_ioremap_resource + /proc + 3 个 IRQ
+ *   temp_ctrl_read_proc 0xc02ad528  /proc 读：只回显缓存值，**不触发转换**
+ *   g_dout_latch        0xc06757b0  平均后的原始值（/proc 里叫 dout_latch）
+ *   g_temper            0xc06757b4  换算后的摄氏温度
+ *   arm_delay_ops       0xc064bee4  每一步延时走它 [+4] = const_udelay
+ *
+ * 寄存器表（下称 base = ioremap 后的 0x94100034；原厂存在
+ * zx_bsp_tempsensor+0x2c，printk 里明确写的就是 &(regs->cfg)，即 cfg 在 +0）：
+ *   base+0x00 0x94100034  cfg      bit12/bit13 = 转换触发对；bit16/17 = detector 选择
+ *   base+0x04 0x94100038  status   bit12 = 就绪位；低 10 bit = ADC 原始值
+ *   base+0x08 0x9410003c  det      未命名；原厂 probe 一次性整写 0x3FFFFFFF
+ *
+ * 原厂读一次温度的完整时序（c02ad1d8 起）。每一步之后都调
+ * arm_delay_ops.const_udelay，参数 r0 = 0x0010624C（movw #0x624c / movt #0x10）；
+ * 按 ARM 的 __udelay(usec) = __const_udelay(usec * 0x10C7) 折算 ≈ 250 µs：
+ *   ① 死等 status.bit12 置位（tst #0x1000 / beq 回跳）——原厂**没有超时**；
+ *   ② 循环（有效样本满 10 个退出，累计迭代上限 6000 = 0x1770）：
+ *        cfg 清 bit13（bic #0x2000）→ 置 bit12（orr #0x1000）→
+ *        清 bit12（bic #0x1000）→ 置 bit13（orr #0x2000），每步之间延时；
+ *      四步做完才读 status 的低 10 bit（ubfx r3,r3,#0,#10），**非 0 才计一个
+ *      有效样本**（cmp r3,#0 / addne），0 直接丢掉重来；
+ *   ③ 有效样本求和后除以 10（0xCCCCCCCD 魔数 >>35，恒除 10，不是除实际样本数）；
+ *   ④ t = (avg * 1550) >> 10（定点，斜率 1550/1024 ≈ 1.5137 °C/LSB，全整数），
+ *      再按四段线性校正，最后 mode=0 时"t>100 斜率减半 + 钳到 110"。
+ *      完整公式见 zx_soc_temp_convert() 的注释。
+ * 原厂这条路径**恒返回 0**：轮询撞到 6000 次只 printk
+ * "tempsensor get status fail!" 然后拿残缺累加值继续算。我们不复刻这个——
+ * 一个有效样本都没有就报错，绝不在残值上继续算温度（会误导散热判断）。
+ *
+ * 输出格式（第 1 行给脚本，第 2 行给人/给日志）：
+ *   temp_c=<摄氏整数>
+ *   raw=<平均原始值> samples=<有效样本数> t=<中间值>
+ */
+
+/* 0x94100034 不在以太网那块（0x92000000）里，原厂 DTB 的 reg 长度又只有 0xc，
+ * 所以按页映射 0x94100000 一页、再把指针挪到 0x34。原厂用
+ * devm_ioremap_resource()，且 probe 里**没有任何 clock / reset 框架调用**
+ * （没有 clk_get、clk_prepare_enable，也没有 reset_control_*）——这一页的
+ * 时钟按常开处理，不需要我们先开 gate。 */
+#define ZX_SOC_TEMP_PAGE	0x94100000u
+#define ZX_SOC_TEMP_PAGE_SIZE	0x1000u
+#define ZX_SOC_TEMP_REG_OFF	0x34u
+
+#define ZX_SOC_TEMP_CFG		0x00	/* 0x94100034 */
+#define ZX_SOC_TEMP_STATUS	0x04	/* 0x94100038 */
+#define ZX_SOC_TEMP_DET		0x08	/* 0x9410003c */
+#define  ZX_SOC_TEMP_TRIG12	BIT(12)	/* cfg：触发相位 A（置 1 → 清 0） */
+#define  ZX_SOC_TEMP_TRIG13	BIT(13)	/* cfg：触发相位 B（清 0 → 置 1，收尾保持置位） */
+#define  ZX_SOC_TEMP_DET_ALL	0x3FFFFFFFu	/* 原厂 probe 写死在 base+8 */
+#define  ZX_SOC_TEMP_RDY	BIT(12)	/* status：就绪位（同名不同寄存器，语义不通用） */
+#define  ZX_SOC_TEMP_DATA	0x3FFu	/* status[9:0] = 原始 ADC 值 */
+
+/* 原厂每步 const_udelay(0x10624C) ≈ 250 µs。这里用"睡"而不是忙等：debugfs read
+ * 是进程上下文，usleep_range 不烧 CPU。上限给 2 倍，宁可慢一点也要 ≥250 µs。 */
+#define ZX_SOC_TEMP_STEP_US	250u
+#define ZX_SOC_TEMP_NSAMPLES	10	/* 原厂取 10 个有效样本平均 */
+#define ZX_SOC_TEMP_ATTEMPTS	(ZX_SOC_TEMP_NSAMPLES * 3)	/* 允许 3 倍重试余量 */
+#define ZX_SOC_TEMP_POLL_US	10u
+#define ZX_SOC_TEMP_RDY_POLLS	100	/* 就绪位轮询：100 × 10 µs = 1 ms */
+#define ZX_SOC_TEMP_BUDGET_US	40000u	/* 整次读取的墙钟上限 40 ms */
+
+/* 传感器是 SoC 的一份全局硬件，但映射的生命周期挂在 adapter->dev 上
+ * (devm_ioremap)，所以指针放在 adapter 里、锁放文件级：这把锁只串行化
+ * "懒初始化 + 触发采样"这段硬件操作，防止两个进程同时读 soc_temp 时交错写 cfg。
+ * 都是进程上下文，用 mutex（采样期间要 sleep）。 */
+static DEFINE_MUTEX(zx_soc_temp_lock);
+
+/* 懒映射。失败只影响 soc_temp 这一个文件，与数据面无关。 */
+static int zx_soc_temp_map(struct zx_eth_adapter *adapter)
+{
+	void __iomem *p;
+
+	if (adapter->soc_temp_base)
+		return 0;
+
+	p = devm_ioremap(adapter->dev, ZX_SOC_TEMP_PAGE,
+			 ZX_SOC_TEMP_PAGE_SIZE);
+	if (!p)
+		return -ENOMEM;
+
+	adapter->soc_temp_base = p + ZX_SOC_TEMP_REG_OFF;
+	return 0;
+}
+
+/* cfg 的写一律读-改-写，**只动 bit12/bit13**：实测空闲值是 0x04001000
+ * （bit12 已置位、bit26 置位），bit16/17 是 detector 选择，整写会把它们踩掉。 */
+static void zx_soc_temp_cfg_set(void __iomem *base, u32 bits)
+{
+	writel(readl(base + ZX_SOC_TEMP_CFG) | bits, base + ZX_SOC_TEMP_CFG);
+}
+
+static void zx_soc_temp_cfg_clear(void __iomem *base, u32 bits)
+{
+	writel(readl(base + ZX_SOC_TEMP_CFG) & ~bits, base + ZX_SOC_TEMP_CFG);
+}
+
+static void zx_soc_temp_step_delay(void)
+{
+	usleep_range(ZX_SOC_TEMP_STEP_US, ZX_SOC_TEMP_STEP_US * 2);
+}
+
+/*
+ * 原厂 ①：死等 status.bit12。我们最多等 1 ms 就放弃，而且**放弃不算失败**——
+ * 没有被驱动启动过的机器上这一位可能恒 0（2026-11-01 取证时 status 实测就是 0），
+ * 把它写成硬前置条件会让这个文件永远报错。真正的判据在采样循环里：一个有效
+ * 样本都拿不到才返回 -ETIMEDOUT。
+ */
+static void zx_soc_temp_wait_ready(void __iomem *base)
+{
+	int i;
+
+	for (i = 0; i < ZX_SOC_TEMP_RDY_POLLS; i++) {
+		if (readl(base + ZX_SOC_TEMP_STATUS) & ZX_SOC_TEMP_RDY)
+			return;
+		udelay(ZX_SOC_TEMP_POLL_US);	/* 总共 1 ms 的短忙等，可接受 */
+	}
+}
+
+/*
+ * 一次性把硬件带到"能出数据"的状态，等价于原厂 zx_temp_probe + bsp_temp_start：
+ *   (a) writel(0x3FFFFFFF, base+8)          原厂 probe 整写；这里 |=，保留 bit30/31
+ *   (b) cfg 清 bit12 → 延时 → cfg 置 bit13  原厂 bsp_temp_start 的顺序
+ *   (c) 等 status[9:0] != 0                 原厂在这里也是死等，我们 1 ms 放弃
+ * 只在第一次读 soc_temp 时执行：**probe/init 一律不碰传感器**。
+ */
+static void zx_soc_temp_hw_init(struct zx_eth_adapter *adapter)
+{
+	void __iomem *base = adapter->soc_temp_base;
+	int i;
+
+	writel(readl(base + ZX_SOC_TEMP_DET) | ZX_SOC_TEMP_DET_ALL,
+	       base + ZX_SOC_TEMP_DET);
+
+	zx_soc_temp_cfg_clear(base, ZX_SOC_TEMP_TRIG12);
+	zx_soc_temp_step_delay();
+	zx_soc_temp_cfg_set(base, ZX_SOC_TEMP_TRIG13);
+
+	for (i = 0; i < ZX_SOC_TEMP_RDY_POLLS; i++) {
+		if (readl(base + ZX_SOC_TEMP_STATUS) & ZX_SOC_TEMP_DATA)
+			break;
+		udelay(ZX_SOC_TEMP_POLL_US);
+	}
+}
+
+/*
+ * 原始值 → 摄氏度，逐条对应原厂机器码（c02ad2e8 - c02ad3b4）：
+ *
+ *   t = (avg * 1550) >> 10        ; mul r3,r3,#1550 ; lsr r3,#10
+ *
+ *   (u32)(t-1139) <= 9   即 t∈[1139,1148]：out = (t-1104) - ((t-1139) >> 1)
+ *   (u32)(t-1149) <= 19  即 t∈[1149,1168]：out = (t-1109) - ((t-1149) >> 2)
+ *   (t-1104) > 64        即 t > 1168      ：out = t - 1113
+ *   其余（实际就是 t <= 1138）            ：out = t - 1104
+ *
+ * 四段在 1139/1148/1149/1168 处连续（35/40/40/55 °C），是厂家贴的分段线性
+ * 校正，不是抄错。之后 mode=0（temp_ctrl_read，GetCputemperature 走的就是它）：
+ *   if (out > 100) out = 100 + (out - 100) / 2;   过 100°C 斜率减半
+ *   if (out > 110) out = 110;                      硬钳位
+ * 返回的是**钳位前**的值，钳位留给调用方，好让合理性校验看到真实值。
+ */
+static s32 zx_soc_temp_convert(u32 avg, u32 *t_out)
+{
+	s32 t = (s32)((avg * 1550u) >> 10);
+	s32 out;
+
+	if ((u32)(t - 1139) <= 9u) {
+		out = (t - 1104) - ((t - 1139) >> 1);
+	} else if ((u32)(t - 1149) <= 19u) {
+		/* 到这里的 t 正常都 ≥1149；t<1149 那支是原厂 submi 的补丁路径 */
+		s32 adj = (t < 1149) ? (t - 1146) : (t - 1149);
+
+		out = (t - 1109) - (adj >> 2);
+	} else if ((t - 1104) > 64) {
+		out = t - 1113;
+	} else {
+		out = t - 1104;
+	}
+
+	*t_out = (u32)t;
+	return out;
+}
+
+/*
+ * 采样。失败一律只返回 errno：不 panic、不打印刷屏、不碰任何加速状态，
+ * 数据面完全不受影响（这个文件是纯旁路观测）。
+ * 所有轮询都有上限：单次就绪 1 ms，整次读取 40 ms（ktime 兜底），
+ * 采样最多 30 轮（每轮 4 × ~250 µs 睡眠），远低于原厂的 6000 轮死循环。
+ */
+static int zx_soc_temp_sample(struct zx_eth_adapter *adapter, u32 *avg_out,
+			      u32 *n_out)
+{
+	void __iomem *base = adapter->soc_temp_base;
+	ktime_t deadline = ktime_add_us(ktime_get(), ZX_SOC_TEMP_BUDGET_US);
+	u32 sum = 0;
+	int n = 0;
+	int tries = 0;
+
+	zx_soc_temp_wait_ready(base);
+
+	while (n < ZX_SOC_TEMP_NSAMPLES && tries < ZX_SOC_TEMP_ATTEMPTS) {
+		u32 raw;
+
+		if (ktime_after(ktime_get(), deadline))
+			break;
+		tries++;
+
+		/* 原厂 ② 的四相位，顺序不能换：清 bit13 → 置 bit12 → 清 bit12
+		 * → 置 bit13，每步之间等 ~250 µs，采样在四步**之后**。 */
+		zx_soc_temp_cfg_clear(base, ZX_SOC_TEMP_TRIG13);
+		zx_soc_temp_step_delay();
+		zx_soc_temp_cfg_set(base, ZX_SOC_TEMP_TRIG12);
+		zx_soc_temp_step_delay();
+		zx_soc_temp_cfg_clear(base, ZX_SOC_TEMP_TRIG12);
+		zx_soc_temp_step_delay();
+		zx_soc_temp_cfg_set(base, ZX_SOC_TEMP_TRIG13);
+		zx_soc_temp_step_delay();
+
+		raw = readl(base + ZX_SOC_TEMP_STATUS) & ZX_SOC_TEMP_DATA;
+		if (!raw)
+			continue;	/* 原厂同样跳过 0（cmp/addne） */
+
+		sum += raw;
+		n++;
+	}
+
+	if (!n)
+		return -ETIMEDOUT;
+
+	/* 原厂恒除 10；这里除实际有效样本数（n 正常也是 10，超时时会 <10，
+	 * 那样求平均才不会被 0 拉低）。 */
+	*avg_out = sum / (u32)n;
+	*n_out = (u32)n;
+	return 0;
+}
+
+static int zx_accel_soc_temp_show(struct seq_file *s, void *data)
+{
+	struct zx_eth_adapter *adapter = s->private;
+	u32 avg = 0, n = 0, t = 0;
+	s32 out;
+	int ret;
+
+	(void)data;
+
+	mutex_lock(&zx_soc_temp_lock);
+
+	ret = zx_soc_temp_map(adapter);
+	if (ret)
+		goto out;
+
+	if (!adapter->soc_temp_inited) {
+		zx_soc_temp_hw_init(adapter);
+		adapter->soc_temp_inited = true;
+	}
+
+	ret = zx_soc_temp_sample(adapter, &avg, &n);
+	if (ret)
+		goto out;
+
+	out = zx_soc_temp_convert(avg, &t);
+
+	/* 合理性校验：先看**钳位前**的值。−40..150 °C 之外说明传感器/时序
+	 * 不对（例如 status 卡在某值、或 bit13 的假设是错的），直接报 -ERANGE，
+	 * 不把这个数交给任何人当温度用，并且每个速率上限只告警一次（不刷屏）。 */
+	if (out < -40 || out > 150) {
+		dev_warn_ratelimited(adapter->dev,
+				     "soc_temp: 读数超出 -40..150 °C：temp=%d raw=%u n=%u t=%u，拒绝上报\n",
+				     out, avg, n, t);
+		ret = -ERANGE;
+		goto out;
+	}
+
+	/* 原厂 mode=0 的收尾（temp_ctrl_read）：过 100 °C 斜率减半，再钳到 110。 */
+	if (out > 100)
+		out = 100 + (out - 100) / 2;
+	if (out > 110)
+		out = 110;
+
+	seq_printf(s, "temp_c=%d\n", out);
+	seq_printf(s, "raw=%u samples=%u t=%u\n", avg, n, t);
+
+out:
+	mutex_unlock(&zx_soc_temp_lock);
+	return ret;
+}
+
+static int zx_accel_soc_temp_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_accel_soc_temp_show, inode->i_private);
+}
+
+/* 只读：没有 .write，权限 0444（见 zx279128s-main.c 的 debugfs 注册）。
+ * 每次 cat 都会真的去触发一次转换——硬件只在读的时候碰。 */
+const struct file_operations zx_accel_soc_temp_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_accel_soc_temp_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};

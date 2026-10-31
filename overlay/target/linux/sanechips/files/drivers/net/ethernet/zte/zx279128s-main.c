@@ -2888,6 +2888,13 @@ static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 			    &zx_accel_learn_fops);
 	debugfs_create_file("accel_autofallback", 0644, dir, adapter,
 			    &zx_accel_autofallback_fops);
+	/*
+	 * SoC 温度（只读，0444）：读一次就现场触发一次转换并返回摄氏度。
+	 * 传感器是懒映射的，probe 不碰它；完整寄存器语义见 zx279128s-accel.c
+	 * 的 "SoC 温度" 一节（由原厂 vmlinux 反汇编得出）。
+	 */
+	debugfs_create_file("soc_temp", 0444, dir, adapter,
+			    &zx_accel_soc_temp_fops);
 }
 
 static void zx_pkt_pool_free(struct device *dev,

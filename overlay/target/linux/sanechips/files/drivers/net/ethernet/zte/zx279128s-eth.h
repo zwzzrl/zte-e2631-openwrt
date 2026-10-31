@@ -708,6 +708,14 @@ struct zx_eth_adapter {
 	struct notifier_block	sw_netdev_nb;
 	struct notifier_block	sw_switchdev_nb;
 	struct notifier_block	sw_switchdev_blocking_nb;
+
+	/*
+	 * SoC 温度传感器（debugfs soc_temp，见 zx279128s-accel.c 那一节）。
+	 * 懒映射：**probe 不碰传感器**，第一次读 soc_temp 时才 devm_ioremap
+	 * 0x94100000 一页并做一次性初始化，所以没人读过时这两个字段一直是空的。
+	 */
+	void __iomem		*soc_temp_base;	/* 已挪到 0x94100034 */
+	bool			soc_temp_inited;/* 一次性使能/detector 配置已做过 */
 };
 
 /* MAC in the layout of the switch's MAC registers: bytes 2-5, then 0-1 */
@@ -855,7 +863,7 @@ struct zx_ffe_egress_ops {
 			  struct zx_ffe_flow *flow);
 };
 /* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, ffe_aging,
- * ffe_migrate, ffe_learn, accel_autofallback
+ * ffe_migrate, ffe_learn, accel_autofallback, soc_temp
  */
 extern const struct file_operations zx_accel_v4_fops;
 extern const struct file_operations zx_accel_v6_fops;
@@ -867,6 +875,7 @@ extern const struct file_operations zx_accel_aging_fops;
 extern const struct file_operations zx_accel_migrate_fops;
 extern const struct file_operations zx_accel_learn_fops;
 extern const struct file_operations zx_accel_autofallback_fops;
+extern const struct file_operations zx_accel_soc_temp_fops;
 
 /* zx279128s-switch.c */
 void zx_sw_init(struct zx_eth_adapter *adapter);
