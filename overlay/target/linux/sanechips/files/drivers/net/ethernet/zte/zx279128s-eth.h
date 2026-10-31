@@ -297,20 +297,22 @@ enum zx_accel_mode {
 
 /*
  * 快路计数：cnt[0] 是 IPv4，cnt[1] 是 IPv6，口径见设计 §1.5 / P1-TASK §1。
- * P1（shadow，只判不发）的不变式是 lookup == hit + miss：每一帧进判据链时
- * lookup 加一，通过全部判据才算 hit，其余一律 miss；csum_err/ttl_err/
- * drop_local/drop_noport/fallback 是 miss 的子集，用来区分是哪条判据把它挡
- * 回去的。P1 没有 fwd（真转发在 P2），hit 的帧照样走协议栈。
+ * 不变式 lookup == hit + miss：每一帧进判据链时 lookup 加一，真正被转发出去
+ * 的才算 hit（所以 P2 起 hit == fwd），其余一律 miss；csum_err/ttl_err/
+ * drop_local/drop_noport/fallback/fallback_qfull/rx_drop 都是 miss 的子集，
+ * 用来区分是哪条判据把它挡回去的（rx_drop 是"改写后提交失败"的兜底，理论上
+ * 不可达）。
  */
 struct zx_ffe_cnt {
 	u64	lookup;		/* 进判据链的帧 */
-	u64	hit;		/* 通过全部判据（P2 里会转发） */
-	u64	miss;		/* 没通过：查表未命中或任一判据不符 */
+	u64	hit;		/* 通过全部判据并真正转发（P2 起 hit == fwd） */
+	u64	miss;		/* 没通过：查表未命中或任一判据不符（含下面的子集） */
 	u64	fwd;		/* P2：真正交给发送硬件 */
 	u64	drop_noport;	/* miss 的子集：出口端口不存在/down */
 	u64	drop_local;	/* miss 的子集：目的 IP 属本机（终结） */
 	u64	fallback;	/* miss 的子集：查表命中但被同口等判据挡回栈 */
 	u64	fallback_qfull;	/* P2：其中因为 TX 环满而回栈 */
+	u64	rx_drop;	/* P2：已改写但提交失败（不可达），只能丢帧 */
 	u64	csum_err;	/* miss 的子集：IPv4 头校验和错 */
 	u64	ttl_err;	/* miss 的子集：TTL 到期 */
 	u64	bytes;		/* fwd 的字节数 */
@@ -603,6 +605,14 @@ void zx_eth_for_each_adapter(void (*fn)(struct zx_eth_adapter *adapter,
 				       void *data), void *data);
 /* Reclaim the sent frames the DMA reported; the caller holds tx_lock. */
 void zx_tx_reclaim(struct zx_eth_adapter *adapter);
+/*
+ * Hand the frame in pool buffer bp to the egress TM queue of eport: descriptor,
+ * one TX_START, the ring accounting and the queue-stop throttle.  The caller
+ * holds tx_lock and owns bp.  Returns false - nothing written at all - when the
+ * ring is full, so the caller may still hand the untouched frame to the stack.
+ */
+bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
+		     unsigned len);
 /* Turn the zero-copy path on/off.  It takes rtnl_lock() itself, so the caller
  * must not hold rtnl (zx_accel_set() relies on that).
  */
@@ -628,12 +638,24 @@ void zx_accel_on_close(struct zx_eth_adapter *adapter);
 /* Ethernet type to family: 0 = IPv4, 1 = IPv6, -1 = the fast path passes. */
 int zx_eth_family(__be16 proto);
 /*
- * P1 shadow 判定：按设计 §2.2 的判据链判断"这一帧如果走快路会不会成功"，
- * 结果只进 cnt[family] 与流表条目的 hits/bytes，返回值本身在 P1 里没有意义
- * （调用方一律让帧继续走原栈路径）。数据面只读 + 计数，不消费描述符、不还 bp。
+ * zx_ffe_rx() 的结果（P2 起真转发）。调用方 zx_eth_rx() 据此决定收尾：
+ *   STACK     没转发，帧一个字节都没动：照原路径走 zc/skb/GRO
+ *   FORWARDED 已写进发送描述符：只做 RX 收尾，**不许**还 bp（硬件发完自己还）
+ *   DROPPED   在快路里确定丢了：做 RX 收尾并把 bp 还给 BMU
  */
-bool zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len, int rx_port,
-	       int family, __be16 h_proto);
+enum zx_ffe_rx_result {
+	ZX_FFE_RX_STACK = 0,
+	ZX_FFE_RX_FORWARDED,
+	ZX_FFE_RX_DROPPED,
+};
+/*
+ * P2 真转发：按设计 §2.2 的判据链判断，全部通过就把**同一个 bp** 写进发送
+ * 描述符（zx_tx_submit_bp()）交给硬件，帧不再进 zc/skb/协议栈。判据不符一律
+ * 返回 STACK 且帧完好无损；数据面不消费描述符、不还 bp，收尾由调用方按返回
+ * 值做（收尾对账见 zx279128s-main.c 的 ffe_done 标签）。
+ */
+enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
+				int rx_port, int family, __be16 h_proto);
 /* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, accel_autofallback */
 extern const struct file_operations zx_accel_v4_fops;
 extern const struct file_operations zx_accel_v6_fops;

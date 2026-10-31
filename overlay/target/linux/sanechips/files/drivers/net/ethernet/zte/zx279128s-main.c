@@ -1591,6 +1591,68 @@ void zx_zc_set(struct zx_eth_adapter *adapter, bool on)
 /* ---- TX path ------------------------------------------------------- */
 
 /*
+ * 把一个已经躺在池槽位 bp 里的帧提交给发送硬件：写描述符 → 每包一次
+ * TX_START → 推进/占用发送环 → 到限流就停所有端口队列。
+ *
+ * 栈路径（zx_eth_xmit()）与快路（zx279128s-accel.c 的 zx_ffe_rx()）共用这
+ * 一段，保证"协议栈发出去的帧"和"驱动内快路转发的帧"在硬件看来逐字节一样：
+ * 同一套 desc[0..2] 常量、同一次 dma_wmb()、同一次 writel(ZX_DMA_TX_START)、
+ * 同一套 tx_cur_idx/tx_pending 与限流动作。
+ *
+ * **调用方必须持 adapter->tx_lock**（本函数不加锁、也不检查持有者）：环索引、
+ * tx_pending 与描述符的写入必须与 zx_tx_reclaim() 的唤醒、别的端口的提交互斥。
+ * 调用方还必须拥有 bp：描述符一写，硬件就会去读这个槽位，之后再"还回去/改写
+ * 内容"都是二次所有权。
+ *
+ * 返回 false 表示环满（tx_pending >= ZX_TX_QUEUE_LIMIT）：这时**一个字节都没
+ * 写**，bp 与帧内容保持调用前的样子，调用方可以安全地把这一帧交给协议栈。
+ * tx_lock 在手里时这个判断不会被别人改变——tx_pending 只在 tx_lock 下增长。
+ */
+bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
+		     unsigned len)
+{
+	void __iomem *base = adapter->base;
+	__le32 *desc;
+	u32 tx_idx;
+
+	if (unlikely(adapter->tx_pending >= ZX_TX_QUEUE_LIMIT))
+		return false;
+
+	tx_idx = adapter->tx_cur_idx % ZX_NUM_TX_DESC;
+	desc = (__le32 *)adapter->tx_ring + tx_idx * (ZX_DESC_SIZE / sizeof(*desc));
+
+	/*
+	 * Directed egress to the port's TM queue.  The switch does not
+	 * forward between ports: the Linux bridge does, one netdev per port.
+	 */
+	desc[0] = cpu_to_le32(0x80 | (ZX_PORT_TX_QUEUE(eport) << 20));
+	desc[3] = cpu_to_le32(0x3 | ((len & 0x3fff) << 2));
+	desc[1] = cpu_to_le32(0x10000);
+	desc[2] = cpu_to_le32(0x21000000 | ((len & 0x3fff) << 9));
+
+	((u8 *)desc)[7] = (u8)((bp & 0x7f) << 1);
+	((u8 *)desc)[8] = (u8)(bp >> 7);
+
+	dma_wmb();
+	writel(1, base + ZX_DMA_TX_START);
+
+	adapter->tx_cur_idx++;
+	adapter->tx_pending++;
+	/* 快路与栈共用一个环，dma_state 的 qlen_peak 记整环占用峰值 */
+	if (adapter->tx_pending > READ_ONCE(adapter->accel.cnt[0].qlen_peak))
+		WRITE_ONCE(adapter->accel.cnt[0].qlen_peak, adapter->tx_pending);
+	if (adapter->tx_pending >= ZX_TX_QUEUE_LIMIT) {
+		int p;
+
+		for (p = 0; p < ZX_NUM_PORTS; p++)
+			if (adapter->ports[p])
+				netif_stop_queue(adapter->ports[p]);
+		zx_tx_kick(adapter);
+	}
+	return true;
+}
+
+/*
  * 池子的映射属性（缓存 / 非缓存）由 pool_cacheable 决定，两条路径的实测代价见
  * docs/ffe-cacheable-pool-2026-10-30.md。预取（pld/pldw）在这颗 SoC 上是负收益：实测 1400 B
  * 帧的接收拷贝 6.67 -> 9.85 us、发送拷贝+同步 15.09 -> 18.57 us，已回退。
@@ -1599,10 +1661,7 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	struct zx_eth_priv *priv = netdev_priv(netdev);
 	struct zx_eth_adapter *adapter = priv->adapter;
-	void __iomem *base = adapter->base;
 	unsigned int len = skb->len;
-	__le32 *desc;
-	u32 tx_idx;
 	u8 *buf_ptr;
 	int bp;
 	u16 zcbp = 0;
@@ -1681,23 +1740,20 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 					   16 + len, DMA_TO_DEVICE);
 
 	t_copy = ZX_TS();
-	tx_idx = adapter->tx_cur_idx % ZX_NUM_TX_DESC;
-	desc = (__le32 *)adapter->tx_ring + tx_idx * (ZX_DESC_SIZE / sizeof(*desc));
-
 	/*
-	 * Directed egress to the port's TM queue.  The switch does not
-	 * forward between ports: the Linux bridge does, one netdev per port.
+	 * 描述符 + TX_START + 环推进 + 限流都在 zx_tx_submit_bp() 里，快路用的是
+	 * 同一段代码。上面在同一次 tx_lock 会话里刚查过容量，tx_pending 在那之后
+	 * 只可能被本函数增加，所以这里不可能返回 false；真出现就丢帧（bp 归还，
+	 * zc 的那份 bp 由 skb 的 destructor 收回去），绝不发半成品。
 	 */
-	desc[0] = cpu_to_le32(0x80 | (ZX_PORT_TX_QUEUE(priv->port) << 20));
-	desc[3] = cpu_to_le32(0x3 | ((len & 0x3fff) << 2));
-	desc[1] = cpu_to_le32(0x10000);
-	desc[2] = cpu_to_le32(0x21000000 | ((len & 0x3fff) << 9));
-
-	((u8 *)desc)[7] = (u8)((bp & 0x7f) << 1);
-	((u8 *)desc)[8] = (u8)(bp >> 7);
-
-	dma_wmb();
-	writel(1, base + ZX_DMA_TX_START);
+	if (unlikely(!zx_tx_submit_bp(adapter, priv->port, (u16)bp, len))) {
+		if (!zcbp)
+			zx_bmu_free_bp(adapter, bp);
+		spin_unlock_bh(&adapter->tx_lock);
+		dev_dstats_tx_dropped(netdev);
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
 	t_start = ZX_TS();
 
 	if (unlikely(timing)) {
@@ -1708,16 +1764,6 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 		adapter->tx_stage_n++;
 	}
 
-	adapter->tx_cur_idx++;
-	adapter->tx_pending++;
-	if (adapter->tx_pending >= ZX_TX_QUEUE_LIMIT) {
-		int p;
-
-		for (p = 0; p < ZX_NUM_PORTS; p++)
-			if (adapter->ports[p])
-				netif_stop_queue(adapter->ports[p]);
-		zx_tx_kick(adapter);
-	}
 	spin_unlock_bh(&adapter->tx_lock);
 	dev_dstats_tx_add(netdev, len);
 	dev_kfree_skb_any(skb);
@@ -1877,9 +1923,9 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			/*
 			 * 加速分发点（唯一，设计 §1.2）：描述符已解析、池已
 			 * invalidate、自有源 MAC 已排除，但还没有建任何 skb。
-			 * P1 只判不发——zx_ffe_rx() 只读帧头并计数，返回值一律
-			 * 忽略，帧继续走下面的 zc/skb 路径。**不许**在这里
-			 * continue / 消费描述符 / 还 bp（那会把帧丢掉）。
+			 * P2 起 zx_ffe_rx() 会真转发：返回非 STACK 就说明这一帧
+			 * 已经交给发送硬件（或已在快路里确定丢了），后面只做 RX
+			 * 收尾，**不许**再建 skb、不许把 bp 还给 BMU。
 			 *
 			 * 协议族在 quiesce 判断之前算好：零拷贝那一段也要用它
 			 * （zc 按族生效，见下）。两者都在 goto 之前初始化，所以
@@ -1888,6 +1934,7 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			__be16 h_proto = *(__be16 *)((u8 *)adapter->pkt_pool +
 				(u32)bp * ZX_BUF_SIZE + 16 + 2 * ETH_ALEN);
 			int fam = zx_eth_family(h_proto);
+			int ffe = ZX_FFE_RX_STACK;
 
 			if (unlikely(READ_ONCE(adapter->accel.quiesce)))
 				goto accel_slow;
@@ -1900,17 +1947,19 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			if (fam >= 0) {
 				if (zx_accel_cur_mode(&adapter->accel, fam) ==
 				    ZX_ACC_FFE)
-					zx_ffe_rx(adapter, bp, len, port, fam,
-						  h_proto);
+					ffe = zx_ffe_rx(adapter, bp, len, port, fam,
+							h_proto);
 			} else {
 				int nfam = zx_accel_cur_mode(&adapter->accel, 0) ==
 					   ZX_ACC_FFE ? 0 : 1;
 
 				if (zx_accel_cur_mode(&adapter->accel, nfam) ==
 				    ZX_ACC_FFE)
-					zx_ffe_rx(adapter, bp, len, port, nfam,
-						  h_proto);
+					ffe = zx_ffe_rx(adapter, bp, len, port, nfam,
+							h_proto);
 			}
+			if (ffe != ZX_FFE_RX_STACK)
+				goto ffe_done;
 accel_slow:
 			/*
 			 * 零拷贝：把槽位本身做成 skb 交给协议栈，bp 先不还。
@@ -2026,6 +2075,39 @@ zc_skip:
 				adapter->rx_stage_ns[4] += t5 - t4;
 				adapter->rx_stage_n++;
 			}
+			continue;
+
+ffe_done:
+			/*
+			 * 快路收尾。与上面慢路径的收尾**逐行对照**（P2-TASK §1）：
+			 *
+			 *   描述符消费 zx_rx_consume(desc, rel) —— 同一句：按描述符
+			 *     byte6 bit0 记 release class 并清零描述符。快路帧也必须
+			 *     走这一句，否则 RX 环卡死、ring B 的保留槽位迟早用完。
+			 *   rx_cur_idx[q]++ / work_done++ / avail-- —— 同慢路径，
+			 *     一个字都不差（预算、索引推进、环内待处理计数）。
+			 *   bp —— **唯一的不同**：慢路径在 !zc 时 zx_bmu_free_bp()
+			 *     把槽位还给 BMU；快路里同一个 bp 已经写进发送描述符，
+			 *     发完由 BMU 自己归还。这里再还一次就是"一个槽位两个
+			 *     属主"：RX 环立刻重填同一个槽位，而发送硬件还在读它
+			 *     当发送缓冲。所以 FORWARDED 一律不还。
+			 *   rel[] 批量释放 —— 同慢路径：消费见上面一句，真正下发在
+			 *     本圈循环外的 dma_wmb() + zx_rx_release()，快路帧与
+			 *     慢路帧在同一批量里结账，释放时机不变。
+			 *   timing 统计 —— 快路不加样本（它是另一条路径，加了会把
+			 *     慢路的每段均值稀释成没有意义的数）。
+			 *
+			 * DROPPED 是"改写之后提交失败"的兜底（理论上不可达）：帧已
+			 * 经改过，不能回栈，但槽位也没交给硬件，所以必须还 bp。
+			 */
+			zx_rx_consume(desc, rel);
+			adapter->rx_cur_idx[q]++;
+			work_done++;
+			avail--;
+			if (ffe == ZX_FFE_RX_DROPPED &&
+			    zx_bmu_free_bp(adapter, bp))
+				adapter->bmu_free_fail++;
+			continue;
 		}
 		if (rel[0] || rel[1])
 			dma_wmb();
