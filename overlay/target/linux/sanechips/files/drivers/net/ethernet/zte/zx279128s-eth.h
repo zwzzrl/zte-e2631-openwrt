@@ -977,6 +977,8 @@ struct zx_eth_adapter {
 	 */
 	struct zx_pppoe_sess	pppoe_sess;
 	struct work_struct	pppoe_flush_work;
+	/* C1：submit 因 bp 已在发送环而拒掉的次数（放尾部：既有成员偏移一个都不动） */
+	u64			tx_dup_reject;
 };
 
 /* MAC in the layout of the switch's MAC registers: bytes 2-5, then 0-1 */

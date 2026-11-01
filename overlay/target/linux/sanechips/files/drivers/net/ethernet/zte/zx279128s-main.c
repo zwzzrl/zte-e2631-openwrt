@@ -73,13 +73,13 @@ module_param(ffe_poison, bool, 0644);
 MODULE_PARM_DESC(ffe_poison, "Poison the first 16 B of a bp on return to the BMU and count poisoned RX frames (default: on)");
 
 /*
- * P10.5 A3：RX 拿到仍在发送环里的 bp 时**拦投递**（丢帧、不归还），默认关。
- * 只有先证明 bp_state 零假阳性（见 dma_state 的 ffe_dup/bp_double_free）
- * 才允许打开 —— 状态误判会把合法帧丢掉。默认只由 A0 计数。
+ * P10.5 A3：RX 拿到仍在发送环里的 bp 时**拦投递**（丢帧、不归还）。C1 起默认开：
+ * 它是"同一个 bp 被写进两个发送描述符"的第一道闸，误判窗口只有"硬件已完成、
+ * reclaim 还没记到"那一段（soak 实测 8/6935 万帧）；写 0 可关掉做 A/B。
  */
-static bool ffe_bp_drop;
+static bool ffe_bp_drop = true;
 module_param(ffe_bp_drop, bool, 0644);
-MODULE_PARM_DESC(ffe_bp_drop, "Drop RX frames whose bp is still in the TX ring (A3, default: off)");
+MODULE_PARM_DESC(ffe_bp_drop, "Drop RX frames whose bp is still in the TX ring (A3, default: on)");
 
 /*
  * 零拷贝：接收时把 BMU 池里的槽位直接当成 skb 的数据区交给协议栈，发送时把同一个
@@ -582,6 +582,9 @@ out:
  * 只改"还不还"，**不改"送不送"**：丢弃决定、描述符消费、索引推进一个字节
  * 都不动；被拒的只是"再还一次 BMU"这个动作。
  *
+ * C1 补一条同源判据：bp_state[bp]==FREE 但槽位仍带毒，说明硬件已经把这个 bp
+ * 还回 BMU（FREE 二义性），这一份描述符是重放 —— 再写一次空闲表就是第二份项。
+ *
  * 为什么必须拒：bp_state[bp]==TX 说明这个槽位已经写进发送描述符、发送硬件
  * 还要读它。此时再 writel(bp, ZX_BMU_BUF_FREE)，BMU 空闲表就多出一份重复项，
  * 该 bp 从此被两个属主循环使用 —— 正是慢态"只有 1537/1540 两个 bp 在循环"
@@ -598,7 +601,8 @@ static int zx_bp_return(struct zx_eth_adapter *adapter, u16 bp)
 	if (unlikely(READ_ONCE(adapter->zc_rx)))
 		return zx_bmu_free_bp(adapter, bp);
 	if (unlikely(bp < ZX_NUM_BUFFERS &&
-		     READ_ONCE(adapter->bp_state[bp]) == ZX_BP_TX)) {
+		     (READ_ONCE(adapter->bp_state[bp]) == ZX_BP_TX ||
+		      (READ_ONCE(ffe_poison) && zx_bp_poisoned(adapter, bp))))) {
 		adapter->bp_double_free++;
 		return 0;
 	}
@@ -1821,6 +1825,12 @@ bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
 
 	if (unlikely(adapter->tx_pending >= ZX_TX_QUEUE_LIMIT))
 		return false;
+	/* C1：bp 已在发送环就拒（调用方持 tx_lock）：否则 tx_bp[] 两格同 bp、reclaim 两次 FREE */
+	if (unlikely(adapter->bp_state && bp < ZX_NUM_BUFFERS &&
+		     READ_ONCE(adapter->bp_state[bp]) == ZX_BP_TX)) {
+		adapter->tx_dup_reject++;
+		return false;
+	}
 
 	tx_idx = adapter->tx_cur_idx % ZX_NUM_TX_DESC;
 	desc = (__le32 *)adapter->tx_ring + tx_idx * (ZX_DESC_SIZE / sizeof(*desc));
@@ -2960,11 +2970,12 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 	/*
 	 * P10.5：bp 生命周期取证（§6 的判读表按这几格读，TASK-P10.5-FIX §7）。
 	 *   ffe_dup        RX 拿到的 bp 仍在发送环里（A0 只计数；A3 才拦）
-	 *   bp_double_free A2 拒掉的二次归还（bp 仍是 TX 时又想还 BMU）
+	 *   bp_double_free A2/C1 拒掉的二次归还（bp 仍是 TX，或槽位仍带毒 = 重放）
+	 *   tx_dup_reject C1 拒掉的重复提交（提交时 bp 已经在发送环里）
 	 *   rx_poison      RX 帧首仍是我们归还时写的毒值（A4）
 	 *   bp_state_stale 完成记账漂移、状态表整体重扫的次数（应恒 0）
 	 *   bp_tx_now      账上仍在发送环里的 bp 个数（应 ≤ tx_pending）
-	 *   bp_poison/bp_drop 两个模块参数的现态（A4 默认 1、A3 默认 0）
+	 *   bp_poison/bp_drop 两个模块参数的现态（A4 默认 1、A3 自 C1 起默认 1）
 	 *   bp_hot         投递次数最多的 8 个 bp —— "同一 bp 的投递速率"
 	 */
 	{
@@ -2993,8 +3004,10 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 			hot_n[k] = n;
 			hot_bp[k] = (u16)i;
 		}
-		seq_printf(s, "ffe_dup=%llu bp_double_free=%llu rx_poison=%llu bp_state_stale=%u bp_tx_now=%u bp_poison=%d bp_drop=%d\n",
+		/* C1：bp_double_free 非 0 只表示"想再写一份空闲表项但被挡住"，不是"已损坏" */
+		seq_printf(s, "ffe_dup=%llu bp_double_free=%llu tx_dup_reject=%llu rx_poison=%llu bp_state_stale=%u bp_tx_now=%u bp_poison=%d bp_drop=%d\n",
 			   adapter->ffe_dup, adapter->bp_double_free,
+			   adapter->tx_dup_reject,
 			   adapter->rx_poison, adapter->bp_state_stale, tx_now,
 			   READ_ONCE(ffe_poison), READ_ONCE(ffe_bp_drop));
 		seq_puts(s, "bp_hot:");
