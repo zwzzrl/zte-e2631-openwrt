@@ -234,6 +234,13 @@ module_param(ffe_aging, uint, 0644);
 MODULE_PARM_DESC(ffe_aging, "Age out FFE flows after this many seconds (0 = never, default: 300)");
 
 /*
+ * learn_delay_ms 的生效值上限（10 分钟）。再长在本板上没有意义，而且超过约
+ * 49 天时 jiffies_to_msecs() 的 u32 返回值会让 ffe_learn 末尾的
+ * auto_enable_in_ms= 显示错值。init 里超限就钳到这里并打一条 dev_info。
+ */
+#define ZX_FFE_LEARN_DELAY_MAX_MS	600000
+
+/*
  * P10.3 学习门控延时（毫秒）。p10.2 把 learn_on 默认写成 1，两次开机都在
  * ~44 s 硬死机（关中断自旋、engine loaded/flow offload/wifi-on 三行全缺，
  * 见 .scratch/ffe-fastpath/DIAG-P10.2-HANG.md）；而 learn_on=0 开机、运行期
@@ -246,8 +253,10 @@ MODULE_PARM_DESC(ffe_aging, "Age out FFE flows after this many seconds (0 = neve
  * 2.83 ms，互不可比），只能当方向性证据：表空 ⇒ 无命中 ⇒ 没有快路转发；
  * 正式交付验收要补**同轮交替** stack/ffe 各 3 次 ×15 s。
  * 所以交付默认是"probe 期不学，probe 后延时这么久由 1 s 节拍自动开一次"，
- * 既拿到加速，又不让学习在开机窗口里活着。0 = 立刻开（等价于 p10.2 的旧
- * 行为，只在复现死机时用；它是开机参数，不是运行期开关）。
+ * 既拿到加速，又不让学习在开机窗口里活着。0 = probe 立刻开（等价于 p10.2
+ * 的旧行为）——**这条路径就是诊断镜像的复现开关**（起机参数
+ * zx279128s_eth.learn_delay_ms=0），只在复现死机时用；它是开机参数，不是
+ * 运行期开关。超过上限的生效值由 init 钳到 ZX_FFE_LEARN_DELAY_MAX_MS。
  */
 static unsigned int learn_delay_ms = 120000;
 module_param(learn_delay_ms, uint, 0444);
@@ -3658,6 +3667,9 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
 /*
  * P10.3：学习门控到点自动开一次。写 ffe_learn（debugfs）会清 learn_arm_at，
  * 所以用户手动开/关之后这里不会再插手；只开一次，不重复打印。
+ *
+ * 清 arm_at 用一次 cmpxchg（不加锁）：谁先清掉它谁说了算。用户写 ffe_learn
+ * 会让这次 cmpxchg 失败，于是不会把用户刚写的 0 覆盖成 1。
  */
 static void zx_ffe_learn_arm_tick(struct zx_eth_adapter *adapter)
 {
@@ -3666,7 +3678,8 @@ static void zx_ffe_learn_arm_tick(struct zx_eth_adapter *adapter)
 
 	if (!arm_at || time_before(jiffies, arm_at))
 		return;
-	WRITE_ONCE(accel->learn_arm_at, 0);
+	if (cmpxchg(&accel->learn_arm_at, arm_at, 0) != arm_at)
+		return;
 	WRITE_ONCE(accel->learn_on, 1);
 	dev_info(adapter->dev,
 		 "accel: ffe_learn auto-enabled %u ms after probe (ff_learn gate; see DIAG-P10.2-HANG.md)\n",
@@ -3725,10 +3738,25 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	 * P10.3 交付门控：probe 期不学，等开机窗口过去再由 1 s 节拍自动开一次
 	 * （原因见上面 learn_delay_ms 的注释）。learn_arm_at 用 jiffies 记到点
 	 * 时刻；写 ffe_learn 会清掉它。
+	 *
+	 * learn_delay_ms=0 是诊断镜像的复现开关：probe 里立刻把学习打开
+	 * （p10.2 的旧行为）。极端值先钳到 10 分钟，免得 show 里的
+	 * auto_enable_in_ms=（u32）显示错值。
 	 */
-	accel->learn_on = 0;
-	accel->learn_arm_at = learn_delay_ms ?
-		jiffies + msecs_to_jiffies(learn_delay_ms) : 0;
+	if (learn_delay_ms > ZX_FFE_LEARN_DELAY_MAX_MS) {
+		learn_delay_ms = ZX_FFE_LEARN_DELAY_MAX_MS;
+		dev_info(adapter->dev,
+			 "accel: learn_delay_ms clamped to %u ms\n",
+			 learn_delay_ms);
+	}
+	if (learn_delay_ms) {
+		accel->learn_on = 0;
+		accel->learn_arm_at =
+			jiffies + msecs_to_jiffies(learn_delay_ms);
+	} else {
+		accel->learn_on = 1;	/* 0 = probe 立刻学（复现 p10.2 旧行为） */
+		accel->learn_arm_at = 0;
+	}
 	accel->learn_cand = 0;
 	accel->learn_add = 0;
 	accel->learn_dup = 0;
@@ -4921,6 +4949,7 @@ static ssize_t zx_accel_learn_store(struct file *file, const char __user *ubuf,
 	struct zx_eth_adapter *adapter = s->private;
 	char buf[8];
 	char *cmd;
+	int on;
 
 	if (count == 0 || count >= sizeof(buf))
 		return -EINVAL;
@@ -4931,14 +4960,19 @@ static ssize_t zx_accel_learn_store(struct file *file, const char __user *ubuf,
 
 	/* 只在写的那一刻切；钩子与 work 都走 READ_ONCE 读这一个字节 */
 	if (!strcmp(cmd, "1") || !strcmp(cmd, "on"))
-		WRITE_ONCE(adapter->accel.learn_on, 1);
+		on = 1;
 	else if (!strcmp(cmd, "0") || !strcmp(cmd, "off"))
-		WRITE_ONCE(adapter->accel.learn_on, 0);
+		on = 0;
 	else
 		return -EINVAL;
 
-	/* P10.3：手动写就是最终决定，取消待开 */
+	/*
+	 * P10.3：手动写就是最终决定。**先**取消待开、再写开关：tick 的 cmpxchg
+	 * 只认"arm_at 还是它读到的那个值"，所以无论 tick 抢在写口前面还是夹在
+	 * 这两步中间，最终生效的都是这里的 on，不会被自动开那条路径覆盖。
+	 */
 	WRITE_ONCE(adapter->accel.learn_arm_at, 0);
+	WRITE_ONCE(adapter->accel.learn_on, on);
 
 	dev_info(adapter->dev, "accel: ffe_learn %s\n",
 		 READ_ONCE(adapter->accel.learn_on) ? "enabled" : "disabled");

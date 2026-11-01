@@ -53,9 +53,14 @@ n=2 的非冷启动不能外推。
   1 s 节拍的 age work 最先调 `zx_ffe_learn_arm_tick()`，到点置 1、清零、打一条
   `accel: ffe_learn auto-enabled 120000 ms after probe`。
 - 参数 `learn_delay_ms`（module_param，0444，默认 **120000** ms）；0 = probe
-  立刻学，**只在复现死机时用**，它是开机参数，不是运行期开关。
+  立刻学，**这条路径就是诊断镜像复现 p10.2 死机的开关**（起机参数
+  `zx279128s_eth.learn_delay_ms=0`），只在复现时用，它是开机参数不是运行期开关；
+  生效值超过 600000 ms 时 init 会钳到 600000 ms 并打一条
+  `accel: learn_delay_ms clamped to 600000 ms`（只有真钳了才打）。
 - 可观测/可取消：`ffe_learn` 末尾追加 `auto_enable_in_ms=`（0 = 已自动开过，
-  或用户写过 `ffe_learn` 已接管），写 `0`/`1` 会清 `learn_arm_at`，用户意图优先。
+  或用户写过 `ffe_learn` 已接管），写 `0`/`1` 会清 `learn_arm_at`，用户意图优先；
+  tick 用 `cmpxchg` 清 `learn_arm_at`，写口又先清它再写开关，两侧交错时用户写的
+  值最终生效。
 - 门控必须"一次成型"：别改成"开机学 + 定时关"，那会重开死机窗口。
 
 ## 警告：改回"默认立刻学"之前必须先定案
