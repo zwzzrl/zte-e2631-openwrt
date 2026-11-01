@@ -241,6 +241,10 @@ MODULE_PARM_DESC(ffe_aging, "Age out FFE flows after this many seconds (0 = neve
  *
  * 但学习是 v6 加速的必要条件：同一个 p10.3a 镜像，学习关 = 300.8 Mbit/s
  * （ffe_flows 0 行、全 miss 回栈），运行期打开 = 775.1 Mbit/s。
+ * 口径限定（REVIEW-P10.3A.md，应 1659bc2f 证据审计）：这两个数是同一镜像上
+ * 的两次**单次**测量（相隔数分钟，max cwnd 197k vs 481k、mean RTT 3.7 vs
+ * 2.83 ms，互不可比），只能当方向性证据：表空 ⇒ 无命中 ⇒ 没有快路转发；
+ * 正式交付验收要补**同轮交替** stack/ffe 各 3 次 ×15 s。
  * 所以交付默认是"probe 期不学，probe 后延时这么久由 1 s 节拍自动开一次"，
  * 既拿到加速，又不让学习在开机窗口里活着。0 = 立刻开（等价于 p10.2 的旧
  * 行为，只在复现死机时用；它是开机参数，不是运行期开关）。

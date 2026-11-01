@@ -7,10 +7,11 @@
 
 ## 现象
 
-- p10.2 两次开机都在 ≈44 s 起打 `rcu_sched detected stalls`，单个 CPU 关中断自旋
-  （无 NMI 回栈、60 s 里只有 2 个 tick），且 `engine loaded`（≈44.7 s）、
-  `hardware flow offload enabled`（≈44.9 s）、`wifi-on: done`（≈48.9 s）三行全缺；
-  没有 oops/BUG，网络全死。串口原文：`verify-p10/f/boot-hang-1424.log`、
+- p10.2 两次开机都在 ≈44.7 s 冻结（`engine loaded`（≈44.7 s）、
+  `hardware flow offload enabled`（≈44.9 s）、`wifi-on: done`（≈48.9 s）三行全缺、
+  100% 丢包），`rcu_sched detected stalls` 直到 104.2/107.97 s 才打印；冻结的 CPU
+  关中断自旋（无 NMI 回栈、60 s 里只有 2 个 tick），没有 oops/BUG，网络全死。
+  串口原文：`verify-p10/f/boot-hang-1424.log`、
   `boot-hang-1424b.log`、`boot-hang-both.log`（2026-10-31 夜，现场目录 `f/`）。
 - 分析见 `DIAG-P10.2-HANG.md`（形态判读）与 `DIAG-BOOTLEARN-RACE.md`（锁/调用图裁定）。
 
@@ -20,19 +21,31 @@
 |---|---|
 | `accel_v6=ffe` + `ffe_learn=0` 开机 | 干净：三行齐、无 stall，裸启动观察 180 s；v6 单流 300.8/300.2 Mbit/s（全 miss 回栈） |
 | 同镜像运行期 `echo 1 > ffe_learn` | 775.1/773.4 Mbit/s，flows=4，静置 120 s 不死 |
-| `ffe_learn=1` 在开机窗口内 | p10.2 两次 ≈44 s 硬死机 |
+| `ffe_learn=1` 在开机窗口内 | p10.2 两次 ≈44.7 s 冻结（104.2/107.97 s 才报 stall） |
+
+> 口径限定（`REVIEW-P10.3A.md`，应 `1659bc2f` 证据审计）：300.8 与 775.1 是同一
+> 镜像上的两次**单次**测量（相隔数分钟，max cwnd 197k vs 481k、mean RTT 3.7 vs
+> 2.83 ms，互不可比），只能当方向性证据：表空 ⇒ 无命中 ⇒ 没有快路转发；正式交付
+> 验收要补**同轮交替** stack/ffe 各 3 次 ×15 s。
 
 见 `verify-p10/PHASE-G.md` §1 阶梯（S0–S4）。⇒ 死机只在"开机窗口内学习已活"
-时出现；运行期打开学习是健康的，而学习是 v6 加速的必要条件（不学 = 300 Mbit/s 档）。
+时出现；运行期打开学习是健康的，而学习是 v6 加速的必要条件（不学则表空、v6 没有
+快路可走）。
 
 ## 未找到根因
 
 自死锁假设被否定：`rhashtable_walk_*` 迭代期不持锁、`accel->lock` 是 mutex、
 PPE 链与 FFE 表零交集（含反汇编核对，把握 90%，见 `DIAG-BOOTLEARN-RACE.md`）。
 驱动里唯一"关中断区间内 printk"的点是 `zx_ffe_local_ip6_add()` 的
-`dev_warn_ratelimited()`（`zx279128s-accel.c:1007`）：串口 console 的
-`console_trylock_spinning()` 会关中断自旋等。P10.3 已把它搬到锁外，但这是
-**未证实候选**，不等于根因。
+`dev_warn_ratelimited()`（P10.3 前在 `zx279128s-accel.c:1007`，现在锁外
+`:1033`）：串口 console 的 `console_trylock_spinning()` 会关中断自旋等。
+P10.3 已把它搬到锁外，但这是**未证实候选**，不等于根因。
+
+本轮证据审计（`REVIEW-P10.3A.md`）还修正了两处口径：p10.2 的死机时刻应写成
+"≈44.7 s 冻结（应出 `engine loaded` 而未出）、104.2/107.97 s 才报 `rcu_sched`
+stall"，不是"44 s 起 stall"；且 p10.2 两次死亡**至少一次是冷上电**。所以门控版
+的"开机安全"必须用**冷上电矩阵**验证（用户已定 5 冷 + 3 温，每次 ≥180 s），
+n=2 的非冷启动不能外推。
 
 ## 门控设计（P10.3 交付形态）
 
