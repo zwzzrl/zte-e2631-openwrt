@@ -44,7 +44,8 @@
  * 地址/端口）拼成一条候选，写进**每 CPU 的无锁环**；age work 每秒排空一次，
  * 查邻居 MAC、按 ffe_add 的等价路径落表。钩子恒返回 NF_ACCEPT、只做 memcpy +
  * 环写，任何分配都留在 work 里——学习失败不影响转发。开关是 debugfs
- * `ffe_learn`（默认 0），计数也在那里。
+ * `ffe_learn`（**默认 1**，P10.2 F5 起与交付形态 `accel_ipv6=ffe` +
+ * `ffe_learn=1` 一致），计数也在那里。
  *
  * P5 修订一（桥出口）：WAN→LAN 的出口是 br-lan 而不是 lanX，钩子原来那条
  * "出口必须是本驱动端口"把整个方向挡住了。现在钩子允许桥出口、只记桥的
@@ -65,9 +66,10 @@
  *      （改写把 daddr 换成 daddr_out）；有条目不带 NAT_D → drop_local。
  *      drop_local 仍是 miss 的子集，但口径从"未查表的本机目的地"变成
  *      "命中条目且该条目没有 DNAT 改写"（见 zx_ffe_forward() 的 #13'）。
- *   3. **ffe_add 幂等**：同 key 已存在时原地更新（dmac/smac/mtu/NAT 输出/
- *      flags 合并/lastuse）并返回成功，不再 -EEXIST、不再产生重复行；学习
- *      路径的"已存在就刷新"与它共用 __zx_ffe_store()。见该函数的注释。
+ *   3. **ffe_add 幂等**：同 key 已存在时用新节点整体替换（dmac/smac/mtu/NAT
+ *      输出/flags 合并/hits/bytes 继承/lastuse 刷新）并返回成功，不再 -EEXIST、
+ *      不再产生重复行；学习路径的"已存在就刷新"与它共用 __zx_ffe_store()。
+ *      P10.2 F4 起不再原地改活条目，见 __zx_ffe_flow_replace()。
  *
  * P9（回程方向学习修复，**数据面零改动**）：P7 上机确认"回程方向永远学不到"
  * 是学习这一侧的两处阻塞，不是数据面问题（手工 ffe_add 一条回程条目后
@@ -120,9 +122,13 @@
  *      skb_headlen() 的起点是 skb->data，钩子里二者目前相等，但"从 data 起
  *      有 44 B"证明不了"从 ipv6_hdr 起有 44 B"。按 skb_network_offset() 折算
  *      （int 先转 unsigned 再比，负 offset 直接拒）。
- *   3. **补两条与数据面同口径的拒绝**：v6 的 payload_len < 4（端口都不全，
- *      学出来的键永不命中）与 hop_limit <= 1（数据面 #8 会 TTL_ERR 回栈）；
- *      parse4 也补 ttl <= 1（数据面 #9），这是 v4 判据集合唯一的变化。
+ *   3. **补两条拒绝**（P10.1；与数据面**不是"同口径"，而是严一档**）：
+ *      v6 的 payload_len < 4（端口都不全，学出来的键永不命中）与
+ *      hop_limit <= 1；parse4 也补 ttl <= 1。钩子在 POST_ROUTING，转发帧的
+ *      TTL/hop_limit 已经由 ip_forward()/ip6_forward() 递减过，所以这里看到
+ *      的 `<= 1` 对应数据面（递减前判）的 `<= 2`：学习侧多拒一档。方向是
+ *      安全的——只会少学一条短 TTL 流（traceroute 那类），不会学出数据面
+ *      必拒的条目。
  *   4. **入口/出口解析不出时不再静默丢**（复审 B 第 6 条）：learn_one 里
  *      "出口端口指针为空/没起来"的两处 return 并入 learn_nonport。
  *   5. **v6 钩子优先级改用 NF_IP6_PRI_LAST**（复审 A 第 4 条）：数值与
@@ -133,8 +139,9 @@
  *      字都没动，debugfs 文件数不变。
  *   7. **P9.1 老账**：brport 加 br_vlan_enabled() 护栏（开了 VLAN filtering 的
  *      桥不拿 vid=0 的 FDB 猜出口）、命中的端口再确认上层桥是候选里那个
- *      （防 ifindex 被复用）。顺带核对了 P10 的去重槽尺寸注释（槽 104 B /
- *      memcmp 96 B），已与实测一致，无需再改。
+ *      （防 ifindex 被复用）。P10.2 更正去重槽尺寸的口径：旧注释按 64 位
+ *      主机 ABI 记 104 B，本板 ARM32 实测 dedup=100 B / cand=96 B /
+ *      learn_cnt=72 B（见 ZX_FFE_DEDUP_SLOTS 处注释）。
  *
  * 锁与顺序约定（很重要）：
  *   - accel->lock 串行化模式切换。持有它时**可以**调 zx_zc_set()；
@@ -331,6 +338,32 @@ struct zx_ffe_flow {
 };
 
 /*
+ * 数据面的一次性条目快照（P10.2 F4）。
+ *
+ * 背景：控制面过去在**活条目**上原地改 flags/dmac/smac/daddr_out 等字段，而
+ * 数据面在 RCU 只读段里反复重读它们；最坏结果是"按无 NAT 校验通过、按有 NAT
+ * 改写"，发出一个改坏的帧。现在控制面改成"新节点 + rhashtable_replace_fast()
+ * + list_replace_rcu()"整体换位，数据面则在查到条目后**只读一次**，把后面
+ * 判据/改写/提交要用的字段全部拷进这个结构，之后不再解引用 flow。
+ *
+ * 只放"会被控制面更新"的字段；hits/bytes/lastuse 是数据面自己写的运行态，
+ * 不在快照里（见 zx_ffe_forward() 末尾的记账段）。
+ */
+struct zx_ffe_flow_rt {
+	u8		flags;
+	u8		dmac[ETH_ALEN];
+	u8		smac[ETH_ALEN];
+	u8		egress_type;
+	u16		egress_id;
+	u16		mtu;
+	__be32		saddr_out;
+	__be32		daddr_out;
+	__be16		sport_out;
+	__be16		dport_out;
+	u8		proto;
+};
+
+/*
  * ffe_add 可选 NAT 尾段的解析结果（P3-TASK §0 A.2）。先解析到这个临时结构，
  * 等 key/eport/dmac 全部通过、容量检查也过了，再一次性写进条目——失败路径
  * 不需要回滚半填的 flow。
@@ -442,9 +475,14 @@ static inline bool zx_ffe_learn_addr_eq(const union nf_inet_addr *a,
  * （learn_drop 涨），drain 里还要做上千次重复的邻居查询/落表。数据面命中时
  * 自己会刷新 lastuse，所以 dmac/MTU 每 1 s 刷新一次完全够用。
  *
- * 16 槽 × 104 B 的线性比（memcmp 整键 96 B，P10 把地址加宽到 16 B 之后）+
+ * 16 槽 × 100 B 的线性比（memcmp 整键 96 B，P10 把地址加宽到 16 B 之后）+
  * 一个 jiffies，只在**已经确认环有空位**之后才做；不分配、不取锁，表满就
  * 覆盖最老的一格（dedup_idx 轮转）。
+ *
+ * 尺寸口径（P10.2 更正）：旧注释写"104 B"是**按 64 位主机 ABI** 算的
+ * （unsigned long 8 B + cand 96 B）。本板是 ARM32：unsigned long 4 B，
+ * 所以实测 dedup=100 B、整键 cand=96 B、learn_cnt=72 B（9×u64）。
+ * 这些数只影响每 CPU 环占多少内存，不参与任何判据。
  * 同一 CPU 的软中断理论上可能嵌套，最坏结果是偶尔多投/漏投一条候选；计数
  * 本来就是"尽力而为"的口径，接受。
  */
@@ -669,7 +707,7 @@ static int __zx_ffe_insert(struct zx_eth_adapter *adapter,
 }
 
 /*
- * 同 key 条目的原地更新（P5 修订二 §C）：ffe_add 与旁路学习对"这条流已经在表
+ * 同 key 条目的合并语义（P10.2 F4）：ffe_add 与旁路学习对"这条流已经在表
  * 里"的处理必须是同一段代码，否则同一条流会被写进两行（P4 验收实测出现过），
  * 或者学习条目与静态条目在 flags 上打架。
  *
@@ -687,39 +725,100 @@ static int __zx_ffe_insert(struct zx_eth_adapter *adapter,
  *     ffe_flows 里只打 `S`，不会出现 `S L` 两个标记；
  *   - 学习条目不能把静态条目降级成学习条目。
  * hits/bytes 不清零：还是同一条流，计数连续比"看起来是新建的"有用。
+ * **与旧 __zx_ffe_flow_update() 语义一致：更新时刷新 `lastuse`**
+ * （任务书 §F4 的原意是"别让撕裂读"，不是"别刷新时间戳"；零回归优先，
+ * 主 agent 13:5x 拍板保持刷新）。旧实现结尾就是
+ * `flow->lastuse = jiffies`，即控制面更新被视为"这条流还活跃"。若改成继承
+ * 旧值，只靠 ffe_add/learn_dup 续命、数据面从不命中的条目会比以前更早老化，
+ * 出现"反复更新却被老化删掉"的抖动（P10.2 复审整改 2）。
+ *
+ * P10.2 F4：这段现在只操作**还没进表的新节点**（new 已由调用者按"后写者赢"
+ * 填好 dmac/smac/egress/mtu/NAT 输出），不再触碰活条目。旧条目的字段只被
+ * 读、不被写；运行态（hits/bytes）在这里继承到新节点，lastuse 刷新。
  */
-static void __zx_ffe_flow_update(struct zx_ffe_flow *flow,
-				 const struct zx_ffe_flow *src)
+static void __zx_ffe_flow_merge(struct zx_ffe_flow *new,
+				const struct zx_ffe_flow *old)
 {
-	ether_addr_copy(flow->dmac, src->dmac);
-	ether_addr_copy(flow->smac, src->smac);
-	flow->egress_type = src->egress_type;
-	flow->egress_id = src->egress_id;
-	flow->mtu = src->mtu;
-	if (src->flags & ZX_FFE_FLOW_NAT_S) {
-		flow->saddr_out = src->saddr_out;
-		flow->sport_out = src->sport_out;
+	/* NAT 位只增不减；新给者没给的维度继承旧值 */
+	new->flags |= old->flags & ZX_FFE_FLOW_NAT_MASK;
+	if (old->flags & ZX_FFE_FLOW_NAT_S &&
+	    !(new->flags & ZX_FFE_FLOW_NAT_S)) {
+		new->saddr_out = READ_ONCE(old->saddr_out);
+		new->sport_out = READ_ONCE(old->sport_out);
 	}
-	if (src->flags & ZX_FFE_FLOW_NAT_D) {
-		flow->daddr_out = src->daddr_out;
-		flow->dport_out = src->dport_out;
+	if (old->flags & ZX_FFE_FLOW_NAT_D &&
+	    !(new->flags & ZX_FFE_FLOW_NAT_D)) {
+		new->daddr_out = READ_ONCE(old->daddr_out);
+		new->dport_out = READ_ONCE(old->dport_out);
 	}
-	flow->flags |= src->flags & ZX_FFE_FLOW_NAT_MASK;
-	if (src->flags & ZX_FFE_FLOW_STATIC) {
-		flow->flags |= ZX_FFE_FLOW_STATIC;
-		flow->flags &= ~ZX_FFE_FLOW_LEARNED;
-	} else if (!(flow->flags & ZX_FFE_FLOW_STATIC)) {
-		flow->flags |= ZX_FFE_FLOW_LEARNED;
+	if ((old->flags | new->flags) & ZX_FFE_FLOW_STATIC) {
+		new->flags |= ZX_FFE_FLOW_STATIC;
+		new->flags &= ~ZX_FFE_FLOW_LEARNED;
+	} else {
+		new->flags |= ZX_FFE_FLOW_LEARNED;
 	}
-	flow->lastuse = jiffies;
+	/*
+	 * 运行态：hits/bytes 继承（统计连续），lastuse 刷新（与旧原地更新
+	 * 语义一致：控制面更新 = 这条流还活跃，避免"反复更新却被老化删掉"）。
+	 */
+	new->hits = READ_ONCE(old->hits);
+	new->bytes = READ_ONCE(old->bytes);
+	new->lastuse = jiffies;
+}
+
+/*
+ * 用新节点整体替换同 key 的旧节点（P10.2 F4）。
+ *
+ * 为什么必须换节点而不是原地改：数据面在 RCU 只读段里读 flags/dmac/smac/
+ * daddr_out 等字段，控制面原地写会让它读到"一半旧一半新"的组合（最坏是
+ * "按无 NAT 校验通过、按有 NAT 改写"）。换节点后数据面要么拿旧、要么拿新，
+ * 两边都是自洽的一份快照。
+ *
+ * 两条归属必须同时换，且都要在 accel->lock 里：
+ *   - rhashtable：rhashtable_replace_fast() 在同一个桶里把 obj_old 换
+ *     obj_new（内部就是 rcu_assign_pointer，见 6.18.55
+ *     include/linux/rhashtable.h:1147-1195）。数据面查表只会看到旧或新，
+ *     **不会短暂 miss**；表元素数不变，所以 n_flows 不用动。
+ *   - flow_list（老化/ffe_flows 遍历）：list_replace_rcu() 把 prev->next 和
+ *     next->prev 原子指向新节点（include/linux/rculist.h:244-262），前向遍历
+ *     的读者要么看到旧、要么看到新；老化 work 与本函数持同一把 accel->lock，
+ *     不会看到"哈希换了、链表还是旧的"的半状态。
+ *
+ * 旧节点 kfree_rcu()：还在 RCU 只读段里、拿着旧指针的数据面可以继续用到
+ * 宽限期结束。它们对 hits/bytes/lastuse 的写入会落到旧节点上（替换瞬间之后
+ * 的在飞帧，计数丢几个），不影响转发内容——新节点在替换时已经继承了旧节点的
+ * hits/bytes，并把 lastuse 刷新为替换时刻。
+ *
+ * 失败（只可能是 -ENOENT/-EINVAL，正常不可达）时两条结构都原封不动，新节点
+ * 由调用者释放；**不做**原地更新兜底，否则又把撕裂读放回来了。
+ */
+static int __zx_ffe_flow_replace(struct zx_eth_adapter *adapter,
+				 struct zx_ffe_flow *old,
+				 struct zx_ffe_flow *new)
+{
+	struct zx_accel *accel = &adapter->accel;
+	int ret;
+
+	__zx_ffe_flow_merge(new, old);
+
+	ret = rhashtable_replace_fast(&accel->flows, &old->node, &new->node,
+				      zx_ffe_ht_params);
+	if (ret)
+		return ret;
+
+	list_replace_rcu(&old->list, &new->list);
+	kfree_rcu(old, rcu);
+	return 0;
 }
 
 /*
  * 落表（ffe_add 与旁路学习共用的唯一入口）。调用者持 accel->lock。
- *   返回 1  = 同 key 已存在：字段已并进旧条目，**flow 本身没进表**（调用者
- *             自己释放它），表里同 key 永远只有一行；
- *   返回 0  = 新键，已插入；
- *   返回 <0 = 失败（-ENOSPC = 表满，-ENOMEM/-EEXIST 之类来自 rhashtable）。
+ *   返回 1  = 同 key 已存在：新节点已整体换上（旧节点 kfree_rcu），
+ *             **flow 已经属于表**，调用者不要再释放它；
+ *   返回 0  = 新键，已插入（flow 属于表）；
+ *   返回 <0 = 失败（-ENOSPC = 表满；-ENOMEM/-EEXIST 来自 rhashtable；
+ *             replace 失败是 -EINVAL/-ENOENT）。失败时 flow **没有进表**，
+ *             调用者自己释放。
  *
  * 容量检查放在**查表之后**：同 key 的更新不该因为表满被拒（ffe_add 幂等化的
  * 要点之一——表里已满 1024 条时，对一条已存在的键重新 add 必须成功）。表满
@@ -730,13 +829,14 @@ static int __zx_ffe_store(struct zx_eth_adapter *adapter,
 {
 	struct zx_accel *accel = &adapter->accel;
 	struct zx_ffe_flow *old;
+	int ret;
 
 	rcu_read_lock();
 	old = rhashtable_lookup(&accel->flows, &flow->key, zx_ffe_ht_params);
 	rcu_read_unlock();
 	if (old) {
-		__zx_ffe_flow_update(old, flow);
-		return 1;
+		ret = __zx_ffe_flow_replace(adapter, old, flow);
+		return ret ? ret : 1;
 	}
 	if (accel->n_flows >= ZX_FFE_FLOWS_MAX) {
 		accel->tbl_full++;
@@ -1069,6 +1169,22 @@ static struct net_device *zx_ffe_eport_dev(struct zx_eth_adapter *adapter,
 }
 
 /*
+ * 出口"现在能不能发"的唯一判据（P10.2 F3）：判据段（usable）与提交段
+ * （submit）必须用**同一套**，否则两处一漂移就会出现"判据说能发、提交段
+ * 按另一套判据说不能"或反过来。判据就是 zx_ffe_eport_dev() 的三条：
+ * 端口存在 + netif_running + netif_carrier_ok。
+ *
+ * 数据面不取 rtnl（会与 ndo 路径构成 ABBA），所以这两次判定都是良性竞态：
+ * 判不准的后果只有两种——判据段回栈（不丢包），或提交段丢帧（rx_drop++，
+ * bp 由 main.c 的 DROPPED 收尾还给 BMU）。绝不允许把帧发给一个已经
+ * carrier off 的端口却还记 fwd++。
+ */
+static inline bool zx_ffe_out_ok(struct zx_eth_adapter *adapter, u16 id)
+{
+	return zx_ffe_eport_dev(adapter, id) != NULL;
+}
+
+/*
  * 老化（设计 §4.1）：每秒一拍，某个条目超过 ffe_aging 秒没有被"全部判据
  * 通过"的帧命中就删掉。P1 的条目都是静态条目，照样老化（P1-TASK §3）。
  */
@@ -1322,11 +1438,11 @@ static int zx_ffe_learn_brport(struct zx_eth_adapter *adapter,
  *     的 MAC），MTU 取出口端口的。
  *   两条路的出口都必须解析成 0..4 的真端口才落表（解析失败不猜、不落表）。
  *
- * 已存在（同 key）：交给 __zx_ffe_flow_update() 原地刷新，计 learn_dup。字段
- * 与 flags 的合并规则写在那个函数头上（NAT 位只增不减、STATIC 只增不减）；
- * dmac 的更新没有加锁：数据面可能在同一条目上读到一个撕裂的 6 字节 MAC，代价
- * 是那一帧发到错 MAC 被交换机丢掉（不是发错内容）；邻居 MAC 变化本身极罕见，
- * 接受。
+ * 已存在（同 key）：交给 __zx_ffe_flow_replace() 用新节点整体替换，计
+ * learn_dup。字段与 flags 的合并规则写在 __zx_ffe_flow_merge() 头上（NAT 位
+ * 只增不减、STATIC 只增不减）；替换经 rhashtable_replace_fast() +
+ * list_replace_rcu()，数据面拿到的永远是自洽的一份（旧或新），不再有"读到
+ * 撕裂的 6 字节 MAC"那个窗口（P10.2 F4 之前是原地写、没有加锁）。
  */
 static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 			     const struct zx_ffe_learn_cand *cand)
@@ -1518,8 +1634,10 @@ static void zx_ffe_learn_one(struct zx_eth_adapter *adapter,
 	flow->lastuse = jiffies;
 	ret = __zx_ffe_store(adapter, flow);
 	if (ret == 1) {
-		/* 同 key 已存在：字段已经在 __zx_ffe_flow_update() 里并进旧条目 */
-		kfree(flow);
+		/*
+		 * 同 key 已存在：P10.2 F4 起是"新节点整体换上、旧节点
+		 * kfree_rcu"，flow 已经属于表，**不要 free**。
+		 */
 		accel->learn_dup++;
 		accel->learn_cnt[family == 6].dup++;
 	} else if (ret == 0) {
@@ -1637,8 +1755,10 @@ static inline bool zx_ffe_v6_is_linklocal(const struct in6_addr *addr)
  *   #5 无分片（MF/OFFSET）；
  *   #6 只学 TCP/UDP；
  *   #9 IP 头与 L4 端口都在 skb_headlen() 里（钩子不做 pskb_may_pull）；
- *   #9' TTL <= 1 放弃（P10.1，与数据面 #9 同口径：这种帧栈要发 ICMP Time
- *      Exceeded，快路一定 TTL_ERR 回栈，学了也命中不了）。
+ *   #9' TTL <= 1 放弃（P10.1）。**比数据面严一档**：本钩子在 POST_ROUTING，
+ *      转发帧的 TTL 已被 ip_forward() 递减，所以这里 `<= 1` 等价于数据面
+ *      （递减前）的 `<= 2`；数据面 ttl=2 的帧会转发，学习侧却不学。只会
+ *      少学（traceroute 那类短 TTL 流），不会学出数据面必拒的条目。
  * P9 的 GSO 放开不需要额外代码：这里没有任何 skb_is_gso() 判据，GSO skb 的
  * IP 头与 L4 头同样合法（同一五元组才会被 GRO 合并）。
  */
@@ -1659,7 +1779,10 @@ static bool zx_ffe_learn_parse4(struct sk_buff *skb,
 		return false;
 	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
 		return false;
-	/* #9' 与数据面 #9 同口径（P10.1）：TTL<=1 的帧数据面必 TTL_ERR 回栈 */
+	/*
+	 * #9' 与数据面 #9 **不是同口径，是严一档**（P10.1，见函数头）：
+	 * POST_ROUTING 看到的是已递减的 TTL，数据面 #9 判的是递减前的值。
+	 */
 	if (iph->ttl <= 1)
 		return false;
 	if (skb_headlen(skb) < iph->ihl * 4 + (unsigned int)sizeof(ports))
@@ -1691,7 +1814,10 @@ static bool zx_ffe_learn_parse4(struct sk_buff *skb,
  *      判据 #7 同一个黑名单（AH/ESP 等其余 next header 在下面按"非 TCP/UDP"
  *      拒掉，与数据面 #12 一致）。不猜扩展头长度，就不用把扩展头当 L4 端口
  *      读；这正是"v6 快路只吃纯 TCP/UDP 帧"的落地方式。
- *   4. **hop_limit <= 1 放弃**（P10.1）：数据面 #8 必 TTL_ERR 回栈。
+ *   4. **hop_limit <= 1 放弃**（P10.1）：**比数据面 #8 严一档**——钩子在
+ *      POST_ROUTING，转发帧的 hop_limit 已由 ip6_forward() 递减，这里
+ *      `<= 1` 对应数据面（递减前）的 `<= 2`。数据面 hlim=2 的帧会转发，
+ *      学习侧不学；只会少学，不会学出数据面必拒的条目。
  *   5. **ICMPv6(58) 排除**：NS/NA/RS/RA/MLD/echo 全在"非 TCP/UDP"这条里，
  *      与数据面 #12 同一刀。
  *   6. **fe80::/10 源排除**：数据面 #11 不收链路本地源（避免旁路 ND 状态机），
@@ -1735,7 +1861,7 @@ static bool zx_ffe_learn_parse6(struct sk_buff *skb,
 	case IPPROTO_DSTOPTS:
 		return false;
 	}
-	/* 4. hop_limit<=1：数据面 #8 必 TTL_ERR 回栈（P10.1） */
+	/* 4. hop_limit<=1：比数据面 #8 严一档（POST_ROUTING 已递减，见函数头） */
 	if (ip6->hop_limit <= 1)
 		return false;
 	/* 5. 只学 TCP/UDP（ICMPv6 = 58 在这里被排除） */
@@ -1868,6 +1994,25 @@ static unsigned int zx_ffe_learn_hook(void *priv, struct sk_buff *skb,
 
 	/* 开关关掉时第一行就返回：零副作用（P5-TASK §1.8） */
 	if (!READ_ONCE(accel->learn_on))
+		return NF_ACCEPT;
+	/*
+	 * P10.2 复审整改 1：**学习只为喂 FFE**，该族不在 ffe 模式就直接返回。
+	 *
+	 * 交付形态是 `accel_v4=hw` + `accel_v6=ffe` + `ffe_learn=1`。若这里只按
+	 * learn_on 放行，IPv4 的 POST_ROUTING 钩子也会学，把 v4 条目写进与 v6
+	 * **共用**的 1024 条流表；v4 学满后 v6 学习会 tbl_full，而 v6 才是交付
+	 * 卖点。所以按族判"该族当前模式 == ffe"：不是就直接 return，
+	 * **不计数、不入环**（learn_cand 的口径仍是"钩子看到并成功投递"，
+	 * B2 的 `v6=ffe + learn=1 ⇒ Δcand = 2×连接数` 不变）。
+	 *
+	 * 用 zx_accel_cur_mode()（内部 READ_ONCE）而不是裸读字段：debugfs 切
+	 * 模式与钩子并发，读到旧值最多多学/少学一拍，下一拍自愈。
+	 */
+	if (state->pf == NFPROTO_IPV4 &&
+	    zx_accel_cur_mode(accel, 0) != ZX_ACC_FFE)
+		return NF_ACCEPT;
+	if (state->pf == NFPROTO_IPV6 &&
+	    zx_accel_cur_mode(accel, 1) != ZX_ACC_FFE)
 		return NF_ACCEPT;
 	/*
 	 * #1 按注册的协议族选报头解析器（P10）。钩子注册了两次（IPv4/IPv6），
@@ -2157,6 +2302,58 @@ static void zx_ffe_learn_drain(struct zx_eth_adapter *adapter)
  */
 
 /*
+ * 长度判据（P10.2 F1，v4/v6 共用同一份，别复制两份）：
+ *   avail   = 线缆上的 L3 字节数（含 MAC padding）= len - ETH_HLEN；
+ *   claimed = 报头声明的 IP 层长度（v4 = tot_len，v6 = 40 + payload_len）。
+ *
+ * 允许 padding、拒绝真截断与槽位残留：
+ *   claimed > avail              → 真截断，回栈（计 len_short）；
+ *   avail - claimed > MAX_PAD    → 尾部不是本帧的 padding，回栈（计 len_long）；
+ *   avail >= claimed 且差 <= 6   → 只可能是 MAC 补的最小帧 padding，放行。
+ * 容差**只允许 padding 方向**，所以"声称比实到还长"这件事永远不会被放过。
+ *
+ * 前置不变式（P10.2 复审整改 6）：调用者只会在 runt 判据之后调用
+ * （zx_ffe_ingress_switch_run() 的 `if (len < (family ? 64 : 60))`，当前在
+ * accel.c:3052），所以 `avail = len - ETH_HLEN >= 46`，是无符号安全值；
+ * 本函数里先判 `claimed > avail` 再减，`avail - claimed` 也不会下溢。
+ * **若将来给 zx_ffe_v4_check()/v6_check() 加别的调用点**（例如不经 runt 的
+ * 直调），调用者必须自己保证 `len >= ETH_HLEN`，否则 avail 会回绕成
+ * 巨大值、这条判据就失效。
+ *
+ * 为什么 6 B 的差不可能把 VLAN 外层误吞成 padding（已逐处确认）：
+ *   1. 进 parse 的帧，offset 12 就已经是 0x0800/0x86dd：
+ *      zx_ffe_ingress_switch_run() 在 frame+12 读 h_proto（A:2776），
+ *      zx_ffe_v4_check() 第一句核对 ETH_P_IP（A:2186）、v6 核对
+ *      ETH_P_IPV6（A:2265）。VLAN 帧的 h_proto 是 0x8100/0x88a8，在
+ *      这两句就 MISS，根本走不到长度判据。
+ *   2. RX 路径**没有**"剥了 VLAN 再交上来"的软件路径：zx_ffe_rx() 拿到的
+ *      是 BMU 池里的原始帧，main.c 的 RX 段没有任何 vlan_untag/skb_vlan
+ *      处理；交换机驱动的 VLAN 配置只服务 br 交换与 egress untag
+ *      （zx279128s-switch.c:131 ZX_SBRG_VLAN_UNTAG），不碰送 CPU 的帧。
+ *   3. 反过来说，如果哪天硬件在送 CPU 前剥 tag 而 len 仍含 4 B tag，
+ *      `len - ETH_HLEN` 的口径就错了——那时这条判据要跟着重核，不能
+ *      靠把 6 改大来圆。今天的代码与抓包都没有这种路径的证据。
+ *
+ * 注：v4 UDP 的最小 IP 包是 28 B，MAC padding 可到 18 B；本判据对它是
+ * 保守的（miss 回栈，不误发）。这条快路的目标帧（v6/TCP）6 B 是精确上界。
+ */
+static bool zx_ffe_len_ok(struct zx_accel *accel, int family, u32 avail,
+			  u32 claimed)
+{
+	struct zx_ffe_cnt *c = &accel->cnt[family];
+
+	if (claimed > avail) {
+		c->len_short++;
+		return false;
+	}
+	if (avail - claimed > ZX_FFE_MAX_PAD) {
+		c->len_long++;
+		return false;
+	}
+	return true;
+}
+
+/*
  * IPv4 判据链（设计 §2.2 + 勘误 §1/§2）。通过时填好 key 与 *pkt_len（IPv4 的
  * tot_len，即 IP 层长度），返回 ZX_FFE_V_OK。入口口/MAC/runt 三条两族共用的
  * 判据在 zx_ffe_rx() 的前置段里做过，这里不再重复。
@@ -2185,10 +2382,17 @@ zx_ffe_v4_check(struct zx_accel *accel, const u8 *frame, u16 len,
 	/* #4 只处理裸 IPv4（ARP/PPPoE/VLAN 外层/IPv6 都不碰） */
 	if (h_proto != htons(ETH_P_IP))
 		return ZX_FFE_V_MISS;
-	/* #5 版本/IHL/长度：带选项、被截断的都不碰 */
+	/* #5 版本/IHL/长度：带选项的、真截断的、尾部是槽位残留的都不碰。
+	 *
+	 * P10.2 F1 之前这里是 `tot_len > len - ETH_HLEN → miss`，只挡"声明
+	 * 比实到长"，不挡"实到比声明多一大截"——后者正是硬件长副本的形态
+	 * （len=1514、tot_len=40）。现在改走 zx_ffe_len_ok()，两个方向都挡，
+	 * 同时把 <= 6 B 的 MAC padding（60 B 裸 ACK）放进来。 */
 	memcpy(&ip, frame + ETH_HLEN, sizeof(ip));
-	if (ip.version != 4 || ip.ihl != 5 ||
-	    ntohs(ip.tot_len) > len - ETH_HLEN)
+	if (ip.version != 4 || ip.ihl != 5)
+		return ZX_FFE_V_MISS;
+	if (!zx_ffe_len_ok(accel, 0, (u32)len - ETH_HLEN,
+			   (u32)ntohs(ip.tot_len)))
 		return ZX_FFE_V_MISS;
 	/* #6 IPv4 头校验和（错的帧栈也会丢，快路不背这个锅） */
 	if (ip_fast_csum(&ip, ip.ihl))
@@ -2234,9 +2438,13 @@ zx_ffe_v4_check(struct zx_accel *accel, const u8 *frame, u16 len,
  * 顺序与理由：
  *   #4 ethertype 必须是 0x86dd（非 IP 帧走 nfam 分支进来时也在这里回栈）；
  *   #5 version == 6；
- *   #6 payload_len + 40 == 帧长 - 14：**严格相等**。payload_len 只算 40 B 固定
- *      头之后的部分（含扩展头），所以这条同时挡掉 jumbo payload（payload_len=0
- *      + 逐跳 jumbo 选项）、被截断的帧、被 GRO 聚合过的帧——快路不做任何拆分；
+ *   #6 长度：payload_len + 40 与"帧长 - 14"比较，**允许 <= 6 B 的 MAC
+ *      padding，不允许报头声明比实到长**（P10.2 F1）。payload_len 只算
+ *      40 B 固定头之后的部分（含扩展头），所以这条同时挡掉 jumbo payload
+ *      （payload_len=0 + 逐跳 jumbo 选项）、被截断的帧、被 GRO 聚合过的
+ *      帧，以及硬件长副本（len=1514、payload_len=20，尾部是槽位残留）；
+ *      快路不做任何拆分。padding 只可能是"最小帧 60 B"补出来的，v6 的
+ *      最小 L3（TCP/UDP）是 44 B ⇒ 最多 6 B，与 ZX_FFE_MAX_PAD 一致。
  *   #7 next_header 为 0/43/44/60（逐跳/路由/分片/目的选项）一律回栈：猜扩展头
  *      长度就是把扩展头当 L4 端口读，判错一次就是发错包；
  *   #8 hop_limit <= 1：必须由栈回 ICMPv6 Time Exceeded，计 ttl_err；
@@ -2268,9 +2476,9 @@ zx_ffe_v6_check(struct zx_accel *accel, const u8 *frame, u16 len,
 	/* #5 */
 	if (ip6.version != 6)
 		return ZX_FFE_V_MISS;
-	/* #6 */
+	/* #6 长度（P10.2 F1）：claimed 是 IP 层长度，不是 payload_len */
 	pkt = (u32)ntohs(ip6.payload_len) + sizeof(ip6);
-	if (pkt != (u32)len - ETH_HLEN)
+	if (!zx_ffe_len_ok(accel, 1, (u32)len - ETH_HLEN, pkt))
 		return ZX_FFE_V_MISS;
 	/* #7 */
 	switch (ip6.nexthdr) {
@@ -2295,7 +2503,11 @@ zx_ffe_v6_check(struct zx_accel *accel, const u8 *frame, u16 len,
 	/* #12 */
 	if (ip6.nexthdr != IPPROTO_TCP && ip6.nexthdr != IPPROTO_UDP)
 		return ZX_FFE_V_MISS;
-	/* #6 已保证 payload_len >= 4（len >= 64），端口 4 字节在帧内 */
+	/*
+	 * #6 + #3 保证 payload_len >= 4：len >= 64 ⇒ avail >= 50，而
+	 * claimed >= avail - 6 >= 44，claimed = 40 + plen ⇒ plen >= 4。
+	 * 端口 4 字节必在帧内。
+	 */
 	memcpy(ports, frame + ETH_HLEN + sizeof(ip6), sizeof(ports));
 
 	memset(key, 0, sizeof(*key));
@@ -2339,7 +2551,7 @@ zx_ffe_v6_check(struct zx_accel *accel, const u8 *frame, u16 len,
  *     地址那两处没这个问题：`ip->saddr` 是解引用 __be32，也是内存约定。
  */
 static void zx_ffe_v4_nat_rewrite(u8 *frame, struct iphdr *ip,
-				  const struct zx_ffe_flow *flow)
+				  const struct zx_ffe_flow_rt *rt)
 {
 	u8 *l4 = frame + ETH_HLEN + ip->ihl * 4;
 	bool udp = ip->protocol == IPPROTO_UDP;
@@ -2353,25 +2565,25 @@ static void zx_ffe_v4_nat_rewrite(u8 *frame, struct iphdr *ip,
 	__be16 dport = get_unaligned((__be16 *)(l4 + 2));
 
 	if (!(udp && !*check)) {
-		if (flow->flags & ZX_FFE_FLOW_NAT_S) {
-			csum_replace4(check, ip->saddr, flow->saddr_out);
-			csum_replace2(check, sport, flow->sport_out);
+		if (rt->flags & ZX_FFE_FLOW_NAT_S) {
+			csum_replace4(check, ip->saddr, rt->saddr_out);
+			csum_replace2(check, sport, rt->sport_out);
 		}
-		if (flow->flags & ZX_FFE_FLOW_NAT_D) {
-			csum_replace4(check, ip->daddr, flow->daddr_out);
-			csum_replace2(check, dport, flow->dport_out);
+		if (rt->flags & ZX_FFE_FLOW_NAT_D) {
+			csum_replace4(check, ip->daddr, rt->daddr_out);
+			csum_replace2(check, dport, rt->dport_out);
 		}
 		if (udp && !*check)
 			*check = CSUM_MANGLED_0;
 	}
 	/* 校验和算完才能动地址/端口：上面的 from 值必须是改写前的 */
-	if (flow->flags & ZX_FFE_FLOW_NAT_S) {
-		ip->saddr = flow->saddr_out;
-		put_unaligned(flow->sport_out, (__be16 *)l4);
+	if (rt->flags & ZX_FFE_FLOW_NAT_S) {
+		ip->saddr = rt->saddr_out;
+		put_unaligned(rt->sport_out, (__be16 *)l4);
 	}
-	if (flow->flags & ZX_FFE_FLOW_NAT_D) {
-		ip->daddr = flow->daddr_out;
-		put_unaligned(flow->dport_out, (__be16 *)(l4 + 2));
+	if (rt->flags & ZX_FFE_FLOW_NAT_D) {
+		ip->daddr = rt->daddr_out;
+		put_unaligned(rt->dport_out, (__be16 *)(l4 + 2));
 	}
 }
 
@@ -2392,22 +2604,47 @@ static void zx_ffe_v4_nat_rewrite(u8 *frame, struct iphdr *ip,
  * tx_lock 里、改写之前做完。改完以后帧头已经是出口形态，再交给协议栈就会发出
  * 一个 MAC 与 TTL 都被动过的坏包，所以调用点之后只剩"提交"和"丢弃"两条路。
  */
-static void zx_ffe_rewrite(u8 *frame, const struct zx_ffe_flow *flow, int family)
+/*
+ * 数据面条目快照：进 RCU 只读段、查到 flow 之后**只读这一次**，之后判据/
+ * 改写/提交只用 rt，不再解引用 flow（P10.2 F4）。
+ *
+ * 控制面现在用 __zx_ffe_flow_replace() 整体换节点，理论上一次 memcpy 也能
+ * 拿到自洽的一份；但"只拷要用到的字段"让数据面与结构布局解耦，也避免把
+ * rhash_head/list/rcu 这些会被控制面改的字段读进来。全部用 READ_ONCE：
+ * 换节点之前的旧代码路径（以及以后可能的原地写）不会读到撕裂值。
+ */
+static void zx_ffe_flow_snapshot(struct zx_ffe_flow_rt *rt,
+				 const struct zx_ffe_flow *flow)
+{
+	rt->flags = READ_ONCE(flow->flags);
+	ether_addr_copy(rt->dmac, flow->dmac);
+	ether_addr_copy(rt->smac, flow->smac);
+	rt->egress_type = READ_ONCE(flow->egress_type);
+	rt->egress_id = READ_ONCE(flow->egress_id);
+	rt->mtu = READ_ONCE(flow->mtu);
+	rt->saddr_out = READ_ONCE(flow->saddr_out);
+	rt->daddr_out = READ_ONCE(flow->daddr_out);
+	rt->sport_out = READ_ONCE(flow->sport_out);
+	rt->dport_out = READ_ONCE(flow->dport_out);
+	rt->proto = READ_ONCE(flow->key.proto);
+}
+
+static void zx_ffe_rewrite(u8 *frame, const struct zx_ffe_flow_rt *rt, int family)
 {
 	struct iphdr *ip = (struct iphdr *)(frame + ETH_HLEN);
 	struct ipv6hdr *ip6 = (struct ipv6hdr *)(frame + ETH_HLEN);
 
 	/* h_dest ← 出口下一跳 MAC；h_source ← 出口端口 MAC 快照（add 时取的） */
-	ether_addr_copy(frame, flow->dmac);
-	ether_addr_copy(frame + ETH_ALEN, flow->smac);
+	ether_addr_copy(frame, rt->dmac);
+	ether_addr_copy(frame + ETH_ALEN, rt->smac);
 
 	if (family) {
 		/* 判据 #8 已挡掉 hop_limit <= 1：这里必然 >= 2，减完 >= 1 */
 		ip6->hop_limit--;
 		return;
 	}
-	if (flow->flags & ZX_FFE_FLOW_NAT_MASK)
-		zx_ffe_v4_nat_rewrite(frame, ip, flow);
+	if (rt->flags & ZX_FFE_FLOW_NAT_MASK)
+		zx_ffe_v4_nat_rewrite(frame, ip, rt);
 	/* 判据 #9 已挡掉 ttl<=1：这里 ttl >= 2，减完必然 >= 1 */
 	ip->ttl--;
 	/*
@@ -2433,37 +2670,42 @@ static struct zx_ffe_flow *zx_ffe_lookup(struct zx_accel *accel,
 
 /*
  * 交换机出口的 usable()：本驱动端口 + running + carrier。判据与 P2 的 #14
- * 完全一样（就是 zx_ffe_eport_dev() 的返回值）：数据面不取 rtnl，判不准就
- * 回栈，不丢包。
+ * 完全一样，P10.2 F3 起与提交段共用 zx_ffe_out_ok()：数据面不取 rtnl，判不准
+ * 就回栈，不丢包。
  */
 static bool zx_ffe_egress_switch_usable(struct zx_eth_adapter *adapter, u16 id)
 {
-	return zx_ffe_eport_dev(adapter, id) != NULL;
+	return zx_ffe_out_ok(adapter, id);
 }
 
 /*
  * 交换机出口的提交：写发送描述符 + TX_START + 出口侧记账。
  *
  * 调用者（zx_ffe_forward()）已经持 adapter->tx_lock、刚查过环容量、并且已经把
- * 帧改写成出口形态，所以这里不可能失败；真失败（代码/内存被改坏）就按"丢帧"
- * 处理：帧已经改过，绝不能回栈，槽位也没交给硬件，由调用方把 bp 还给 BMU
- * （返回 DROPPED）。
+ * 帧改写成出口形态，所以这里正常不会失败；真失败（出口在判据段之后掉链、
+ * 代码/内存被改坏）就按"丢帧"处理：帧已经改过，绝不能回栈，槽位也没交给
+ * 硬件，由调用方把 bp 还给 BMU（返回 DROPPED，complete() 计 rx_drop）。
+ *
+ * P10.2 F3（usable() → submit() 的 TOCTOU）：判过出口可用之后、写描述符之前，
+ * 出口可能掉链（carrier off）或 admin down。旧代码照样写描述符并记 fwd++，
+ * 这一帧没有任何 FFE 计数能看见它没出去。现在在真正提交前**紧邻处**用同一套
+ * zx_ffe_out_ok() 再判一次，不满足就返回失败（调用方返 DROPPED：bp 还给
+ * BMU、rx_drop++、dev_warn_ratelimited），fwd++ 只在提交成功后由 complete()
+ * 加。数据面不取 rtnl，所以这是"宁可丢一帧也不发错"的良性竞态。
  *
  * 现在恒 n == 1（design §5 第 1 条的批量预留）：一批一帧，与 P2 的提交段**逐字节
  * 等价**——同一个描述符内容、同一次 TX_START、同样的失败返回。将来的批量提交
  * （一次取锁/一次记账）只改这个函数内部，分层与调用方不变。
  *
- * TOCTOU：flow->egress_id 可被进程上下文（ffe_add 同 key 更新 / learn_dup）
- * 原地改写，所以本函数只在入口取一次快照；快照与之前 usable() 之间仍有窗口
- * （判过的口到提交时可能已不可用），属可接受的一帧级误差。
+ * P10.2 F4 起不再收 flow 指针：egress_id 由调用方从 RCU 段的条目快照传入，
+ * 控制面换节点不会让提交段落到另一条条目的出口上。
  */
 static int zx_ffe_egress_switch_submit(struct zx_eth_adapter *adapter,
 				       struct zx_ffe_pkt **pkts, int n,
-				       struct zx_ffe_flow *flow)
+				       u16 eid)
 {
 	struct zx_ffe_pkt *pkt = pkts[0];
 	struct net_device *nd;
-	u16 eid = READ_ONCE(flow->egress_id);
 	u16 bp = (u16)(uintptr_t)pkt->token;
 
 	/* 现在恒 n == 1；批量提交见 design/extensibility.md §5 第 1 条 */
@@ -2471,6 +2713,14 @@ static int zx_ffe_egress_switch_submit(struct zx_eth_adapter *adapter,
 
 	if (eid >= ZX_NUM_PORTS)	/* 与 #14 同源守卫；今天不可达 */
 		return -EINVAL;
+
+	/* F3：判据段到提交段之间出口可能已经不可用，紧邻提交再判一次 */
+	if (!zx_ffe_out_ok(adapter, eid)) {
+		dev_warn_ratelimited(adapter->dev,
+			"ffe: egress port %u went down between the check and the submit, dropping a rewritten frame\n",
+			eid);
+		return -ENETDOWN;
+	}
 
 	if (!zx_tx_submit_bp(adapter, eid, bp, pkt->len)) {
 		dev_warn_ratelimited(adapter->dev,
@@ -2480,9 +2730,9 @@ static int zx_ffe_egress_switch_submit(struct zx_eth_adapter *adapter,
 	}
 	/*
 	 * 出口侧 /proc/net/dev 记账（慢路径在 zx_eth_xmit() 里记，快路在这里记）。
-	 * 端口号是上面的入口快照（不再重读 flow->egress_id）；ports[] 只在 probe
-	 * 里写一次、没有 remove 路径，所以直接取同一个 netdev，不再走一次
-	 * running/carrier 判定——帧已经发出去了，统计必须落在拍板时那个出口上。
+	 * 端口号是入口快照（不再重读条目）；ports[] 只在 probe 里写一次、没有
+	 * remove 路径，所以直接取同一个 netdev，不再走一次 running/carrier
+	 * 判定——帧已经发出去了，统计必须落在拍板时那个出口上。
 	 */
 	nd = READ_ONCE(adapter->ports[eid]);
 	dev_dstats_tx_add(nd, pkt->len);
@@ -2547,6 +2797,7 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	struct zx_accel *accel = &adapter->accel;
 	const struct zx_ffe_egress_ops *eops;
 	struct zx_ffe_flow *flow;
+	struct zx_ffe_flow_rt rt;
 	struct zx_ffe_pkt *pkts[1];
 	unsigned int clean;
 	u8 *frame = pkt->data;
@@ -2565,6 +2816,13 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 		return ZX_FFE_V_MISS;
 	}
 	/*
+	 * P10.2 F4：查到条目后**只读这一次**。控制面可能正在用
+	 * __zx_ffe_flow_replace() 换节点；这里拿到的是旧节点，但只要按快照
+	 * 用，就是自洽的一份（dmac/smac/flags/出口/NAT 输出/MTU 全部来自
+	 * 同一次读）。后面判据链、改写、提交都不许再解引用 flow。
+	 */
+	zx_ffe_flow_snapshot(&rt, flow);
+	/*
 	 * #13' 目的地址属本机的**延迟判定**（P5 修订二 §B）。
 	 *
 	 * 本机目的地的帧有两种截然不同的命运，区别只在这个条目带不带 DNAT：
@@ -2579,7 +2837,7 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	 * 顺序：排在 #14 出口现判之前，与 P5 的"#13 提到最前"一致——本机目的地
 	 * 的帧不该被算成 drop_noport。
 	 */
-	if (daddr_local && !(flow->flags & ZX_FFE_FLOW_NAT_D)) {
+	if (daddr_local && !(rt.flags & ZX_FFE_FLOW_NAT_D)) {
 		rcu_read_unlock();
 		return ZX_FFE_V_DROP_LOCAL;
 	}
@@ -2591,13 +2849,13 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	 * 存在**：无线帧永远回栈走 mac80211（队列/聚合/功率控制），见
 	 * zx_ffe_learn_hook() 头的"覆盖范围"。
 	 */
-	eops = zx_ffe_egress_lookup(flow->egress_type);
-	if (!eops || !eops->usable(adapter, flow->egress_id)) {
+	eops = zx_ffe_egress_lookup(rt.egress_type);
+	if (!eops || !eops->usable(adapter, rt.egress_id)) {
 		rcu_read_unlock();
 		return ZX_FFE_V_DROP_NOPORT;
 	}
 	/* #15 同口进出：不做 hairpin */
-	if ((int)flow->egress_id == rx_port) {
+	if ((int)rt.egress_id == rx_port) {
 		rcu_read_unlock();
 		return ZX_FFE_V_FALLBACK;
 	}
@@ -2608,12 +2866,12 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	 * 不属于链路的包）。v6 没有 NAT66（P4-TASK §0 "不做"），带 NAT 位的
 	 * v6 条目一律回栈；ffe_add 在入口就拒了，这里只是防御。
 	 */
-	if (flow->flags & ZX_FFE_FLOW_NAT_MASK) {
+	if (rt.flags & ZX_FFE_FLOW_NAT_MASK) {
 		if (family ||
-		    ((flow->flags & ZX_FFE_FLOW_NAT_S) &&
-		     (!flow->saddr_out || !flow->sport_out)) ||
-		    ((flow->flags & ZX_FFE_FLOW_NAT_D) &&
-		     (!flow->daddr_out || !flow->dport_out))) {
+		    ((rt.flags & ZX_FFE_FLOW_NAT_S) &&
+		     (!rt.saddr_out || !rt.sport_out)) ||
+		    ((rt.flags & ZX_FFE_FLOW_NAT_D) &&
+		     (!rt.daddr_out || !rt.dport_out))) {
 			rcu_read_unlock();
 			return ZX_FFE_V_FALLBACK;
 		}
@@ -2629,7 +2887,7 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	}
 	/*
 	 * #18 出口 MTU：IP datagram 超过出口 MTU 时栈会分片（v4）或回 ICMPv6
-	 * Packet Too Big（v6），快路两条都做不到，回栈。flow->mtu 是 ffe_add
+	 * Packet Too Big（v6），快路两条都做不到，回栈。rt.mtu 是 ffe_add/学习
 	 * 时从出口 netdev 快照的 dev->mtu，语义是 **IP 层 MTU**：对 v6 它是
 	 * "IPv6 包最大长度"（40 B 固定头已经算在里面，内核 ip6_mtu() 就是
 	 * dev->mtu 减去 L2 开销后的这个值），所以两边都拿 IP 层长度跟它比，
@@ -2638,7 +2896,7 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	 * 读到，且它只反映单条路径；这里用 dev->mtu 这个链路层上界，超了回栈
 	 * 让栈去发 Packet Too Big，语义保守且不需要额外加锁。）
 	 */
-	if (!flow->mtu || pkt_len > flow->mtu) {
+	if (!rt.mtu || pkt_len > rt.mtu) {
 		rcu_read_unlock();
 		return ZX_FFE_V_FALLBACK;
 	}
@@ -2646,7 +2904,12 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	/* #19 环容量（设计 §2.2 #15）：满就回栈，让 qdisc 背压 */
 	spin_lock_bh(&adapter->tx_lock);
 	if (adapter->tx_pending >= ZX_TX_QUEUE_LIMIT) {
-		/* 活跃流：不更新 lastuse，老化会把这条件正在用的条目删掉 */
+		/*
+		 * 活跃流：刷新 lastuse，否则老化会把这条件正在用的条目删掉。
+		 * P10.2 F4：写的还是查表拿到的那条（可能是正被换下的旧节点，
+		 * 写到它上面的运行态在替换瞬间会丢一拍）；条目内容本身不受
+		 * 影响，属于可接受的统计误差。
+		 */
 		flow->lastuse = jiffies;
 		spin_unlock_bh(&adapter->tx_lock);
 		rcu_read_unlock();
@@ -2654,7 +2917,7 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	}
 
 	/* 改写与提交都在 tx_lock 里，帧内容不会裸露在锁外（P2-TASK §1 顺序） */
-	zx_ffe_rewrite(frame, flow, family);
+	zx_ffe_rewrite(frame, &rt, family);
 	/*
 	 * 池可缓存时，改写过的头必须在 BMU 读之前推到一致性点（设计 §8-1）：
 	 * 脏的只有 16 B 池头 + L2 头 + 固定 IP 头——v4 是 34 B，v6 是 54 B
@@ -2669,8 +2932,8 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 	 * 校验和都在前 20 B 里。UDP 校验和为 0 时改写不动 L4，多同步这 8 B
 	 * 只是把已经写过的端口推下去，没有坏处。
 	 */
-	if (!family && (flow->flags & ZX_FFE_FLOW_NAT_MASK)) {
-		clean += flow->key.proto == IPPROTO_UDP ?
+	if (!family && (rt.flags & ZX_FFE_FLOW_NAT_MASK)) {
+		clean += rt.proto == IPPROTO_UDP ?
 			 sizeof(struct udphdr) : sizeof(struct tcphdr);
 	}
 	if (adapter->pkt_pool_cacheable)
@@ -2680,18 +2943,25 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 					   clean, DMA_TO_DEVICE);
 	/*
 	 * 提交（n == 1：批量接口现在还只喂一帧，见 design §5 第 1 条）。tx_lock 在
-	 * 手里、容量刚查过，所以 submit() 不可能失败。真出现（代码/内存被改坏）
-	 * 就按"丢帧"处理：帧已经改过，绝不能回栈；槽位也没交给硬件，所以 bp 由
-	 * 调用方还给 BMU（返回 DROPPED）。
+	 * 手里、容量刚查过，正常不会失败；P10.2 F3 起 submit() 会在写描述符前
+	 * 紧邻处再判一次出口（carrier/running），失败返回 -ENETDOWN。失败一律
+	 * 按"丢帧"处理：帧已经改过，绝不能回栈；槽位也没交给硬件，所以 bp 由
+	 * 调用方还给 BMU（返回 DROPPED），complete() 计 rx_drop++。
 	 */
 	pkts[0] = pkt;
-	if (eops->submit(adapter, pkts, 1, flow)) {
+	if (eops->submit(adapter, pkts, 1, rt.egress_id)) {
 		spin_unlock_bh(&adapter->tx_lock);
 		rcu_read_unlock();
 		return ZX_FFE_V_RX_DROP;
 	}
 
-	/* 记账：条目 hits/bytes/lastuse 每次命中更新，否则老化会误删活跃流 */
+	/*
+	 * 记账：条目 hits/bytes/lastuse 每次命中更新，否则老化会误删活跃流。
+	 * P10.2 F4：这里写的仍是查表拿到的 flow（可能已被换成新节点）；在飞
+	 * 帧的这几个计数会落在旧节点上，替换时新节点已经继承过一份，最多丢
+	 * 一拍增量，不影响转发。**必须放在 submit 成功之后**——fwd++ 由
+	 * complete() 在 FWD 出口加，失败路径走 RX_DROP，不会多计。
+	 */
 	flow->hits++;
 	flow->bytes += len;
 	flow->lastuse = jiffies;
@@ -2720,7 +2990,8 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
  * 结构（P4 起按 family 分派，两族共用同一段提交逻辑）：
  *
  *   前置段（#0-#3，两族共用）：入口口已 probe → 目的 MAC 非组播/广播 →
- *     目的 MAC 在本机集合 → len >= 64
+ *     目的 MAC 在本机集合 → runt（P10.2 起 v4 是 60 B、v6 仍是 64 B，
+ *     见 #3 注释）
  *   判据段（按 family 二选一）：zx_ffe_v4_check() / zx_ffe_v6_check()
  *     ——各自的判据顺序详见这两个函数的头注释。v4 的判据段只把
  *     "目的地址属本机"算成 daddr_local，裁决在提交段里（#13'）。
@@ -2768,8 +3039,17 @@ zx_ffe_ingress_switch_run(struct zx_eth_adapter *adapter,
 	/* #2 目的 MAC 不在本机集合：这帧不是给我们的，交给桥/栈扩散 */
 	if (!zx_ffe_is_local_mac(accel, dmac))
 		goto plain_miss;
-	/* #3 runt（< 64 B） */
-	if (len < 64)
+	/*
+	 * #3 runt，两族下限**刻意不同**（P10.2 F1）：
+	 *   v4 60 = 以太最小净荷（64 B 含 4 B FCS）。Windows 关 timestamp 的
+	 *     裸 ACK 是 14+20+20=54 B，MAC 补到 60 B；原来 `<64` 把它当 runt
+	 *     挡在快路外，于是 v4 只加速了带选项的 66 B ACK。
+	 *   v6 保持 64。v6 最小 TCP ACK 74 B、最小 UDP 62 B，而 62 B 量级
+	 *     正好是 ICMPv6（ND/RS/RA 的短形态）——ND 必须回栈，现有
+	 *     `hop_limit <= 1` 判据挡不住 hop_limit=255 的 ND，所以这里不能
+	 *     跟着降到 60。两族下限不同不是笔误。
+	 */
+	if (len < (family ? 64 : 60))
 		goto plain_miss;
 
 	/* 与 zx_eth_rx() 原来传给这里的 h_proto 同址同值（帧的第 12 字节） */
@@ -3389,7 +3669,12 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->mig_ppe_flows = 0;
 	accel->tbl_full = 0;
 	accel->learn_rings = NULL;
-	accel->learn_on = 0;
+	/*
+	 * P10.2 F5：交付形态是 `accel_ipv6=ffe` + `ffe_learn=1`，所以默认
+	 * 开机即学。钩子要等下面 alloc_percpu() + nf_register_net_hook() 之后
+	 * 才可能被调用，learn_on 先写 1 不会读到 NULL 环。
+	 */
+	accel->learn_on = 1;
 	accel->learn_cand = 0;
 	accel->learn_add = 0;
 	accel->learn_dup = 0;
@@ -3667,11 +3952,11 @@ static void zx_accel_show(struct seq_file *s, int family)
 
 	seq_printf(s, "%s\n",
 		   zx_accel_mode_name(zx_accel_cur_mode(accel, family)));
-	seq_printf(s, "lookup=%llu hit=%llu miss=%llu fwd=%llu fallback=%llu fallback_qfull=%llu drop_noport=%llu drop_local=%llu csum_err=%llu ttl_err=%llu bytes=%llu qlen_peak=%u rx_drop=%llu\n",
+	seq_printf(s, "lookup=%llu hit=%llu miss=%llu fwd=%llu fallback=%llu fallback_qfull=%llu drop_noport=%llu drop_local=%llu csum_err=%llu ttl_err=%llu bytes=%llu qlen_peak=%u rx_drop=%llu len_short=%llu len_long=%llu\n",
 		   c->lookup, c->hit, c->miss, c->fwd, c->fallback,
 		   c->fallback_qfull, c->drop_noport, c->drop_local,
 		   c->csum_err, c->ttl_err, c->bytes, qlen_peak,
-		   c->rx_drop);
+		   c->rx_drop, c->len_short, c->len_long);
 	/*
 	 * 第 3 行是给人和脚本看的状态行。hint 是"下一步该做什么"的机器可读
 	 * 提示：PPE 绑着 flowtable 时切 ffe/zc 会被 S1 拒绝，用户态得先关掉
@@ -3974,8 +4259,9 @@ static int zx_ffe_nat_parse(char **argv, int base, int argc,
 /*
  * ffe_add <key 8 个 token> <eport> <dmac> [nat ...] [dnat ...]
  *
- * **幂等**（P5 修订二 §C）：同 key 已存在时原地更新（见 __zx_ffe_flow_update()
- * 的 flags 合并规则）并返回成功，不再 -EEXIST、也不再产生第二条同键行；
+ * **幂等**（P5 修订二 §C）：同 key 已存在时用新节点整体替换（见
+ * __zx_ffe_flow_replace() 与 __zx_ffe_flow_merge() 的 flags 合并规则）并返回
+ * 成功，不再 -EEXIST、也不再产生第二条同键行；
  * add_replace 计数加一，ffe_last 里带 `(replaced ...)` 便于上机分辨。
  * 这与"学习路径先插、用户后钉"互相不打架：谁后写谁赢，NAT 位只增不减。
  */
@@ -4052,8 +4338,9 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 	flow->dport_out = nat.dport_out;
 	flow->lastuse = jiffies;
 	/*
-	 * 落表：同 key 已存在 → 原地更新并返回 1（flow 没进表，自己释放）；
-	 * 新键才走容量检查（__zx_ffe_store 里，"表满"只拒绝新键）。
+	 * 落表：同 key 已存在 → 新节点整体换上并返回 1（flow 已属于表，
+	 * **不要 free**）；新键才走容量检查（__zx_ffe_store 里，"表满"只
+	 * 拒绝新键）。P10.2 F4 起不再原地改活条目，见 __zx_ffe_flow_replace()。
 	 */
 	ret = __zx_ffe_store(adapter, flow);
 	if (ret < 0) {
@@ -4064,10 +4351,8 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 		mutex_unlock(&accel->lock);
 		return ret;
 	}
-	if (ret == 1) {
+	if (ret == 1)
 		accel->add_replace++;
-		kfree(flow);
-	}
 	zx_ffe_key_print(accel->ffe_last, sizeof(accel->ffe_last), "add",
 			 &key, eport, accel->n_flows);
 	zx_ffe_nat_print(accel->ffe_last, sizeof(accel->ffe_last), &nat);
@@ -4077,7 +4362,7 @@ static int zx_ffe_op_add(struct zx_eth_adapter *adapter, char **argv, int argc)
 		if (n < sizeof(accel->ffe_last))
 			scnprintf(accel->ffe_last + n,
 				  sizeof(accel->ffe_last) - n,
-				  " (replaced: same key updated in place)");
+				  " (replaced: same key swapped in a new node)");
 	}
 	mutex_unlock(&accel->lock);
 	return 0;
@@ -4289,8 +4574,8 @@ const struct file_operations zx_accel_flush_fops = {
  *
  * P5 修订二的两条不变式（上机核对时就看这两条）：
  *   1. **同一个 key 只会有一行**：所有落表路径（ffe_add、旁路学习）都过
- *      __zx_ffe_store()，同 key 时原地更新旧条目而不是再插一条，所以这里不会
- *      出现两行同键（P4 验收曾见过）。
+ *      __zx_ffe_store()，同 key 时整体换上一条新节点而不是再插一条，所以
+ *      这里不会出现两行同键（P4 验收曾见过）。
  *   2. **带 DNAT 的行是"pre-NAT 目的地址属本机"的那些流**（端口映射的
  *      ORIGINAL 侧、masquerade 的 REPLY 侧）：它们 pre-NAT 的 daddr 是盒子
  *      自己的 WAN IP，数据面靠 ZX_FFE_FLOW_NAT_D 这位放行——没有这一位的
@@ -4465,12 +4750,20 @@ const struct file_operations zx_accel_aging_fops = {
  *   第 5 行  v6 同上，末尾多一个 nat6=（v6 带 NAT 位、进环前丢弃）
  * 写 0/1（也认 off/on）：
  *   0 = 不再把新流写进环（环里剩的候选在下一拍清掉），已有条目照常工作到老化；
- *   1 = 开始学。默认 0，避免一上线就改变行为。
+ *   1 = 开始学。**默认 1**（P10.2 F5）：交付形态是 `accel_ipv6=ffe` +
+ *       `ffe_learn=1`，开机即学；不想改变行为时用它自己的 `0` 关掉。
+ *
+ * 按族过滤（P10.2 复审整改 1）：学习只为喂 FFE，**该族必须在 ffe 模式才会学；
+ * stack/hw/zc 下不产生任何 cand**（钩子在解析前就按 zx_accel_cur_mode() 返回，
+ * 不计数、不入环）。交付形态 v4=hw 时因此只有 v6 会学，不会白占两族共用的 1024
+ * 条表；把某族切到 ffe 后该族立即开始学，不需要改开关。
  *
  * 计数口径：learn_cand 是钩子"看到并投递"的候选数，learn_drop 是环满没投递
  * 的（所以 cand 不含 drop），learn_noneigh 是候选在 work 里取不到下一跳 MAC
- * 的，learn_dup 是同 key 已存在、字段被并进旧条目的（P5 修订二起不只是刷新
- * dmac/MTU），learn_add 才是真正新增的条目。learn_nobrport 是**出口**桥在
+ * 的，learn_dup 是同 key 已存在、新节点整体换上旧节点并继承 hits/bytes、
+ * 刷新 lastuse 的（P5 修订二起不只是刷新 dmac/MTU；P10.2 F4 起不再原地改），
+ * learn_add 才是真正
+ * 新增的条目。learn_nobrport 是**出口**桥在
  * work 里解不出本驱动端口的（FDB 未命中/要泛洪/桥已不在），learn_nonport 是
  * "命中的不是交换机口"这类放弃——**两个方向都算**：出口 FDB 命中无线口等
  * （P5），以及 P9 起**入口**桥的源 MAC 反查失败/命中无线口（`非交换机口`这

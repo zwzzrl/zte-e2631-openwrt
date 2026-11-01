@@ -301,6 +301,25 @@ enum zx_accel_mode {
 #define ZX_FFE_LAST_LEN		192
 
 /*
+ * 以太 padding 的容差（P10.2 F1/F2，**只在这一处定义**，accel.c 与 main.c
+ * 都通过本头文件看得到）。
+ *
+ * 以太最小帧 64 B 含 4 B FCS ⇒ 线上净荷最小 60 B；驱动的 len **不含 FCS**
+ * （证据：v6 满帧 `ffe_flows` 均值 1514.0，含 FCS 就该 1518），所以对
+ * IP 层长度 >= 40 B 的帧（v6 最小 L3 44、v4 TCP 最小 40），L3 之后最多
+ * 6 B 只能是 MAC padding，不是槽位残留。比这更大的差：
+ *   - `claimed > avail`：真截断（协议栈本来也会判 truncated 丢掉）；
+ *   - `avail - claimed > 6`：槽位尾部残留（今天的长副本就是这种形态）。
+ * 两者快路都回栈/慢路径都只计数，见 zx_ffe_v4_check()/zx_ffe_v6_check()
+ * 与 zx_eth_rx() 的慢路径校验。
+ *
+ * 注意：v4 UDP 的最小 IP 包只有 28 B，MAC padding 可以到 18 B；本判据
+ * 不覆盖这种极小帧（它们会保守地 miss 回栈，不会误发）。6 是"这条快路
+ * 收的 v6/TCP 帧"的精确上界，对 UDP 是保守侧。
+ */
+#define ZX_FFE_MAX_PAD		6
+
+/*
  * 快路计数：cnt[0] 是 IPv4，cnt[1] 是 IPv6，口径见设计 §1.5 / P1-TASK §1。
  * 不变式 lookup == hit + miss：每一帧进判据链时 lookup 加一，真正被转发出去
  * 的才算 hit（所以 P2 起 hit == fwd），其余一律 miss；csum_err/ttl_err/
@@ -331,6 +350,16 @@ struct zx_ffe_cnt {
 	u64	csum_err;	/* miss 的子集：IPv4 头校验和错（v6 恒 0） */
 	u64	ttl_err;	/* miss 的子集：TTL / hop_limit 到期 */
 	u64	bytes;		/* fwd 的字节数 */
+	/*
+	 * P10.2 F1：长度判据的两种 miss，按族分开（cnt[0] v4 / cnt[1] v6）。
+	 *   len_short  claimed > avail：真截断（帧被切掉尾巴），回栈；
+	 *   len_long   avail - claimed > ZX_FFE_MAX_PAD：实到比报头声明的多
+	 *              一大截，只可能是槽位残留/长副本，回栈。
+	 * 两者都不算错误路径（帧本来也进不了快路），但必须能自证"60 B 裸
+	 * ACK 现在真的过了""长副本没有进快路"。
+	 */
+	u64	len_short;
+	u64	len_long;
 	/*
 	 * 整环（v4 与 v6 共用）占用峰值：只由 zx279128s-main.c 的
 	 * zx_tx_submit_bp() 写进 cnt[0]——那一层拿不到 family，而环本来就
@@ -404,7 +433,7 @@ struct zx_ffe_learn_ring;
 struct zx_ffe_learn_cnt {
 	u64	cand;		/* 钩子看到并投递的候选（不含 drop） */
 	u64	add;		/* 真正插进表的学习条目 */
-	u64	dup;		/* 同 key 已存在：原地刷新（对应合计行的 dup） */
+	u64	dup;		/* 同 key 已存在：新节点替换旧节点（对应合计行的 dup） */
 	u64	noneigh;	/* 候选拿不到下一跳 MAC */
 	u64	nobrport;	/* 桥出口解析不出本驱动端口 */
 	u64	nonport;	/* 不是本驱动交换机口（含入口/出口端口不可用） */
@@ -453,7 +482,9 @@ struct zx_accel {
 	/*
 	 * 旁路学习（P5-TASK §1）：POST_ROUTING 钩子只看不抓帧，把"可学的流"
 	 * 写进每 CPU 的无锁环（learn_rings），由 age work 每秒排空、查邻居、
-	 * 落表。开关默认关（learn_on = 0）：不开时钩子第一行就返回，零副作用。
+	 * 落表。开关**默认开**（learn_on = 1，P10.2 F5 起与交付形态
+	 * `accel_ipv6=ffe` + `ffe_learn=1` 一致）；用 debugfs `ffe_learn` 写 0
+	 * 可随时关掉，关掉后钩子第一行就返回，零副作用。
 	 *
 	 * learn_cand/add/dup/drop/noneigh/nobrport/nonport/dedup 八个计数全是
 	 * "尽力而为"的裸 u64++：钩子在软中断里跑、可能并发，丢几个计数不影响
@@ -491,17 +522,19 @@ struct zx_accel {
 	 * （v6 没有 NAT66，数据面 #16 对"family=6 且带 NAT 位"一律回栈，学进表
 	 * 只是白占表项到老化），计 learn_cnt[1].nat6；parse6 的线性区基准改成
 	 * skb_network_header（不再从 skb->data 起算），并补 payload_len >= 4 与
-	 * hop_limit > 1 两条与数据面同口径的拒绝；parse4 补 ttl > 1；
-	 * learn_one 里"出口端口不可用"的两处静默 return 并入 learn_nonport
-	 * （原因见 zx279128s-accel.c 的 P10.1 注释）。
+	 * ttl/hop_limit 两条拒绝。注意后者**比数据面严一档**：钩子在
+	 * POST_ROUTING，看到的是已递减的 TTL/hop_limit，`<= 1` 对应数据面
+	 * （递减前）的 `<= 2`；学习侧只会少学短 TTL 流，不会学出数据面必拒的
+	 * 条目（P10.2 文档口径）。learn_one 里"出口端口不可用"的两处静默
+	 * return 并入 learn_nonport（原因见 zx279128s-accel.c 的 P10.1 注释）。
 	 */
 	struct zx_ffe_learn_ring __percpu	*learn_rings;
 	struct nf_hook_ops	learn_hook;	/* pf=IPv4, POST_ROUTING, NF_IP_PRI_LAST */
 	struct nf_hook_ops	learn_hook6;	/* pf=IPv6, 同一个回调, POST_ROUTING, NF_IP6_PRI_LAST */
-	u8			learn_on;	/* debugfs ffe_learn：0/1，默认 0 */
-	u64			learn_cand;	/* 钩子看到的候选（含被丢的） */
+	u8			learn_on;	/* debugfs ffe_learn：0/1，默认 1（P10.2 F5） */
+	u64			learn_cand;	/* 钩子看到并**成功投递**的候选（不含 learn_drop） */
 	u64			learn_add;	/* 真正插进表的学习条目 */
-	u64			learn_dup;	/* 同 key 已存在：原地更新 dmac/smac/MTU/NAT/lastuse */
+	u64			learn_dup;	/* 同 key 已存在：新节点换旧节点，继承 hits/bytes、刷新 lastuse（P10.2 F4） */
 	u64			learn_drop;	/* 环满丢掉的候选（绝不阻塞数据面） */
 	u64			learn_noneigh;	/* 候选拿不到下一跳 MAC */
 	u64			learn_nobrport;	/* 桥出口解析不出本驱动端口：FDB 未命中/要泛洪/桥已不在 */
@@ -516,8 +549,9 @@ struct zx_accel {
 	struct zx_ffe_learn_cnt	learn_cnt[2];
 	/*
 	 * ffe_add 命中同 key 的次数（P5 修订二 §C 的幂等化）：这次 add 走的是
-	 * "原地更新"而不是"新插入"，表里不会多出一行。与学习无关，放在这一组
-	 * 里只是因为 ffe_learn 是唯一常开的计数行（见 zx_accel_learn_show()）。
+	 * "换节点（RCU 替换）"而不是"新插入"，表里不会多出一行、n_flows 不变。
+	 * 与学习无关，放在这一组里只是因为 ffe_learn 是唯一常开的计数行
+	 * （见 zx_accel_learn_show()）。
 	 */
 	u64			add_replace;
 	struct zx_ffe_cnt	cnt[2];
@@ -610,6 +644,32 @@ struct zx_eth_priv {
 	u32			mib_last[ZX_MIB_NUM];	/* last register values */
 };
 
+/*
+ * P10.2 F6：alias 丢弃点的环形取证快照（只读 debugfs `alias_dump`）。
+ *
+ * 背景：`zx_eth_rx()` 的 alias 判据（源 MAC 等于盒子自己的 MAC）会把整帧
+ * 丢掉；慢态下它与"宿主发出但盒子没收到"的帧数 1:1 吻合，但无法判定被丢的
+ * 是「已转发帧的副本」（丢掉是对的）还是「本该转发的原帧」（静默真丢）。
+ * 每丢一帧存一份描述符原值 + 帧头，之后读 `alias_dump` 对照：
+ *   - `head[6..11]` 是本帧的源 MAC。若它等于 br-lan/本口 MAC，说明 RX 缓冲
+ *     已被 FFE 原地改写过（zx_ffe_rewrite() 的 h_source ← 出口端口 MAC）；
+ *     若它是外部主机的 MAC，说明这帧进来时就是那样，不是 FFE 改的。
+ *   - `desc[0..2]` 的高位带 reason/copy/trap 类字段（驱动只解析 bp/len/
+ *     port/class，其余位全丢），原值留给 P10.3 定位。
+ *   - `len` 与 `head` 里声明的 IP 长度、同一时刻 lan2.tx 是否已发出同 seq
+ *     的帧，三者一起决定"副本 vs 原帧"。
+ * 只在这条罕见分支里写，32 条 × 84 B，成本可忽略。
+ */
+#define ZX_ALIAS_SNAP_N		32	/* 必须是 2 的幂（下标用 & 取模） */
+
+struct zx_alias_snap {
+	u32	desc[4];	/* RX 描述符原值（已转 CPU 序），reason/copy 位在这里 */
+	u16	len;		/* 描述符报的帧长 */
+	u8	port;		/* 描述符解析出的入口端口 */
+	u8	rsvd;
+	u8	head[64];	/* 池里帧的前 64 B（以太头 + IP 头前若干字节） */
+};
+
 struct zx_eth_adapter {
 	struct device		*dev;
 	void __iomem		*base;
@@ -662,6 +722,30 @@ struct zx_eth_adapter {
 	u32			rx_nobuf_cnt;
 	u32			rx_rel_fail;
 	u32			rx_bad_cnt;
+	/*
+	 * P10.2 F2：慢路径的"报头声明的长度 == 描述符报的字节数"校验。
+	 * 硬件/交换机额外送给 CPU 的副本帧有两种形态（原帧已转发，不是丢包）：
+	 *   rx_len_short  短副本：len 只盖住 L2+L3+L4 头，而 plen/tot_len 声明
+	 *                 还有载荷 ⇒ claimed > avail。今天由 ip6_rcv 判
+	 *                 truncated 丢掉（Ip6InTruncatedPkts），现在驱动先丢、
+	 *                 计数搬到这里，少一次无用的栈内处理。
+	 *   rx_len_long   长副本：len 是一整帧，报头却只声明一个头长 ⇒
+	 *                 avail - claimed > ZX_FFE_MAX_PAD。今天靠 pskb_trim
+	 *                 裁掉尾巴后照常转发（每秒多 1-2 个重复 ACK），**不丢**
+	 *                 （拿到描述符 dump 之前不做激进改动）。
+	 * 这两个计数只由 zx_eth_rx() 的慢路径写，与快路的 len_short/len_long
+	 * 不是一回事（后者是"被判据挡回栈"，前者是"慢路径直接丢弃/放行"）。
+	 */
+	u64			rx_len_short_cnt;
+	u64			rx_len_long_cnt;
+	/*
+	 * P10.2 F6：alias 丢弃点的环形取证快照（见 struct zx_alias_snap）。
+	 * alias_snap_idx 是下一个写槽位（0..31 回绕），alias_snap_cnt 是累计
+	 * 快照数（读侧用它判断哪些槽位有效）。写侧只有 RX NAPI 一处。
+	 */
+	u32			alias_snap_idx;
+	u32			alias_snap_cnt;
+	struct zx_alias_snap	alias_snap[ZX_ALIAS_SNAP_N];
 
 	/*
 	 * 每包耗时分解（临时调试用）。收包五段：解析描述符、缓存无效化、
@@ -918,14 +1002,17 @@ struct zx_ffe_ingress_ops {
  *   submit()  按批提交（现在恒 n == 1，见 §5 第 1 条）。调用者已经持 tx_lock、把帧
  *             改写完，并做过容量检查；返回非 0 = 这一帧已经改过、但提交不
  *             出去，只能丢（调用方返回 DROPPED，把 bp 还给 BMU）。
+ *
+ * P10.2 起 submit() 只收 egress id，不收流表条目：数据面在 RCU 段里先做一次
+ * 条目快照（struct zx_ffe_flow_rt，见 zx279128s-accel.c），控制面换节点后
+ * 提交段不许再解引用条目指针；出口判据两处共用 zx_ffe_out_ok()。
  */
 struct zx_ffe_egress_ops {
 	const char *name;
 	u8	type;
 	bool	(*usable)(struct zx_eth_adapter *adapter, u16 id);
 	int	(*submit)(struct zx_eth_adapter *adapter,
-			  struct zx_ffe_pkt **pkts, int n,
-			  struct zx_ffe_flow *flow);
+			  struct zx_ffe_pkt **pkts, int n, u16 egress_id);
 };
 /* debugfs: accel_ipv4, accel_ipv6, ffe_flows, ffe_add/del/flush, ffe_aging,
  * ffe_migrate, ffe_learn, accel_autofallback, soc_temp

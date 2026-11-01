@@ -27,6 +27,8 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/mm.h>
@@ -70,17 +72,24 @@ MODULE_PARM_DESC(zc_rx, "Zero-copy RX/TX over the BMU packet pool: legacy alias 
 /*
  * 加速路径的默认值，每条协议族各自独立（设计 §1.1）：
  *   0 stack、1 ffe、2 hw（仅 IPv4）、3 zc
- * 默认 v4=hw、v6=stack：v4 放行 PPE 硬件流表（nft flowtable 在喂它），v6 保持
- * 软件 flowtable + 标准栈（PPE 的 v6 分类表实测不成立）。ffe 是本设计新增的
- * 驱动内快路，P0 只有骨架，默认不启用。
+ * 默认 v4=hw、**v6=ffe**（P10.2 F5 的交付形态）：
+ *   - v4 继续放行 PPE 硬件流表（nft flowtable 在喂它）；ffe 是驱动内快路，
+ *     v4 上它只是 hw 的替代品，交付不启用；
+ *   - v6 没有 hw 路径，PPE 的 v6 分类表实测不成立，所以 v6 默认走驱动内
+ *     快路。依据：多流 `-P 8` ffe 809–904 Mbit/s vs stack 378–390（2.14×），
+ *     单流 BBR ffe 886 vs stack 497（1.78×）；单流 cubic 的落后（123 vs 179）
+ *     是重排/伪重传的病理，不是丢包，记为交付风险但不阻断。
+ * `accel_autofallback=1` 仍兜底：ffe 判据出问题时自动回 stack。
+ * ffe 默认值不依赖 nft flowtable（那是 v4→hw 的要求，见 zx_accel_set()），
+ * probe 阶段只是把 v6_mode 字段写成 ffe，不调用 zx_accel_set()，不会被拒。
  */
 static int accel_v4 = ZX_ACC_HW;
 module_param(accel_v4, int, 0644);
 MODULE_PARM_DESC(accel_v4, "IPv4 acceleration path: 0 stack, 1 ffe, 2 hw, 3 zc (default: 2)");
 
-static int accel_v6 = ZX_ACC_STACK;
+static int accel_v6 = ZX_ACC_FFE;
 module_param(accel_v6, int, 0644);
-MODULE_PARM_DESC(accel_v6, "IPv6 acceleration path: 0 stack, 1 ffe, 3 zc (default: 0)");
+MODULE_PARM_DESC(accel_v6, "IPv6 acceleration path: 0 stack, 1 ffe, 3 zc (default: 1)");
 
 /*
  * 自动降级：某一族 drop > 0.1% 或 fallback > 50% 持续 10 s 就回 stack
@@ -1783,6 +1792,45 @@ static bool zx_is_own_addr(struct zx_eth_adapter *adapter, const u8 *addr)
 	return false;
 }
 
+/*
+ * P10.2 F6：alias 丢弃点的环形取证快照（见 struct zx_alias_snap 的注释）。
+ *
+ * 只记录、不改变 alias 判据的任何行为：调用点在 rx_alias_cnt++ 之后、
+ * zx_rx_consume() 之前，帧还在池槽位里。调用前已经做过
+ * dma_sync_single_for_cpu()，所以 head 直接 memcpy，**不要再 sync**。
+ *
+ * 写侧只有 RX NAPI 一处，读侧（debugfs alias_dump）不加锁：先填满槽位再
+ * WRITE_ONCE 发布索引，读到半条也只是取证数据不完整，重读一次即可。
+ */
+static void zx_alias_snapshot(struct zx_eth_adapter *adapter,
+			      const __le32 *desc, u16 len, int port,
+			      const u8 *frame)
+{
+	u32 slot = adapter->alias_snap_idx & (ZX_ALIAS_SNAP_N - 1);
+	struct zx_alias_snap *s = &adapter->alias_snap[slot];
+	u32 head_len = min_t(u32, len, (u32)sizeof(s->head));
+	int i;
+
+	for (i = 0; i < 4; i++)
+		s->desc[i] = le32_to_cpu(desc[i]);
+	s->len = len;
+	s->port = (port >= 0 && port <= 0xff) ? (u8)port : 0xff;
+	s->rsvd = 0;
+	/*
+	 * 只拷描述符声明的长度：len 最小可以到 14（守卫只挡 <14），此时
+	 * 拷贝 64 B 会把"本帧之后"的槽内残留（上一条帧的尾巴/未初始化垃圾）
+	 * 打进 debugfs，取证会误导（不崩、也不越池）。余下的补 0，读侧能
+	 * 一眼看出"这一帧只有这么长"。
+	 */
+	memcpy(s->head, frame, head_len);
+	memset(s->head + head_len, 0, sizeof(s->head) - head_len);
+	WRITE_ONCE(adapter->alias_snap_cnt, adapter->alias_snap_cnt + 1);
+	/* 槽位填完才发布下一个索引（读侧 best-effort） */
+	smp_wmb();
+	WRITE_ONCE(adapter->alias_snap_idx,
+		   (slot + 1) & (ZX_ALIAS_SNAP_N - 1));
+}
+
 static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 {
 	int work_done = 0, q;
@@ -1901,6 +1949,13 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 
 				if (zx_is_own_addr(adapter, d + ETH_ALEN)) {
 					adapter->rx_alias_cnt++;
+					/*
+					 * P10.2 F6：只留证，不改行为。
+					 * 此时缓存已 invalidate、帧还在
+					 * 池槽位里，head 直接从 d 拷。
+					 */
+					zx_alias_snapshot(adapter, desc, len,
+							  port, d);
 					zx_rx_consume(desc, rel);
 					adapter->rx_cur_idx[q]++;
 					work_done++;
@@ -1961,6 +2016,91 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			if (ffe != ZX_FFE_RX_STACK)
 				goto ffe_done;
 accel_slow:
+			/*
+			 * P10.2 F2：慢路径的"报头声明的长度 == 描述符报的字节数"
+			 * 校验。硬件/交换机在我们已经把同一帧正常转发出去之后，
+			 * 还会额外送一份**副本**给 CPU；副本的描述符 len 会错成
+			 * 另一类帧的长度（REVIEW-V6-HDRONLYSKB §0.3）：
+			 *   短副本 len=74/86（L3 60/72），头里 plen=1460；
+			 *   长副本 len=1514（L3 1500），头里 plen=20/32。
+			 * 今天前者由 ip6_rcv 判 truncated 丢掉（看着像丢包），
+			 * 后者由 pskb_trim 裁掉尾巴后**再转发一次**（每秒 1-2 个
+			 * 重复 ACK，且没有任何计数）。这里把判断提前到驱动：
+			 *   claimed > avail              ⇒ 丢帧 + rx_len_short++
+			 *                                  （语义与今天等价：栈也会
+			 *                                  判 truncated 丢掉，只是
+			 *                                  少一次无用的栈内处理）；
+			 *   avail - claimed > MAX_PAD    ⇒ **不丢**，只
+			 *                                  rx_len_long++ + 限速日志
+			 *                                  （长副本今天无害，拿到
+			 *                                  描述符 dump 之前不做
+			 *                                  激进改动）。
+			 *
+			 * 口径变化（P10.2 复审补）：短副本现在在**驱动**就被摘
+			 * 掉、不再进 ip_rcv/ip6_rcv，所以 IP 层的
+			 * IpInTruncatedPkts / Ip6InTruncatedPkts 会**下降**
+			 * （下降多少 ≈ rx_len_short 涨多少），不是"丢包变多"。
+			 * 看丢包要么看 rx_len_short，要么看上层其它计数字段；
+			 * 别把 IP 层 truncated 归零当成"栈不再截断"。
+			 *
+			 * 判据来源（已确认）：这里还没建 skb，所以用池里原始帧
+			 * offset 12 的 h_proto，与 zx_eth_family()、快路
+			 * zx_ffe_ingress_switch_run() 读的是同一个地址、同一个值。
+			 * 建 skb 之后 eth_type_trans() 会把它填成 skb->protocol，
+			 * 两者相等；用 h_proto 可以让"非 IP / VLAN 外层一律跳过"
+			 * 这条在分配 skb 之前就成立（0x8100/0x88a8 都不是 IP）。
+			 * 帧短到读不出完整报头的（< 14+20 / 14+40）不在这里判，
+			 * 留给协议栈按它自己的规则处理。
+			 */
+			if (fam >= 0) {
+				const u8 *l3 = (const u8 *)adapter->pkt_pool +
+					       (u32)bp * ZX_BUF_SIZE + 16 +
+					       ETH_HLEN;
+				u32 l3_avail = (u32)len - ETH_HLEN;
+				u32 claimed = 0;
+				bool have_len = false;
+
+				if (fam == 1 &&
+				    len >= ETH_HLEN + sizeof(struct ipv6hdr)) {
+					struct ipv6hdr ip6;
+
+					memcpy(&ip6, l3, sizeof(ip6));
+					claimed = sizeof(ip6) +
+						  ntohs(ip6.payload_len);
+					have_len = true;
+				} else if (fam == 0 &&
+					   len >= ETH_HLEN + sizeof(struct iphdr)) {
+					struct iphdr ip;
+
+					memcpy(&ip, l3, sizeof(ip));
+					claimed = ntohs(ip.tot_len);
+					have_len = true;
+				}
+				if (have_len && claimed > l3_avail) {
+					adapter->rx_len_short_cnt++;
+					if (adapter->rx_len_short_cnt <= 5)
+						dev_warn_ratelimited(adapter->dev,
+							"rxq%d: short frame? port=%d len=%u claimed=%u proto=0x%04x; dropping (the stack would call it truncated)\n",
+							q, port, len, claimed,
+							ntohs(h_proto));
+					zx_rx_consume(desc, rel);
+					adapter->rx_cur_idx[q]++;
+					work_done++;
+					avail--;
+					if (zx_bmu_free_bp(adapter, bp))
+						adapter->bmu_free_fail++;
+					continue;
+				}
+				if (have_len &&
+				    l3_avail - claimed > ZX_FFE_MAX_PAD) {
+					adapter->rx_len_long_cnt++;
+					if (adapter->rx_len_long_cnt <= 5)
+						dev_warn_ratelimited(adapter->dev,
+							"rxq%d: long frame? port=%d len=%u claimed=%u proto=0x%04x; not dropping (pskb_trim will cut it)\n",
+							q, port, len, claimed,
+							ntohs(h_proto));
+				}
+			}
 			/*
 			 * 零拷贝：把槽位本身做成 skb 交给协议栈，bp 先不还。
 			 * 之后由发送路径交给硬件（硬件发完自己归还），或者由
@@ -2441,9 +2581,10 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 		   adapter->tx_cur_idx, adapter->tx_complete_cnt,
 		   adapter->tx_pending, adapter->tx_done_excess,
 		   adapter->rx_resync_cnt);
-	seq_printf(s, "rx_alias=%u rx_nobuf=%u rx_rel_fail=%u rx_bad=%u\n",
+	seq_printf(s, "rx_alias=%u rx_nobuf=%u rx_rel_fail=%u rx_bad=%u rx_len_short=%llu rx_len_long=%llu\n",
 		   adapter->rx_alias_cnt, adapter->rx_nobuf_cnt,
-		   adapter->rx_rel_fail, adapter->rx_bad_cnt);
+		   adapter->rx_rel_fail, adapter->rx_bad_cnt,
+		   adapter->rx_len_short_cnt, adapter->rx_len_long_cnt);
 	seq_printf(s, "ppe_active=%u ppe_flows=%u ppe_add_skip=%u ppe_add_fail=%u\n",
 		   adapter->ppe_active, adapter->ppe_count,
 		   adapter->ppe_add_skip, adapter->ppe_add_fail);
@@ -2856,12 +2997,95 @@ static const struct file_operations zx_eth_txtest_fops = {
 	.write		= zx_eth_txtest_write,
 };
 
+/*
+ * P10.2 F6：alias_dump —— alias 丢弃点的取证回读（只读 0444）。
+ *
+ * 这是**区分「已转发帧的副本」与「本该转发的原帧」的工具**，不参与任何
+ * 数据面判据：
+ *   - 每条 `#N` 是第 N 个被 alias 判据丢掉的帧（N 从 0 开始，最多 32 条，
+ *     之后覆盖最老的）。`desc0..3` 是 RX 描述符原值（`le32_to_cpu` 之后），
+ *     高位的 reason/copy/trap 类字段驱动平时完全没读；`len/port` 是描述符
+ *     解析结果；`head` 是池里帧的前 64 B 十六进制。
+ *   - `head` 前 6 字节是目的 MAC、6..11 是源 MAC。**若源 MAC 等于
+ *     br-lan/本口 MAC**，说明 RX 缓冲已被 FFE 的 zx_ffe_rewrite() 原地改写过
+ *     （h_source ← 出口端口 MAC）；若它是外部主机的 MAC，说明这帧进缓冲时
+ *     就是那样，不是 FFE 改的。
+ *   - 再结合同一时刻 lan2.tx 是否已发出同 seq 的帧（宿主机抓包），就能定性
+ *     丢掉的是副本还是原帧。
+ * 读侧不加锁：写侧只有 RX NAPI 一处，先填槽位再发布 alias_snap_idx；极端
+ * 并发下可能读到正在覆盖的半条，重读一次即可。
+ */
+static int zx_eth_alias_dump_show(struct seq_file *s, void *data)
+{
+	/*
+	 * s->private 就是 debugfs_create_file(..., adapter, ...) 传进来的
+	 * `struct zx_eth_adapter *`（见 zx_eth_debugfs_init()），**不是**
+	 * struct device *：这里绝不能调 dev_get_drvdata()（那会把 adapter
+	 * 结构体里 driver_data 偏移处的字节当指针解引用，`cat alias_dump`
+	 * 读一次就 oops）。与本文件其它 single_open 的 show（zc/zc_ev）同一
+	 * 写法；只有走 debugfs_create_devm_seqfile() 的 dma_state 才是
+	 * struct device *、才该用 dev_get_drvdata()。
+	 */
+	struct zx_eth_adapter *adapter = s->private;
+	u32 cnt = READ_ONCE(adapter->alias_snap_cnt);
+	u32 idx = smp_load_acquire(&adapter->alias_snap_idx);
+	u32 n = min_t(u32, cnt, ZX_ALIAS_SNAP_N);
+	u32 i, j;
+
+	seq_printf(s, "alias_dump: cnt=%u idx=%u\n", cnt, idx);
+	for (i = 0; i < n; i++) {
+		/*
+		 * cnt < N：槽位从 0 顺序写；cnt >= N：idx 是最老的槽位，
+		 * 按时间顺序从它开始绕一圈。
+		 */
+		u32 slot = cnt >= ZX_ALIAS_SNAP_N ?
+			   ((idx + i) & (ZX_ALIAS_SNAP_N - 1)) : i;
+		const struct zx_alias_snap *a = &adapter->alias_snap[slot];
+
+		seq_printf(s, "#%u slot=%u desc0=%08x desc1=%08x desc2=%08x desc3=%08x len=%u port=%u\n",
+			   i, slot, a->desc[0], a->desc[1], a->desc[2],
+			   a->desc[3], a->len, a->port);
+		seq_puts(s, "  head=");
+		for (j = 0; j < sizeof(a->head); j++)
+			seq_printf(s, "%02x", a->head[j]);
+		seq_putc(s, '\n');
+	}
+	/*
+	 * 同一行给出对照读数：rx_alias 是 alias 判据累计丢掉的帧数；
+	 * rx_len_short/long 是慢路径长度校验的两个计数；ffe_fwd 是两族快路
+	 * 转发总数（cnt[0]+cnt[1]）。一次读全能对上时间口径。
+	 */
+	seq_printf(s, "rx_alias=%u rx_len_short=%llu rx_len_long=%llu ffe_fwd=%llu\n",
+		   adapter->rx_alias_cnt,
+		   READ_ONCE(adapter->rx_len_short_cnt),
+		   READ_ONCE(adapter->rx_len_long_cnt),
+		   READ_ONCE(adapter->accel.cnt[0].fwd) +
+		   READ_ONCE(adapter->accel.cnt[1].fwd));
+	return 0;
+}
+
+static int zx_eth_alias_dump_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_eth_alias_dump_show, inode->i_private);
+}
+
+static const struct file_operations zx_eth_alias_dump_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_eth_alias_dump_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 {
 	struct dentry *dir = debugfs_create_dir(dev_name(adapter->dev), NULL);
 
 	debugfs_create_devm_seqfile(adapter->dev, "dma_state", dir,
 				    zx_eth_dma_state_show);
+	/* P10.2 F6：alias 丢弃点的环形取证快照（只读） */
+	debugfs_create_file("alias_dump", 0444, dir, adapter,
+			    &zx_eth_alias_dump_fops);
 	debugfs_create_file("zc", 0644, dir, adapter, &zx_eth_zc_fops);
 	debugfs_create_file("zc_ev", 0444, dir, adapter, &zx_eth_zc_ev_fops);
 	debugfs_create_file("txtest", 0200, dir, adapter, &zx_eth_txtest_fops);
@@ -2883,7 +3107,7 @@ static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 	/* hw→ffe 迁移桥（P3）：写 1 取 PPE 快照，读回统计与样例 cookie */
 	debugfs_create_file("ffe_migrate", 0644, dir, adapter,
 			    &zx_accel_migrate_fops);
-	/* 旁路学习（P5）：读回开关与计数，写 0/1 开关（默认 0） */
+	/* 旁路学习（P5）：读回开关与计数，写 0/1 开关（默认 1，P10.2 F5） */
 	debugfs_create_file("ffe_learn", 0644, dir, adapter,
 			    &zx_accel_learn_fops);
 	debugfs_create_file("accel_autofallback", 0644, dir, adapter,
