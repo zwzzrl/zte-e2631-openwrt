@@ -58,9 +58,9 @@ n=2 的非冷启动不能外推。
   生效值超过 600000 ms 时 init 会钳到 600000 ms 并打一条
   `accel: learn_delay_ms clamped to 600000 ms`（只有真钳了才打）。
 - 可观测/可取消：`ffe_learn` 末尾追加 `auto_enable_in_ms=`（0 = 已自动开过，
-  或用户写过 `ffe_learn` 已接管），写 `0`/`1` 会清 `learn_arm_at`，用户意图优先；
-  tick 用 `cmpxchg` 清 `learn_arm_at`，写口又先清它再写开关，两侧交错时用户写的
-  值最终生效。
+  或用户写过 `ffe_learn` 已接管），写 `0`/`1` 会清 `learn_arm_at`，用户意图优先。
+  门控 tick 与 debugfs 写口**同持 `accel->lock`**（mutex），两者全序，用户写的值
+  一定最终生效（不靠 cmpxchg 的窄窗口）；两处 `dev_info` 都在锁外。
 - 门控必须"一次成型"：别改成"开机学 + 定时关"，那会重开死机窗口。
 
 ## 警告：改回"默认立刻学"之前必须先定案

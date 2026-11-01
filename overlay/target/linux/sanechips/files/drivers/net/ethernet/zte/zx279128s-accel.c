@@ -3668,22 +3668,28 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
  * P10.3：学习门控到点自动开一次。写 ffe_learn（debugfs）会清 learn_arm_at，
  * 所以用户手动开/关之后这里不会再插手；只开一次，不重复打印。
  *
- * 清 arm_at 用一次 cmpxchg（不加锁）：谁先清掉它谁说了算。用户写 ffe_learn
- * 会让这次 cmpxchg 失败，于是不会把用户刚写的 0 覆盖成 1。
+ * 与 debugfs 写口同持 accel->lock：门控开关与"用户意图"必须有一个全序，
+ * 否则 cmpxchg 只能把窗口缩小到 CAS → 写 learn_on 之间，用户的 0 仍可能被
+ * 覆盖（复审 REVIEW-P10.3.md §6(b)）。age work 是进程上下文，可以睡；这里
+ * 只持一小段，且不调用任何会再取本锁的函数（drain 在本函数返回之后）。
  */
 static void zx_ffe_learn_arm_tick(struct zx_eth_adapter *adapter)
 {
 	struct zx_accel *accel = &adapter->accel;
-	unsigned long arm_at = READ_ONCE(accel->learn_arm_at);
+	bool fired = false;
 
-	if (!arm_at || time_before(jiffies, arm_at))
-		return;
-	if (cmpxchg(&accel->learn_arm_at, arm_at, 0) != arm_at)
-		return;
-	WRITE_ONCE(accel->learn_on, 1);
-	dev_info(adapter->dev,
-		 "accel: ffe_learn auto-enabled %u ms after probe (ff_learn gate; see DIAG-P10.2-HANG.md)\n",
-		 learn_delay_ms);
+	mutex_lock(&accel->lock);
+	if (accel->learn_arm_at && !time_before(jiffies, accel->learn_arm_at)) {
+		accel->learn_arm_at = 0;
+		WRITE_ONCE(accel->learn_on, 1);
+		fired = true;
+	}
+	mutex_unlock(&accel->lock);
+
+	if (fired)
+		dev_info(adapter->dev,
+			 "accel: ffe_learn auto-enabled %u ms after probe (ff_learn gate; see DIAG-P10.2-HANG.md)\n",
+			 learn_delay_ms);
 }
 
 /*
@@ -4967,12 +4973,15 @@ static ssize_t zx_accel_learn_store(struct file *file, const char __user *ubuf,
 		return -EINVAL;
 
 	/*
-	 * P10.3：手动写就是最终决定。**先**取消待开、再写开关：tick 的 cmpxchg
-	 * 只认"arm_at 还是它读到的那个值"，所以无论 tick 抢在写口前面还是夹在
-	 * 这两步中间，最终生效的都是这里的 on，不会被自动开那条路径覆盖。
+	 * P10.3：手动写就是最终决定，与 age work 的门控同持 accel->lock，
+	 * 因此两者有一个全序、用户写的值一定最终生效（不再依赖 cmpxchg 的
+	 * 窄窗口）。learn_delay_ms 的钳位与"0 = probe 立刻学"语义不变。
+	 * dev_info 留在锁外。
 	 */
+	mutex_lock(&adapter->accel.lock);
 	WRITE_ONCE(adapter->accel.learn_arm_at, 0);
 	WRITE_ONCE(adapter->accel.learn_on, on);
+	mutex_unlock(&adapter->accel.lock);
 
 	dev_info(adapter->dev, "accel: ffe_learn %s\n",
 		 READ_ONCE(adapter->accel.learn_on) ? "enabled" : "disabled");
