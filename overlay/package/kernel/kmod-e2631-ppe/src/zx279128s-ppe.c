@@ -259,19 +259,26 @@ MODULE_PARM_DESC(v6_wipe,
  *         address and is not recomputed), which is exactly the observed shape.
  *         Applies to flows created after the write.
  *
- *   bit1  write extract index 10's word 4 with ext_mode = 2 (0x00190154
+ *   bit1  set word 4 of extract index 10 to 2 in bits 19:18 (0x00190154
  *         instead of 0x00150154), the value the vendor's aclRamInit puts in
- *         its v6 groups 1..8 while groups 9/10 get 1.  This keeps index 10,
- *         the 16 field ids, the 45-byte key and therefore the slot unchanged
- *         (a hit that works today keeps hitting) and flips only the flag that
- *         may select the post-hit parse template.  It is a hybrid the vendor
- *         never writes - that is what makes it a one-bit experiment - and if
- *         ext_mode also drives extraction the hit dies, which the aging bit
- *         says within a second.  The entry is read back before the first write
- *         and put back word for word when the bit is cleared.
+ *         its v6 groups 1..8 while groups 9/10 get 1.  The field's name is
+ *         not settled: the vendor's own printk pulls `valid_en` from bit 20,
+ *         `nomactch_cfg` from bits 19:18 and `ext_mode` from bit 16
+ *         (tm.full-dis.txt 0x4624-0x4630), which is what this comment now
+ *         follows; the older vendor-cla-extract-index doc has the three names
+ *         one bit lower and docs/CONTRADICTIONS.md X9 leaves that open.  What
+ *         the field *does* is unknown either way.  Bits 19:18 are not part of
+ *         the extraction template: that is bytes 0..15 of the entry (the 16
+ *         field ids), which are copied unchanged, so the 45-byte key and the
+ *         slot stay what they are and a hit that works today keeps hitting.
+ *         The one risk is exactly that: if the write also redirected
+ *         extraction, the hit would die and the aging bit would say so within
+ *         a second - which is the first thing to look at on the box, not a
+ *         verdict about this bit.  The entry is read back before the first
+ *         write and put back word for word when the bit is cleared.
  */
 #define ZX_PPE_POSTHIT_NOHOP	BIT(0)
-#define ZX_PPE_POSTHIT_EXTMODE	BIT(1)
+#define ZX_PPE_POSTHIT_IDXW4	BIT(1)
 static unsigned int zx_ppe_posthit;
 static int zx_ppe_posthit_set(const char *val, const struct kernel_param *kp);
 static const struct kernel_param_ops zx_ppe_posthit_ops = {
@@ -280,7 +287,7 @@ static const struct kernel_param_ops zx_ppe_posthit_ops = {
 };
 module_param_cb(v6_posthit, &zx_ppe_posthit_ops, &zx_ppe_posthit, 0644);
 MODULE_PARM_DESC(v6_posthit,
-	"IPv6 post-hit probes (bitmask, default 0): 1 = do not decrement the hop limit, 2 = extract index 10 ext_mode 2");
+	"IPv6 post-hit probes (bitmask, default 0): 1 = do not decrement the hop limit, 2 = extract index 10 word4 bits19:18 = 2");
 
 /* The vendor's IPv6 extract-rule landing site.  Measured empty on this box: a
  * read of rule table entry 2 in the delivery state (2026-11-02, uptime 4825 s,
@@ -1702,7 +1709,7 @@ static void zx_ppe_rule_restore(struct zx_eth_adapter *adapter)
  *
  * Same shape as the rule table just above, one table lower: the index entry is
  * 5 words in switch SRAM and survives a module reload, so the entry that
- * v6_posthit's ext_mode bit patches is read back before the first write and
+ * v6_posthit's word-4 bit patches is read back before the first write and
  * put back word for word afterwards.  A read that fails means "we do not know
  * what is in there", and writing over an unknown entry would leave something
  * behind that no snapshot can restore - so the write is refused and the caller
@@ -1754,19 +1761,20 @@ static int zx_ppe_index_restore(struct zx_eth_adapter *adapter)
 	return 0;
 }
 
-/* Apply or undo the ext_mode half of v6_posthit.  Word 4 of the index entry is
- * 0x00150154 in the delivered tables: byte 16..17 is index_valid, byte 18 bit0
- * is valid_en, bits 2..3 are ext_mode (= 1), bit4 is nomatch_cfg, byte 19 is 0.
- * ext_mode = 2 therefore means setting bit 19 of the word (0x00080000) and
- * clearing bit 18 (0x00040000) - nothing else changes, so the 16 field ids,
- * index_valid and valid_en stay exactly as they were.
+/* Apply or undo the word-4 half of v6_posthit.  Word 4 of the index entry is
+ * 0x00150154 in the delivered tables: bits 15:0 are index_valid, bit 16 is the
+ * field the vendor prints as `ext_mode` (= 1), bits 19:18 are the one it prints
+ * as `nomactch_cfg` (= 1), bit 20 is `valid_en` (= 1), byte 19 is 0.  This
+ * write moves 2 into bits 19:18 and clears bit 18 - nothing else changes, so
+ * the 16 field ids, index_valid, ext_mode and valid_en stay exactly as they
+ * were.
  */
 static int zx_ppe_index_posthit(struct zx_eth_adapter *adapter)
 {
 	u32 w[5];
 	int ret;
 
-	if (!(zx_ppe_posthit & ZX_PPE_POSTHIT_EXTMODE))
+	if (!(zx_ppe_posthit & ZX_PPE_POSTHIT_IDXW4))
 		return zx_ppe_index_restore(adapter);
 
 	ret = zx_ppe_index_remember(adapter, zx_ppe_v6_ext_idx);
@@ -1782,7 +1790,7 @@ static int zx_ppe_index_posthit(struct zx_eth_adapter *adapter)
 			  zx_ppe_v6_ext_idx, w, 5);
 	if (!ret)
 		dev_info(adapter->dev,
-			 "v6_posthit: index %d word4 %08x -> %08x (ext_mode 2)\n",
+			 "v6_posthit: index %d word4 %08x -> %08x (bits 19:18 = 2)\n",
 			 zx_ppe_v6_ext_idx, zx_ppe_v6_index[4], w[4]);
 	return ret;
 }
@@ -1823,7 +1831,7 @@ static int zx_ppe_v6_tables(struct zx_eth_adapter *adapter)
 	 * normal write below: the write is the authority, the snapshot is only
 	 * there for the case where the knob is turned off later.
 	 */
-	if (!(zx_ppe_posthit & ZX_PPE_POSTHIT_EXTMODE))
+	if (!(zx_ppe_posthit & ZX_PPE_POSTHIT_IDXW4))
 		zx_ppe_index_restore(adapter);
 	if (zx_ppe_v6_hwenc) {
 		ret = zx_ppe_rule_remember(adapter, ZX_PPE_V6_HW_RULE);
@@ -1841,7 +1849,7 @@ static int zx_ppe_v6_tables(struct zx_eth_adapter *adapter)
 	if (!ret)
 		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
 				  zx_ppe_v6_ext_idx, zx_ppe_v6_index, 5);
-	if (!ret && (zx_ppe_posthit & ZX_PPE_POSTHIT_EXTMODE))
+	if (!ret && (zx_ppe_posthit & ZX_PPE_POSTHIT_IDXW4))
 		ret = zx_ppe_index_posthit(adapter);
 	if (!ret && zx_ppe_v6_hwenc)
 		dev_info(adapter->dev,
@@ -1873,7 +1881,7 @@ static int zx_ppe_posthit_set(const char *val, const struct kernel_param *kp)
 
 	if (ret)
 		return ret;
-	if (zx_ppe_posthit & ~(u32)(ZX_PPE_POSTHIT_NOHOP | ZX_PPE_POSTHIT_EXTMODE))
+	if (zx_ppe_posthit & ~(u32)(ZX_PPE_POSTHIT_NOHOP | ZX_PPE_POSTHIT_IDXW4))
 		pr_warn("zx279128s-ppe: v6_posthit: unknown bits set, only bit0/bit1 exist\n");
 	zx_eth_for_each_adapter(zx_ppe_posthit_adapter, NULL);
 	return 0;
