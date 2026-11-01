@@ -44,8 +44,8 @@
  * 地址/端口）拼成一条候选，写进**每 CPU 的无锁环**；age work 每秒排空一次，
  * 查邻居 MAC、按 ffe_add 的等价路径落表。钩子恒返回 NF_ACCEPT、只做 memcpy +
  * 环写，任何分配都留在 work 里——学习失败不影响转发。开关是 debugfs
- * `ffe_learn`（**默认 1**，P10.2 F5 起与交付形态 `accel_ipv6=ffe` +
- * `ffe_learn=1` 一致），计数也在那里。
+ * `ffe_learn`（**默认 0**：probe 期不学，开机窗口过去后由 1 s 节拍自动开
+ * 一次，P10.3 门控见 learn_delay_ms 的注释），计数也在那里。
  *
  * P5 修订一（桥出口）：WAN→LAN 的出口是 br-lan 而不是 lanX，钩子原来那条
  * "出口必须是本驱动端口"把整个方向挡住了。现在钩子允许桥出口、只记桥的
@@ -232,6 +232,22 @@
 static unsigned int ffe_aging = 300;
 module_param(ffe_aging, uint, 0644);
 MODULE_PARM_DESC(ffe_aging, "Age out FFE flows after this many seconds (0 = never, default: 300)");
+
+/*
+ * P10.3 学习门控延时（毫秒）。p10.2 把 learn_on 默认写成 1，两次开机都在
+ * ~44 s 硬死机（关中断自旋、engine loaded/flow offload/wifi-on 三行全缺，
+ * 见 .scratch/ffe-fastpath/DIAG-P10.2-HANG.md）；而 learn_on=0 开机、运行期
+ * 再打开一切正常（p10.3a 阶梯，verify-p10/PHASE-G.md）。
+ *
+ * 但学习是 v6 加速的必要条件：同一个 p10.3a 镜像，学习关 = 300.8 Mbit/s
+ * （ffe_flows 0 行、全 miss 回栈），运行期打开 = 775.1 Mbit/s。
+ * 所以交付默认是"probe 期不学，probe 后延时这么久由 1 s 节拍自动开一次"，
+ * 既拿到加速，又不让学习在开机窗口里活着。0 = 立刻开（等价于 p10.2 的旧
+ * 行为，只在复现死机时用；它是开机参数，不是运行期开关）。
+ */
+static unsigned int learn_delay_ms = 120000;
+module_param(learn_delay_ms, uint, 0444);
+MODULE_PARM_DESC(learn_delay_ms, "Delay before ffe_learn auto-enables after probe, in ms (default: 120000, 0 = at probe)");
 
 /*
  * 自动降级的阈值：drop > 0.1% 或 fallback > 50%，持续 10 s 就回 stack
@@ -1001,16 +1017,22 @@ static void zx_ffe_local_ip6_add(struct zx_eth_adapter *adapter,
 	spin_lock_irqsave(&accel->local_lock, flags);
 	ret = rhashtable_insert_fast(&accel->local_ip6s, &e->node,
 				     zx_ffe_lip6_params);
-	if (ret) {
+	if (ret)
 		kfree(e);
-		if (ret != -EEXIST)
-			dev_warn_ratelimited(adapter->dev,
-				"ffe: cannot record a local IPv6 address: %d (a frame to it may be forwarded instead of terminated)\n",
-				ret);
-	} else {
+	else
 		list_add_rcu(&e->list, &accel->local_ip6_list);
-	}
 	spin_unlock_irqrestore(&accel->local_lock, flags);
+	/*
+	 * P10.3：告警搬到锁外。关中断区间里 printk 会经 console 锁写串口，
+	 * console 被别的 CPU 攥住时 console_trylock_spinning() 会**关中断自旋**
+	 * 等——这正是 p10.2 死机签名（关中断、tick/NMI 全停）的一种可能形态；
+	 * 见 .scratch/ffe-fastpath/DIAG-BOOTLEARN-RACE.md §Q4③。
+	 * 语义不变：-EEXIST 静默、其他失败限速吼一声、失败不挂链表。
+	 */
+	if (ret && ret != -EEXIST)
+		dev_warn_ratelimited(adapter->dev,
+			"ffe: cannot record a local IPv6 address: %d (a frame to it may be forwarded instead of terminated)\n",
+			ret);
 }
 
 /* addr == NULL：删掉这个接口的全部 IPv6 地址（接口注销时用） */
@@ -3629,13 +3651,39 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
 	return degraded;
 }
 
-/* 每秒一拍：流表老化 + 自动降级判据（设计 §4.1 / §9-4）+ 学习环排空（P5）。 */
+/*
+ * P10.3：学习门控到点自动开一次。写 ffe_learn（debugfs）会清 learn_arm_at，
+ * 所以用户手动开/关之后这里不会再插手；只开一次，不重复打印。
+ */
+static void zx_ffe_learn_arm_tick(struct zx_eth_adapter *adapter)
+{
+	struct zx_accel *accel = &adapter->accel;
+	unsigned long arm_at = READ_ONCE(accel->learn_arm_at);
+
+	if (!arm_at || time_before(jiffies, arm_at))
+		return;
+	WRITE_ONCE(accel->learn_arm_at, 0);
+	WRITE_ONCE(accel->learn_on, 1);
+	dev_info(adapter->dev,
+		 "accel: ffe_learn auto-enabled %u ms after probe (ff_learn gate; see DIAG-P10.2-HANG.md)\n",
+		 learn_delay_ms);
+}
+
+/*
+ * 每秒一拍：学习门控 + 流表老化 + 自动降级判据（设计 §4.1 / §9-4）+
+ * 学习环排空（P5）。
+ */
 static void zx_accel_age_work(struct work_struct *work)
 {
 	struct zx_eth_adapter *adapter =
 		container_of(to_delayed_work(work), struct zx_eth_adapter,
 			     accel.age);
 
+	/*
+	 * P10.3 门控先于 drain：同一拍把学习打开，紧接着的排空就能学，
+	 * 不必白等一拍。age work 与 learn_on 无关、每秒都在跑。
+	 */
+	zx_ffe_learn_arm_tick(adapter);
 	/* 先落表再老化：新学的条目不该在同一个节拍里被老化的时间边界伤到 */
 	zx_ffe_learn_drain(adapter);
 	zx_ffe_age(adapter);
@@ -3670,11 +3718,13 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->tbl_full = 0;
 	accel->learn_rings = NULL;
 	/*
-	 * P10.2 F5：交付形态是 `accel_ipv6=ffe` + `ffe_learn=1`，所以默认
-	 * 开机即学。钩子要等下面 alloc_percpu() + nf_register_net_hook() 之后
-	 * 才可能被调用，learn_on 先写 1 不会读到 NULL 环。
+	 * P10.3 交付门控：probe 期不学，等开机窗口过去再由 1 s 节拍自动开一次
+	 * （原因见上面 learn_delay_ms 的注释）。learn_arm_at 用 jiffies 记到点
+	 * 时刻；写 ffe_learn 会清掉它。
 	 */
-	accel->learn_on = 1;
+	accel->learn_on = 0;
+	accel->learn_arm_at = learn_delay_ms ?
+		jiffies + msecs_to_jiffies(learn_delay_ms) : 0;
 	accel->learn_cand = 0;
 	accel->learn_add = 0;
 	accel->learn_dup = 0;
@@ -4748,10 +4798,13 @@ const struct file_operations zx_accel_aging_fops = {
  *   第 4 行  v4 cand=.. add=.. dup=.. noneigh=.. nobrport=.. nonport=..
  *            dedup=.. drop=..（P10.1 按族计数，口径与第 2 行相同）
  *   第 5 行  v6 同上，末尾多一个 nat6=（v6 带 NAT 位、进环前丢弃）
- * 写 0/1（也认 off/on）：
+ *   第 6 行  auto_enable_in_ms=（P10.3 门控：还差多少毫秒自动开；0 = 已经
+ *            自动开过、到点后还没轮到节拍、或用户写过 ffe_learn 已接管）
+ * 写 0/1（也认 off/on）：写一次就取消 P10.3 的待开（用户意图优先）
  *   0 = 不再把新流写进环（环里剩的候选在下一拍清掉），已有条目照常工作到老化；
- *   1 = 开始学。**默认 1**（P10.2 F5）：交付形态是 `accel_ipv6=ffe` +
- *       `ffe_learn=1`，开机即学；不想改变行为时用它自己的 `0` 关掉。
+ *   1 = 开始学。**默认 0**：probe 期不学，开机窗口过去后由 1 s 节拍自动开
+ *       一次（P10.3 门控，见文件上方 learn_delay_ms 的注释）；交付形态
+ *       `accel_ipv6=ffe` 靠这次自动开拿到加速。
  *
  * 按族过滤（P10.2 复审整改 1）：学习只为喂 FFE，**该族必须在 ffe 模式才会学；
  * stack/hw/zc 下不产生任何 cand**（钩子在解析前就按 zx_accel_cur_mode() 返回，
@@ -4786,6 +4839,7 @@ static int zx_accel_learn_show(struct seq_file *s, void *data)
 {
 	struct zx_eth_adapter *adapter = s->private;
 	struct zx_accel *accel = &adapter->accel;
+	unsigned long arm_at;
 	int cpu;
 
 	(void)data;
@@ -4837,6 +4891,17 @@ static int zx_accel_learn_show(struct seq_file *s, void *data)
 		   READ_ONCE(accel->learn_cnt[1].dedup),
 		   READ_ONCE(accel->learn_cnt[1].drop),
 		   READ_ONCE(accel->learn_cnt[1].nat6));
+	/*
+	 * P10.3 门控状态，追加在最后一行：已有 key 名与顺序一个字都没动。
+	 * 0 表示"已经自动开过"（或到点后还没轮到节拍），也表示"用户写过
+	 * ffe_learn，已接管"；与第 1 行的开关一起读就分得清。
+	 */
+	arm_at = READ_ONCE(accel->learn_arm_at);
+	if (arm_at && time_before(jiffies, arm_at))
+		seq_printf(s, "auto_enable_in_ms=%u\n",
+			   jiffies_to_msecs(arm_at - jiffies));
+	else
+		seq_printf(s, "auto_enable_in_ms=0\n");
 	return 0;
 }
 
@@ -4867,6 +4932,9 @@ static ssize_t zx_accel_learn_store(struct file *file, const char __user *ubuf,
 		WRITE_ONCE(adapter->accel.learn_on, 0);
 	else
 		return -EINVAL;
+
+	/* P10.3：手动写就是最终决定，取消待开 */
+	WRITE_ONCE(adapter->accel.learn_arm_at, 0);
 
 	dev_info(adapter->dev, "accel: ffe_learn %s\n",
 		 READ_ONCE(adapter->accel.learn_on) ? "enabled" : "disabled");

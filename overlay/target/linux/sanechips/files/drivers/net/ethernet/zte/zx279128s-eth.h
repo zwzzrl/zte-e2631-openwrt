@@ -482,9 +482,10 @@ struct zx_accel {
 	/*
 	 * 旁路学习（P5-TASK §1）：POST_ROUTING 钩子只看不抓帧，把"可学的流"
 	 * 写进每 CPU 的无锁环（learn_rings），由 age work 每秒排空、查邻居、
-	 * 落表。开关**默认开**（learn_on = 1，P10.2 F5 起与交付形态
-	 * `accel_ipv6=ffe` + `ffe_learn=1` 一致）；用 debugfs `ffe_learn` 写 0
-	 * 可随时关掉，关掉后钩子第一行就返回，零副作用。
+	 * 落表。开关**默认关**，开机窗口过去后由 1 s 节拍自动开一次
+	 * （P10.3 门控，见 `zx279128s-accel.c` 的 learn_delay_ms 注释）；
+	 * 用 debugfs `ffe_learn` 写 0/1 可随时改，写一次就取消待开，
+	 * 关掉后钩子第一行就返回，零副作用。
 	 *
 	 * learn_cand/add/dup/drop/noneigh/nobrport/nonport/dedup 八个计数全是
 	 * "尽力而为"的裸 u64++：钩子在软中断里跑、可能并发，丢几个计数不影响
@@ -531,7 +532,13 @@ struct zx_accel {
 	struct zx_ffe_learn_ring __percpu	*learn_rings;
 	struct nf_hook_ops	learn_hook;	/* pf=IPv4, POST_ROUTING, NF_IP_PRI_LAST */
 	struct nf_hook_ops	learn_hook6;	/* pf=IPv6, 同一个回调, POST_ROUTING, NF_IP6_PRI_LAST */
-	u8			learn_on;	/* debugfs ffe_learn：0/1，默认 1（P10.2 F5） */
+	u8			learn_on;	/* debugfs ffe_learn：0/1，默认 0（P10.3：probe 后延时自动开一次） */
+	/*
+	 * P10.3 交付门控：非 0 = "到这个 jiffies 就自动把 learn_on 打开一次"。
+	 * probe 里按 learn_delay_ms 写入；1 s 节拍到点后置 1 并清零本字段。
+	 * debugfs 写 ffe_learn 会把它清零 —— 用户意图优先，不再自动开。
+	 */
+	unsigned long		learn_arm_at;
 	u64			learn_cand;	/* 钩子看到并**成功投递**的候选（不含 learn_drop） */
 	u64			learn_add;	/* 真正插进表的学习条目 */
 	u64			learn_dup;	/* 同 key 已存在：新节点换旧节点，继承 hits/bytes、刷新 lastuse（P10.2 F4） */
