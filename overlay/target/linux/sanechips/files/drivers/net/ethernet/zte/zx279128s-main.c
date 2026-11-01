@@ -1793,6 +1793,37 @@ static bool zx_is_own_addr(struct zx_eth_adapter *adapter, const u8 *addr)
 }
 
 /*
+ * P10.4：alias 丢弃点按以太类型分族计数（只计数，不改行为），给 accel 的
+ * 自动降级判据用。慢态下这批帧是"进了 FFE 又被静默丢"的证词：它们发生在
+ * 判据链之前，所以既不进 cnt[].lookup、也不进 /proc/net/dev，唯一的痕迹
+ * 就是这里（以及 accel->alias_drop[]）。
+ *
+ * `d` 指向**以太头起点**，不需要再加偏移：调用点就是
+ * `d = pkt_pool + bp * ZX_BUF_SIZE + 16`，与 zx_alias_snapshot() 的 frame、
+ * 以及快路判据链里的 `data + 2 * ETH_ALEN` 是同一个指针（快照里
+ * head[0..5] = dmac、head[6..11] = smac 就是按这个口径取的），所以以太类型
+ * 在 **d + 2 * ETH_ALEN = d + 12**。调用点外面已有 `len >= ETH_HLEN` 守卫，
+ * d[12..13] 一定在帧内；帧是 DMA 写进池槽位的，读之前已经
+ * dma_sync_single_for_cpu()。
+ *
+ * 族判定直接复用 zx_eth_family()（与快路判据链、慢路径同一个口径）：
+ * 0x0800 ⇒ 0（v4）、0x86dd ⇒ 1（v6）、VLAN（0x8100/0x88a8）与其它 ⇒ -1，
+ * 记 ZX_ALIAS_FAM_UNK，不参与判据（判据分母是本族 lookup，VLAN 内层族与它
+ * 不对应）。
+ *
+ * 写侧只有 RX NAPI，裸 u64++，与 cnt[] 同一无锁口径（丢几个计数不影响判据
+ * 结论的方向：少计只会晚降级一个窗，不会误降级）。
+ */
+static void zx_alias_count(struct zx_eth_adapter *adapter, const u8 *d)
+{
+	int fam = zx_eth_family(*(const __be16 *)(d + 2 * ETH_ALEN));
+
+	if (fam < 0)
+		fam = ZX_ALIAS_FAM_UNK;
+	adapter->accel.alias_drop[fam]++;
+}
+
+/*
  * P10.2 F6：alias 丢弃点的环形取证快照（见 struct zx_alias_snap 的注释）。
  *
  * 只记录、不改变 alias 判据的任何行为：调用点在 rx_alias_cnt++ 之后、
@@ -1949,6 +1980,12 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 
 				if (zx_is_own_addr(adapter, d + ETH_ALEN)) {
 					adapter->rx_alias_cnt++;
+					/*
+					 * P10.4：同一帧再按以太类型记到
+					 * accel->alias_drop[]（判据链看不见
+					 * 这批帧，见 zx_alias_count()）。
+					 */
+					zx_alias_count(adapter, d);
 					/*
 					 * P10.2 F6：只留证，不改行为。
 					 * 此时缓存已 invalidate、帧还在
@@ -3032,7 +3069,15 @@ static int zx_eth_alias_dump_show(struct seq_file *s, void *data)
 	u32 n = min_t(u32, cnt, ZX_ALIAS_SNAP_N);
 	u32 i, j;
 
-	seq_printf(s, "alias_dump: cnt=%u idx=%u\n", cnt, idx);
+	/*
+	 * P10.4：头行在 cnt=/idx= 之后**追加**分族的 alias 丢弃数（判据用的
+	 * 就是这三格）。已有字段与顺序不动——上机的解析脚本按 cnt= 取数。
+	 */
+	seq_printf(s, "alias_dump: cnt=%u idx=%u alias_v4=%llu alias_v6=%llu alias_unk=%llu\n",
+		   cnt, idx,
+		   READ_ONCE(adapter->accel.alias_drop[ZX_ALIAS_FAM_V4]),
+		   READ_ONCE(adapter->accel.alias_drop[ZX_ALIAS_FAM_V6]),
+		   READ_ONCE(adapter->accel.alias_drop[ZX_ALIAS_FAM_UNK]));
 	for (i = 0; i < n; i++) {
 		/*
 		 * cnt < N：槽位从 0 顺序写；cnt >= N：idx 是最老的槽位，

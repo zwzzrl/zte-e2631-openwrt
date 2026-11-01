@@ -286,6 +286,34 @@ MODULE_PARM_DESC(learn_delay_ms, "Delay before ffe_learn auto-enables after prob
 #define ZX_FFE_FB_MIN_LOOKUP		1000
 
 /*
+ * P10.4：alias 丢弃也进判据（交付级兜底）。上面的判据只看得见 cnt[]，而
+ * "FFE 收侧描述符 ↔ 池内容错配"那类故障是帧在判据链**之前**就被 alias 判据
+ * 静默丢掉（main.c 的 zx_is_own_addr() 命中点），不进 lookup、不进
+ * /proc/net/dev，于是旧判据永远不降级，用户被卡在 ~110 Mbit/s 的慢态
+ * （机制与定量见 DIAG-P10.3-FFE-COLLAPSE.md）。
+ *
+ * 阈值 2‰ 的推导（任务书 §2.3，全部是上一轮实测）：
+ *   - 慢态：Δalias 36/s ÷ Δffe lookup ≈ 9.1k pps（110 Mbit/s 量级的转发
+ *     尝试）≈ **3.9‰**；独立复算 0.388% 的边也落在同一量级；
+ *   - stack 臂（同一块板、同一条流）：≈4.7/s ÷ ~29k pps ≈ **0.16‰**，即
+ *     "慢态之外也可能零星 alias"的基线；
+ *   - 健康 ffe 快态（700–800 Mbit/s）：alias ≈ 0，比值 ≪ 1‰。
+ * 2‰ 取在两者之间：高于 stack 基线 12 倍（不会被正常流量误触发），是慢态
+ * 的 ~1/2（不会因为单窗内速率抖动而漏判）。判据用乘法比而非除法，既没有
+ * 除零，也不在 32 位 ARM 上做 64 位除法。
+ *
+ * 需要**连续 2 个**不合格窗口才降级：单窗可能被"切换瞬间/突发重传吸走一批
+ * 帧"污染，而慢态是持续平衡点（DIAG §3：不会自愈），多等一个 10 s 窗口只
+ * 损失 ~10 s，换来不误降。第 1 个不合格窗口只 dev_info 打一条 strike 1/2。
+ *
+ * 注意分母口径：Δlookup 是**进了判据链**的帧（alias 丢弃的不在其中，它们
+ * 根本没进 lookup），所以这是个"丢/存"比，不是总收帧的丢包率；上面两个
+ * 实测比值都是按这个口径算的，比较的是同一件事。
+ */
+#define ZX_FFE_FB_ALIAS_PERMILLE	2
+#define ZX_FFE_FB_ALIAS_STRIKES		2
+
+/*
  * 快路能转发的最长帧：1514 = 14 B 以太头 + 1500 B MTU。1515..1536 只可能是
  * 带 VLAN 的帧，而 VLAN 帧在判据 #4（h_proto != 0x0800）就回栈了；这条上限
  * 是给"驱动没有 SG/TSO，zx_eth_xmit() 对 >1536 直接丢"兜底的第二道闸。
@@ -3279,12 +3307,16 @@ static void zx_accel_quiesce_leave(struct zx_eth_adapter *adapter)
 }
 
 /*
- * 无锁读某一族的三个 64 位计数（P8 D）。32 位 ARM 上 u64 读是两条 ldr，
- * 数据面又是裸 u64++（见 struct zx_ffe_cnt 的注释），两者并发时可能读到
- * "半新半旧"的组合值：增量因此可能被算小（漏判）也可能被算大（提前降级）。
- * 偏漏判不致命——下一拍/下一窗还会再判；偏提前降级也只是回 stack，不丢包，
- * 属于安全侧。为了把这个窗口压到最小，这里连读两遍，两遍相等才认；不等就
- * 返回 false，由调用者"本拍不判"，不拿可疑值去比 0.1% 的阈值。
+ * 无锁读某一族的 64 位计数（P8 D；P10.4 起多读一格 alias）。32 位 ARM 上
+ * u64 读是两条 ldr，数据面又是裸 u64++（见 struct zx_ffe_cnt 与
+ * accel->alias_drop 的注释），两者并发时可能读到"半新半旧"的组合值：增量
+ * 因此可能被算小（漏判）也可能被算大（提前降级）。偏漏判不致命——下一拍/
+ * 下一窗还会再判；偏提前降级也只是回 stack，不丢包，属于安全侧。为了把这
+ * 个窗口压到最小，这里连读两遍，两遍相等才认；不等就返回 false，由调用者
+ * "本拍不判"，不拿可疑值去比 0.1% 的阈值。
+ *
+ * alias 那一格不是来自 cnt[]：alias 丢弃发生在判据链之前，有自己的按族计数
+ * accel->alias_drop[]（下标与 family 同号，见 eth.h 的 ZX_ALIAS_FAM_*）。
  *
  * 计数只增，所以两遍相等即视为一致快照（不追求与数据面原子，只求不拿一个
  * 明显撕裂的值当判据）。读失败的代价只是本拍不判，绝不会卡死判据：
@@ -3300,12 +3332,14 @@ static bool zx_accel_fb_cnt_read(const struct zx_accel *accel, int family,
 	a.lookup = READ_ONCE(c->lookup);
 	a.drop = READ_ONCE(c->drop_noport);
 	a.fallback = READ_ONCE(c->fallback);
+	a.alias = READ_ONCE(accel->alias_drop[family]);
 	b.lookup = READ_ONCE(c->lookup);
 	b.drop = READ_ONCE(c->drop_noport);
 	b.fallback = READ_ONCE(c->fallback);
+	b.alias = READ_ONCE(accel->alias_drop[family]);
 
 	if (a.lookup != b.lookup || a.drop != b.drop ||
-	    a.fallback != b.fallback)
+	    a.fallback != b.fallback || a.alias != b.alias)
 		return false;
 
 	*out = a;
@@ -3565,6 +3599,16 @@ unlock:
  *   d_fallback = Δfallback
  *   d_lookup   = Δlookup（判据的分母）
  *   cum …      = 老口径的累计值（drop 仍是 drop_noport + drop_local）
+ *   d_alias    = Δaccel->alias_drop[family]（P10.4，**行尾追加**，既有字段
+ *                与顺序一个都没动）
+ *
+ * P10.4：新增 alias 分子，判据与"连续 2 窗"见上面 ZX_FFE_FB_ALIAS_* 的
+ * 注释。两条判据的关系：
+ *   - drop/fallback 超阈值：一窗即降，行为与 P8 完全相同（没有放宽）；
+ *   - alias 超阈值：本窗记一次 strike 并 dev_info（"alias strike 1/2"），
+ *     **连续第 2 个**不合格窗口才降级；中间只要碰到一个合格/不判的窗口
+ *     （没到阈值、帧太少、计数读撕裂、离开 ffe、关掉 autofallback、
+ *     降级成功），strike 清零，重新从 1 数。
  */
 enum zx_ffe_fb_verdict {
 	ZX_FFE_FB_RETRY = -1,	/* 本拍读到的 64 位计数不一致：不判，窗口保持 */
@@ -3572,15 +3616,17 @@ enum zx_ffe_fb_verdict {
 	ZX_FFE_FB_DEGRADE = 1,	/* 判为降级 */
 };
 
-static int zx_accel_degraded(const struct zx_eth_adapter *adapter, int family)
+static int zx_accel_degraded(struct zx_eth_adapter *adapter, int family)
 {
-	const struct zx_accel *accel = &adapter->accel;
+	struct zx_accel *accel = &adapter->accel;
 	const struct zx_ffe_fb_base *b = &accel->fb_base[family];
 	struct zx_ffe_fb_base now;
 	u64 base_lookup = READ_ONCE(b->lookup);
 	u64 base_drop = READ_ONCE(b->drop);
 	u64 base_fb = READ_ONCE(b->fallback);
-	u64 dlookup, ddrop, dfb;
+	u64 base_alias = READ_ONCE(b->alias);
+	u64 dlookup, ddrop, dfb, dalias;
+	bool alias_bad;
 
 	/*
 	 * P8 D：cnt[] 的 64 位计数是无锁读（32 位 ARM 上两条 ldr，可能撕裂），
@@ -3591,24 +3637,62 @@ static int zx_accel_degraded(const struct zx_eth_adapter *adapter, int family)
 	if (!zx_accel_fb_cnt_read(accel, family, &now))
 		return ZX_FFE_FB_RETRY;
 
-	/* 计数只增；倒挂说明快照/读被写坏，不判，关窗重开 */
-	if (now.lookup <= base_lookup)
+	/*
+	 * 计数只增；倒挂说明快照/读被写坏，不判，关窗重开。没有可比的窗口
+	 * 就谈不上"连续"，strike 一起清零（P10.4）。
+	 */
+	if (now.lookup <= base_lookup) {
+		accel->fb_alias_strike[family] = 0;
 		return ZX_FFE_FB_CLEAR;
+	}
 	dlookup = now.lookup - base_lookup;
-	/* 窗口里帧太少：不判，关窗重开（下一窗重新计时） */
-	if (dlookup < ZX_FFE_FB_MIN_LOOKUP)
+	/* 窗口里帧太少：不判，关窗重开（下一窗重新计时）；同样打断"连续" */
+	if (dlookup < ZX_FFE_FB_MIN_LOOKUP) {
+		accel->fb_alias_strike[family] = 0;
 		return ZX_FFE_FB_CLEAR;
+	}
 	ddrop = now.drop > base_drop ? now.drop - base_drop : 0;
 	dfb = now.fallback > base_fb ? now.fallback - base_fb : 0;
-	if (ddrop * 1000 <= dlookup * ZX_FFE_FB_DROP_PERMILLE &&
-	    dfb * 1000 <= dlookup * ZX_FFE_FB_FALLBACK_PERMILLE)
-		return ZX_FFE_FB_CLEAR;
+	dalias = now.alias > base_alias ? now.alias - base_alias : 0;
 
+	/*
+	 * P10.4：alias 判据。乘法比与"等于阈值也算不合格"的取舍见
+	 * ZX_FFE_FB_ALIAS_PERMILLE / ZX_FFE_FB_ALIAS_STRIKES 的注释。
+	 */
+	alias_bad = dalias * 1000 >= dlookup * ZX_FFE_FB_ALIAS_PERMILLE;
+	if (!alias_bad)
+		accel->fb_alias_strike[family] = 0;	/* 本窗合格 ⇒ 连续中断 */
+
+	/* 旧判据（drop/fallback）一窗即降，行为与 P8 完全相同 */
+	if (ddrop * 1000 > dlookup * ZX_FFE_FB_DROP_PERMILLE ||
+	    dfb * 1000 > dlookup * ZX_FFE_FB_FALLBACK_PERMILLE) {
+		accel->fb_alias_strike[family] = 0;
+		goto degrade;
+	}
+
+	/* alias 不合格：第 1 窗只留证（dev_info），连续第 2 窗才降级 */
+	if (alias_bad) {
+		accel->fb_alias_strike[family]++;
+		if (accel->fb_alias_strike[family] < ZX_FFE_FB_ALIAS_STRIKES) {
+			dev_info(adapter->dev,
+				 "accel: IPv%d alias strike %u/%u: d_alias=%llu of %llu lookups\n",
+				 family ? 6 : 4,
+				 accel->fb_alias_strike[family],
+				 ZX_FFE_FB_ALIAS_STRIKES, dalias, dlookup);
+			return ZX_FFE_FB_CLEAR;
+		}
+		accel->fb_alias_strike[family] = 0;
+		goto degrade;
+	}
+
+	return ZX_FFE_FB_CLEAR;
+
+degrade:
 	dev_info(adapter->dev,
-		 "accel: IPv%d fell back to stack: d_drop=%llu d_fallback=%llu of d_lookup=%llu (cum %llu drop, %llu fallback of %llu lookups)\n",
+		 "accel: IPv%d fell back to stack: d_drop=%llu d_fallback=%llu of d_lookup=%llu (cum %llu drop, %llu fallback of %llu lookups) d_alias=%llu\n",
 		 family ? 6 : 4, ddrop, dfb, dlookup,
 		 now.drop + READ_ONCE(accel->cnt[family].drop_local),
-		 now.fallback, now.lookup);
+		 now.fallback, now.lookup, dalias);
 	return ZX_FFE_FB_DEGRADE;
 }
 
@@ -3623,9 +3707,12 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
 		 * 关掉期间窗口一律作废（每秒都清一次）：重新打开时下一拍从
 		 * 那一刻开新窗，不拿关闭期间的旧起点判一个超长窗口——否则
 		 * 关掉几分钟再打开，第一拍就会用几分钟的增量去比 0.1%。
+		 * P10.4 的 alias strike 同理：关闭期间的"不合格"也作废。
 		 */
 		accel->fb_since[0] = 0;
 		accel->fb_since[1] = 0;
+		accel->fb_alias_strike[0] = 0;
+		accel->fb_alias_strike[1] = 0;
 		return false;
 	}
 
@@ -3635,6 +3722,7 @@ bool zx_accel_autofallback(struct zx_eth_adapter *adapter)
 		/* 不在 ffe 里就没有窗口；下次切入时由 S5.1 重新开 */
 		if (zx_accel_cur_mode(accel, family) != ZX_ACC_FFE) {
 			accel->fb_since[family] = 0;
+			accel->fb_alias_strike[family] = 0;
 			continue;
 		}
 		/* 还没有窗口（刚切入，或上一窗已关）：现在开一个 */
@@ -3728,6 +3816,8 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->zc_mask = 0;
 	WRITE_ONCE(accel->quiesce, false);
 	memset(accel->cnt, 0, sizeof(accel->cnt));
+	/* P10.4：alias 丢弃的按族计数（唯一写侧是 main.c 的 alias 命中点） */
+	memset(accel->alias_drop, 0, sizeof(accel->alias_drop));
 	/* 降级窗口与 cnt[] 一起归零：首次进 ffe 时由 S5.1 开窗、取起点快照 */
 	memset(accel->fb_base, 0, sizeof(accel->fb_base));
 	accel->sw_in = 0;
@@ -3736,6 +3826,8 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->drain_frames = 0;
 	accel->autofallback = true;
 	memset(accel->fb_since, 0, sizeof(accel->fb_since));
+	/* P10.4：连续不合格窗口计数，与 fb_since 一起归零 */
+	memset(accel->fb_alias_strike, 0, sizeof(accel->fb_alias_strike));
 	accel->n_flows = 0;
 	accel->mig_ppe_flows = 0;
 	accel->tbl_full = 0;

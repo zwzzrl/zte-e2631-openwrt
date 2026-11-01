@@ -371,12 +371,18 @@ struct zx_ffe_cnt {
 
 /*
  * 自动降级的窗口起点（P7 上机后改口径，design/extensibility.md §6.6；P8 C
- * 改成真 10 s 窗口）：三个字段都是 cnt[] 里对应计数的快照，由
+ * 改成真 10 s 窗口）：字段是当前窗口里的计数快照，由
  * zx_accel_fb_window_open() 在"开窗"那一刻写入（进入 ffe 的 S5.1，以及每
  * 次关窗后的下一拍），zx_accel_degraded() 只比"当前 - 窗口起点"。
  *
  * 只有 drop_noport 进快照：drop_local（目的地址属本机、帧正常回栈、一帧没
  * 丢）语义上不是失败，不能当降级依据；它照旧在 cnt[]/debugfs 里计数。
+ *
+ * P10.4 加了 alias：唯一一个**不来自 cnt[]** 的字段。alias 丢弃发生在判据
+ * 链之前（zx279128s-main.c 的 zx_is_own_addr() 命中点），那些帧从来没有进
+ * 过 cnt[].lookup，所以它有自己的按族计数 accel->alias_drop[]（见
+ * struct zx_accel）。下标 0/1 与 family 同号，窗口只快照本族那一格 —— 判据
+ * 的分母就是本族的 lookup，两边同族才可比。
  *
  * 注意这里的"基线"是**窗口**起点，不是"进入 ffe 以来"的起点：窗口到点判过
  * 之后会被下一窗覆盖，历史上限是 ZX_FFE_FB_WINDOW_MS 而不是整段 ffe 时间。
@@ -385,6 +391,7 @@ struct zx_ffe_fb_base {
 	u64	lookup;
 	u64	drop;		/* 只累计 cnt[].drop_noport */
 	u64	fallback;
+	u64	alias;		/* 只累计 accel->alias_drop[family]（P10.4） */
 };
 
 /*
@@ -441,6 +448,17 @@ struct zx_ffe_learn_cnt {
 	u64	drop;		/* 环满丢掉的候选 */
 	u64	nat6;		/* v6 带 NAT 位、进环前丢弃（P10.1） */
 };
+
+/*
+ * P10.4：alias 丢弃的分族下标（accel->alias_drop[] 与 debugfs alias_dump 的
+ * 头行共用）。0/1 **刻意与 family 同号**：判断语句里 accel->alias_drop[family]
+ * 就是本族的丢弃数，窗口快照不需要再做映射。2 = VLAN/非 IP，只做展示，
+ * 不进判据（判据分母是本族 lookup，而 VLAN 帧的内层族与它不对应）。
+ */
+#define ZX_ALIAS_FAM_V4		0
+#define ZX_ALIAS_FAM_V6		1
+#define ZX_ALIAS_FAM_UNK	2
+#define ZX_ALIAS_FAM_NUM	3
 
 struct zx_accel {
 	u8			v4_mode;	/* enum zx_accel_mode */
@@ -563,6 +581,17 @@ struct zx_accel {
 	u64			add_replace;
 	struct zx_ffe_cnt	cnt[2];
 	/*
+	 * P10.4：alias 丢弃按以太类型分族的计数（下标见 ZX_ALIAS_FAM_*），
+	 * 唯一写侧是 zx279128s-main.c 的 alias 命中点（RX NAPI），裸 u64++，
+	 * 与 cnt[] 同一无锁口径；读侧是 age work 里的窗口双读校验
+	 * （zx_accel_fb_cnt_read()）与 debugfs alias_dump。
+	 *
+	 * **不并入 cnt[]**：cnt[] 的注释口径是"进了判据链的帧"，而 alias 发生在
+	 * 判据链入口之前（这些帧没进 lookup、没建 skb、bp 已还），语义不同；
+	 * 混在一起会让 lookup == hit + miss 这条不变式失效。
+	 */
+	u64			alias_drop[ZX_ALIAS_FAM_NUM];
+	/*
 	 * 自动降级的窗口起点（P7 上机后改口径，design/extensibility.md §6.6；
 	 * P8 C 改成真 10 s 窗口）：fb_base[] 是该窗口起点的 cnt[] 快照，
 	 * fb_since[] 是窗口起点时刻，两者一起由 zx_accel_fb_window_open() 写
@@ -604,6 +633,14 @@ struct zx_accel {
 	 * zx_accel_autofallback() 清零（切换离开 ffe / 窗口判完），都无锁。
 	 */
 	unsigned long		fb_since[2];
+	/*
+	 * P10.4：本族"连续不合格窗口"的计数（下标同 family），供 alias 判据
+	 * 的"连续 2 窗才降级"用（见 accel 的 ZX_FFE_FB_ALIAS_STRIKES）。只有
+	 * age work 里的 zx_accel_degraded()/zx_accel_autofallback() 写，无锁；
+	 * 窗口判为合格、窗口太小/不判、离开 ffe、关掉 autofallback、降级成功
+	 * 都会清零——"连续"就是靠这一条保持的。
+	 */
+	u8			fb_alias_strike[2];
 };
 
 /* 某个族的当前模式。数据面每个包只读这一个字节：切换是单字节写，
