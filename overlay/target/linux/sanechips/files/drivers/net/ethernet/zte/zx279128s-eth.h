@@ -392,6 +392,27 @@ struct zx_ffe_flow;
  */
 struct zx_ffe_learn_ring;
 
+/*
+ * 按族的学习计数（P10.1）：下标是 `family == 6`（0 = v4、1 = v6），与
+ * struct zx_accel 里的 8 个合计计数**同时**自增，口径完全相同（合计 = 两格
+ * 相加）。只给 debugfs ffe_learn 末尾追加的 v4/v6 两行用：不新增 debugfs
+ * 文件，也不改前两行的字段名与顺序。
+ *
+ * nat6 是 v6 专有：带 NAT 位的 v6 候选在进环之前就被丢弃（数据面 #16 必
+ * 回栈），它不属于上面任何一种合计口径，只出现在 v6 行的末尾。
+ */
+struct zx_ffe_learn_cnt {
+	u64	cand;		/* 钩子看到并投递的候选（不含 drop） */
+	u64	add;		/* 真正插进表的学习条目 */
+	u64	dup;		/* 同 key 已存在：原地刷新（对应合计行的 dup） */
+	u64	noneigh;	/* 候选拿不到下一跳 MAC */
+	u64	nobrport;	/* 桥出口解析不出本驱动端口 */
+	u64	nonport;	/* 不是本驱动交换机口（含入口/出口端口不可用） */
+	u64	dedup;		/* 1 s 去重挡下的重复候选 */
+	u64	drop;		/* 环满丢掉的候选 */
+	u64	nat6;		/* v6 带 NAT 位、进环前丢弃（P10.1） */
+};
+
 struct zx_accel {
 	u8			v4_mode;	/* enum zx_accel_mode */
 	u8			v6_mode;	/* enum zx_accel_mode */
@@ -456,17 +477,27 @@ struct zx_accel {
 	 * 计数**：入口反查失败并入 learn_nonport（口径见下）。
 	 *
 	 * 两个协议族（P10）：同一个回调 zx_ffe_learn_hook() 注册两次（learn_hook
-	 * = IPv4、learn_hook6 = IPv6，都是 POST_ROUTING/NF_IP_PRI_LAST），按
+	 * = IPv4、learn_hook6 = IPv6，都是 POST_ROUTING；v6 的优先级 P10.1 起
+	 * 改用 NF_IP6_PRI_LAST，见下），按
 	 * state->pf 选报头解析器；入口/出口/同口/conntrack/组装/投递只有一份。
 	 * v6 的额外边界（扩展头、ICMPv6、fe80::/10 源）在解析器里，与数据面
 	 * v6 判据链同一个口径。候选/键的地址宽度按族取 4/16 B（union
 	 * nf_inet_addr），去重仍是整结构 memcmp——所有构造点先 memset。
-	 * **计数仍是两族合计、没有新增字段**（ffe_learn 的行格式不变），要区分
-	 * 族就看 ffe_flows 里条目的地址形态（v4/v6 键）。
+	 * **计数仍是两族合计、第 2 行格式不变**；P10.1 起另有一组按族计数
+	 * learn_cnt[2]，只用于 ffe_learn 末尾追加的 v4/v6 两行（见下面的
+	 * struct zx_ffe_learn_cnt 注释）。
+	 *
+	 * P10.1（v6 学习加固）：带 NAT 位的 v6 候选在**进环之前**就被丢弃
+	 * （v6 没有 NAT66，数据面 #16 对"family=6 且带 NAT 位"一律回栈，学进表
+	 * 只是白占表项到老化），计 learn_cnt[1].nat6；parse6 的线性区基准改成
+	 * skb_network_header（不再从 skb->data 起算），并补 payload_len >= 4 与
+	 * hop_limit > 1 两条与数据面同口径的拒绝；parse4 补 ttl > 1；
+	 * learn_one 里"出口端口不可用"的两处静默 return 并入 learn_nonport
+	 * （原因见 zx279128s-accel.c 的 P10.1 注释）。
 	 */
 	struct zx_ffe_learn_ring __percpu	*learn_rings;
 	struct nf_hook_ops	learn_hook;	/* pf=IPv4, POST_ROUTING, NF_IP_PRI_LAST */
-	struct nf_hook_ops	learn_hook6;	/* pf=IPv6, 同一个回调，P10 */
+	struct nf_hook_ops	learn_hook6;	/* pf=IPv6, 同一个回调, POST_ROUTING, NF_IP6_PRI_LAST */
 	u8			learn_on;	/* debugfs ffe_learn：0/1，默认 0 */
 	u64			learn_cand;	/* 钩子看到的候选（含被丢的） */
 	u64			learn_add;	/* 真正插进表的学习条目 */
@@ -477,6 +508,12 @@ struct zx_accel {
 	u64			learn_nonport;	/* 命中的不是本驱动交换机口：出口 FDB 命中无线口等（P5），
 						 * 以及 P9 起**入口**桥的源 MAC 反查失败/命中无线口 */
 	u64			learn_dedup;	/* 1 s 内同一五元组的重复候选，未再投递 */
+	/*
+	 * P10.1：按族拆开的同一组计数（下标 0 = v4、1 = v6），与上面 8 个
+	 * 合计计数同时自增（合计 = 两格相加），只用于 ffe_learn 末尾追加的
+	 * 两行。上面 8 个字段仍是两族合计，第 2 行的格式一个字段都没动。
+	 */
+	struct zx_ffe_learn_cnt	learn_cnt[2];
 	/*
 	 * ffe_add 命中同 key 的次数（P5 修订二 §C 的幂等化）：这次 add 走的是
 	 * "原地更新"而不是"新插入"，表里不会多出一行。与学习无关，放在这一组
