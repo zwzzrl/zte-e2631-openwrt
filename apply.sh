@@ -216,10 +216,17 @@ echo "kernel config: forced the OpenWrt command line, root on mtdblock$ROOTDEV, 
 #   MAGIC_SYSRQ_SERIAL   SysRq over a plain serial line, no break needed, so 'w'
 #                        and 'l' can be typed at the console while it is stuck
 DBG_MARK='# E2631: lockup instrumentation for the MT7916 bus hang (see apply.sh)'
+# The "# CONFIG_BOOTPARAM_HUNG_TASK_PANIC is not set" line is a comment, not a
+# CONFIG_* assignment, so it must be deleted explicitly too. Without this the
+# block below appends one more copy on every apply.sh run: the tree had 146
+# accumulated copies before the P10.2 reproducibility pass, i.e. re-applying
+# gave a different config-6.18 every time (harmless to Kconfig, but not
+# reproducible and not clean).
 sed -i -e "\|^$DBG_MARK\$|d" -e '/^CONFIG_SOFTLOCKUP_DETECTOR=y$/d' \
 	-e '/^CONFIG_DETECT_HUNG_TASK=y$/d' -e '/^CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=/d' \
 	-e '/^CONFIG_MAGIC_SYSRQ_SERIAL=y$/d' -e '/^CONFIG_PCIEPORTBUS=y$/d' \
-	-e '/^CONFIG_PCIEAER=y$/d' -e '/^CONFIG_PCIEAER_INJECT=y$/d' "$CFG"
+	-e '/^CONFIG_PCIEAER=y$/d' -e '/^CONFIG_PCIEAER_INJECT=y$/d' \
+	-e '/^# CONFIG_BOOTPARAM_HUNG_TASK_PANIC is not set$/d' "$CFG"
 printf '%s\n' "$DBG_MARK" \
 	'CONFIG_SOFTLOCKUP_DETECTOR=y' \
 	'CONFIG_DETECT_HUNG_TASK=y' \
