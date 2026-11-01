@@ -3669,12 +3669,8 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	accel->mig_ppe_flows = 0;
 	accel->tbl_full = 0;
 	accel->learn_rings = NULL;
-	/*
-	 * P10.2 F5：交付形态是 `accel_ipv6=ffe` + `ffe_learn=1`，所以默认
-	 * 开机即学。钩子要等下面 alloc_percpu() + nf_register_net_hook() 之后
-	 * 才可能被调用，learn_on 先写 1 不会读到 NULL 环。
-	 */
-	accel->learn_on = 1;
+	/* P10.3a 二分：`accel_v6` 保持 FFE 不动，只把学习默认关掉（运行期 `echo 1 > ffe_learn` 可复现） */
+	accel->learn_on = 0;
 	accel->learn_cand = 0;
 	accel->learn_add = 0;
 	accel->learn_dup = 0;
