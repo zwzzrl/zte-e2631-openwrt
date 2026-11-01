@@ -237,6 +237,51 @@ module_param_named(v6_wipe, zx_ppe_v6_wipe, bool, 0644);
 MODULE_PARM_DESC(v6_wipe,
 	"zero all 520 hash slots when the engine stops (only with v6_hwenc, default 1)");
 
+/*
+ * Post-hit IPv6 probes (default 0: the delivered behaviour, bit for bit).
+ *
+ * The hit is not in doubt any more: rule 2 / extr 2 / key rule byte 2 / zero
+ * key header lands in the slot the software computes, and the aging bit goes
+ * up under traffic.  What fails is everything *after* the hit - the frames are
+ * taken away from the CPU and the far end never acknowledges a byte of them,
+ * and the five action words that were A/B'd on the box all fail the same way.
+ * The two knobs below are the two post-hit inputs a table entry can still
+ * change; both are per-flow or table-only, neither needs a reboot to undo.
+ *
+ *   bit0  do not set the packet modifier's "decrement TTL / hop limit" bit
+ *         (bit 34 of the 12-byte rewrite instruction) for an IPv6 flow.  The
+ *         instruction has no "this header is IPv6" field - the only
+ *         family-aware bits are the two checksum-update bits, which are
+ *         already cleared for v6 - so if the modifier resolves bit 34 with the
+ *         IPv4 offsets it decrements byte 8 of the IPv6 header, and byte 8 is
+ *         source address byte 0.  The frame still leaves the box and the far
+ *         end drops it silently (the transport checksum covers the source
+ *         address and is not recomputed), which is exactly the observed shape.
+ *         Applies to flows created after the write.
+ *
+ *   bit1  write extract index 10's word 4 with ext_mode = 2 (0x00190154
+ *         instead of 0x00150154), the value the vendor's aclRamInit puts in
+ *         its v6 groups 1..8 while groups 9/10 get 1.  This keeps index 10,
+ *         the 16 field ids, the 45-byte key and therefore the slot unchanged
+ *         (a hit that works today keeps hitting) and flips only the flag that
+ *         may select the post-hit parse template.  It is a hybrid the vendor
+ *         never writes - that is what makes it a one-bit experiment - and if
+ *         ext_mode also drives extraction the hit dies, which the aging bit
+ *         says within a second.  The entry is read back before the first write
+ *         and put back word for word when the bit is cleared.
+ */
+#define ZX_PPE_POSTHIT_NOHOP	BIT(0)
+#define ZX_PPE_POSTHIT_EXTMODE	BIT(1)
+static unsigned int zx_ppe_posthit;
+static int zx_ppe_posthit_set(const char *val, const struct kernel_param *kp);
+static const struct kernel_param_ops zx_ppe_posthit_ops = {
+	.set	= zx_ppe_posthit_set,
+	.get	= param_get_uint,
+};
+module_param_cb(v6_posthit, &zx_ppe_posthit_ops, &zx_ppe_posthit, 0644);
+MODULE_PARM_DESC(v6_posthit,
+	"IPv6 post-hit probes (bitmask, default 0): 1 = do not decrement the hop limit, 2 = extract index 10 ext_mode 2");
+
 /* The vendor's IPv6 extract-rule landing site.  Measured empty on this box: a
  * read of rule table entry 2 in the delivery state (2026-11-02, uptime 4825 s,
  * IPv6 classifier programmed) came back as 17 zero words, and this driver has
@@ -995,7 +1040,14 @@ static void zx_ppe_flow_entry(const struct zx_ppe_rewrite *r, u32 w[3])
 		zx_ppe_put_bits(b, 2, 16, be16_to_cpu(r->new_dport));
 	if (r->sport)
 		zx_ppe_put_bits(b, 18, 16, be16_to_cpu(r->new_sport));
-	zx_ppe_put_bits(b, 34, 1, 1);			/* decrement TTL/hop limit */
+	/* bit 34: decrement TTL / hop limit.  Nothing in these 12 bytes tells
+	 * the modifier that the L3 header is IPv6, so v6_posthit bit0 lets it
+	 * stay clear on an IPv6 flow: if the modifier resolves the action with
+	 * the IPv4 offsets it would decrement source address byte 0 instead of
+	 * the hop limit (DESIGN-V6-POSTHIT.md §4).
+	 */
+	if (!(r->v6 && (zx_ppe_posthit & ZX_PPE_POSTHIT_NOHOP)))
+		zx_ppe_put_bits(b, 34, 1, 1);		/* decrement TTL/hop limit */
 	/* IPv6 has no header checksum and its transport pseudo header does not
 	 * cover the hop limit, so nothing needs fixing up at all.
 	 */
@@ -1646,6 +1698,95 @@ static void zx_ppe_rule_restore(struct zx_eth_adapter *adapter)
 	}
 }
 
+/* ---- One-button undo, part 3: the extract-index table -----------------
+ *
+ * Same shape as the rule table just above, one table lower: the index entry is
+ * 5 words in switch SRAM and survives a module reload, so the entry that
+ * v6_posthit's ext_mode bit patches is read back before the first write and
+ * put back word for word afterwards.  A read that fails means "we do not know
+ * what is in there", and writing over an unknown entry would leave something
+ * behind that no snapshot can restore - so the write is refused and the caller
+ * logs it.  Only index 10 (zx_ppe_v6_ext_idx) is ever touched, so one snapshot
+ * keyed by id is enough; a second id would mean two experiments at once.
+ */
+static struct {
+	unsigned int	id;
+	bool		valid;
+	u32		w[5];
+} zx_ppe_idx_save;
+
+static int zx_ppe_index_remember(struct zx_eth_adapter *adapter, unsigned int id)
+{
+	int ret;
+
+	if (zx_ppe_idx_save.valid)
+		return zx_ppe_idx_save.id == id ? 0 : -ENOSPC;
+	ret = zx_pp_read_entry(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX, id,
+			       zx_ppe_idx_save.w, 5);
+	if (ret)
+		return ret;
+	zx_ppe_idx_save.id = id;
+	zx_ppe_idx_save.valid = true;
+	dev_info(adapter->dev,
+		 "cla index %u saved before the first write: %08x %08x %08x %08x %08x\n",
+		 id, zx_ppe_idx_save.w[0], zx_ppe_idx_save.w[1],
+		 zx_ppe_idx_save.w[2], zx_ppe_idx_save.w[3],
+		 zx_ppe_idx_save.w[4]);
+	return 0;
+}
+
+static int zx_ppe_index_restore(struct zx_eth_adapter *adapter)
+{
+	int ret;
+
+	if (!zx_ppe_idx_save.valid)
+		return 0;
+	ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
+			  zx_ppe_idx_save.id, zx_ppe_idx_save.w, 5);
+	if (ret)
+		return ret;
+	dev_info(adapter->dev,
+		 "cla index %u restored: %08x %08x %08x %08x %08x\n",
+		 zx_ppe_idx_save.id, zx_ppe_idx_save.w[0], zx_ppe_idx_save.w[1],
+		 zx_ppe_idx_save.w[2], zx_ppe_idx_save.w[3],
+		 zx_ppe_idx_save.w[4]);
+	zx_ppe_idx_save.valid = false;
+	return 0;
+}
+
+/* Apply or undo the ext_mode half of v6_posthit.  Word 4 of the index entry is
+ * 0x00150154 in the delivered tables: byte 16..17 is index_valid, byte 18 bit0
+ * is valid_en, bits 2..3 are ext_mode (= 1), bit4 is nomatch_cfg, byte 19 is 0.
+ * ext_mode = 2 therefore means setting bit 19 of the word (0x00080000) and
+ * clearing bit 18 (0x00040000) - nothing else changes, so the 16 field ids,
+ * index_valid and valid_en stay exactly as they were.
+ */
+static int zx_ppe_index_posthit(struct zx_eth_adapter *adapter)
+{
+	u32 w[5];
+	int ret;
+
+	if (!(zx_ppe_posthit & ZX_PPE_POSTHIT_EXTMODE))
+		return zx_ppe_index_restore(adapter);
+
+	ret = zx_ppe_index_remember(adapter, zx_ppe_v6_ext_idx);
+	if (ret) {
+		dev_warn(adapter->dev,
+			 "v6_posthit: index %d could not be read back, not writing it\n",
+			 zx_ppe_v6_ext_idx);
+		return ret;
+	}
+	memcpy(w, zx_ppe_v6_index, sizeof(w));
+	w[4] = (w[4] & ~(u32)0x000c0000) | (u32)0x00080000;
+	ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
+			  zx_ppe_v6_ext_idx, w, 5);
+	if (!ret)
+		dev_info(adapter->dev,
+			 "v6_posthit: index %d word4 %08x -> %08x (ext_mode 2)\n",
+			 zx_ppe_v6_ext_idx, zx_ppe_v6_index[4], w[4]);
+	return ret;
+}
+
 /* Zero all 520 hash slots and their aging words.  Caller holds ppe_lock; the
  * hash tables and the aging words are separate address spaces (the vendor's
  * cla_set_hash_table never clears aging), so both are written.
@@ -1678,6 +1819,12 @@ static int zx_ppe_v6_tables(struct zx_eth_adapter *adapter)
 	int ret;
 
 	zx_ppe_v6_tune();
+	/* Put back an index entry the post-hit knob patched last time before the
+	 * normal write below: the write is the authority, the snapshot is only
+	 * there for the case where the knob is turned off later.
+	 */
+	if (!(zx_ppe_posthit & ZX_PPE_POSTHIT_EXTMODE))
+		zx_ppe_index_restore(adapter);
 	if (zx_ppe_v6_hwenc) {
 		ret = zx_ppe_rule_remember(adapter, ZX_PPE_V6_HW_RULE);
 		if (ret) {
@@ -1694,12 +1841,42 @@ static int zx_ppe_v6_tables(struct zx_eth_adapter *adapter)
 	if (!ret)
 		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
 				  zx_ppe_v6_ext_idx, zx_ppe_v6_index, 5);
+	if (!ret && (zx_ppe_posthit & ZX_PPE_POSTHIT_EXTMODE))
+		ret = zx_ppe_index_posthit(adapter);
 	if (!ret && zx_ppe_v6_hwenc)
 		dev_info(adapter->dev,
 			 "IPv6 hw encoding armed: rule %u + index %d, key rule byte 0x%02x, extr %u\n",
 			 zx_ppe_v6_rule_id(), zx_ppe_v6_ext_idx,
 			 zx_ppe_v6_extr_index(), zx_ppe_v6_extr_index());
 	return ret;
+}
+
+/* v6_posthit is a table entry, so it takes effect immediately (unlike its bit0,
+ * which only shapes flows created from now on).  The knob is only meaningful
+ * with the IPv6 tables programmed, so an adapter that never ran
+ * zx_ppe_v6_tables() is left alone.
+ */
+static void zx_ppe_posthit_adapter(struct zx_eth_adapter *adapter, void *data)
+{
+	mutex_lock(&adapter->ppe_lock);
+	if (adapter->ppe_active && zx_ppe_ipv6) {
+		if (zx_ppe_index_posthit(adapter))
+			dev_warn(adapter->dev,
+				 "v6_posthit: the classifier index entry was not updated\n");
+	}
+	mutex_unlock(&adapter->ppe_lock);
+}
+
+static int zx_ppe_posthit_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_uint(val, kp);
+
+	if (ret)
+		return ret;
+	if (zx_ppe_posthit & ~(u32)(ZX_PPE_POSTHIT_NOHOP | ZX_PPE_POSTHIT_EXTMODE))
+		pr_warn("zx279128s-ppe: v6_posthit: unknown bits set, only bit0/bit1 exist\n");
+	zx_eth_for_each_adapter(zx_ppe_posthit_adapter, NULL);
+	return 0;
 }
 
 static int zx_ppe_v6_hwenc_set(const char *val, const struct kernel_param *kp)
@@ -2615,6 +2792,11 @@ static void zx_ppe_stop(struct zx_eth_adapter *adapter)
 	}
 	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX, ZX_PPE_V4_INDEX, NULL, 0);
 	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE, ZX_PPE_V4_RULE, NULL, 0);
+	/* Put the index entry back before zeroing it: if a snapshot exists it is
+	 * the exact pre-patch content, and the zeroing below is the state the
+	 * delivered driver leaves behind either way.
+	 */
+	zx_ppe_index_restore(adapter);
 	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX, zx_ppe_v6_ext_idx, NULL, 0);
 	if (!zx_ppe_v6_hwenc)
 		zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE,
