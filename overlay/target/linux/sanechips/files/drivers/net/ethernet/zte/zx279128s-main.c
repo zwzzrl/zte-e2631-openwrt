@@ -42,6 +42,12 @@
 
 #include "zx279128s-eth.h"
 #include "zx279128s-ppe.h"
+/*
+ * M2：ZX_PPPOE_ETH_P_SESSION/DISCOVERY、zx_pppoe_gate（门控读侧别名）与
+ * zx_ffe_pppoe_sniff() 的声明。这个头文件在 __KERNEL__ 下只借
+ * <linux/types.h>，不会把额外内核头带进来。
+ */
+#include "zx279128s-pppoe.h"
 
 /*
  * Map the 4096 x 2048 B DMA buffer pool cacheable (streaming DMA, so every
@@ -2300,6 +2306,38 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			if (unlikely(READ_ONCE(adapter->accel.quiesce)))
 				goto accel_slow;
 			/*
+			 * M2：PPPoE 窥探（P1-9 的位置约束）。
+			 *
+			 *   1. 必须在 poisoned 判据之后：毒帧的 dmac 已被改成保留
+			 *      组播、内容不可信，拿它更新会话就是让任意伪造帧改
+			 *      写 sid / 触发 flush；
+			 *   2. 必须在 quiesce 之后：切换中一律回栈，不进快路也
+			 *      不学会话；
+			 *   3. 必须在 fam 算好之后、按族分派之前：探针成功后把
+			 *      fam 换成**内层**协议族（0/1），后面才走"这一族是
+			 *      ffe 才进判据链"的分支；否则 PPPoE 帧会以 fam=-1
+			 *      落进 nfam 兜底分支，被当成"另一族"再送一遍判据链。
+			 *
+			 * pppoe=0 时这里只多一次 "读门控 + cmp + 前向跳过"：
+			 * zx_pppoe_gate 与 M1 的 module_param(pppoe) 是同一字节
+			 * （accel.c 里的同地址 alias），所以运行期写 sysfs 立刻
+			 * 生效，不需要重启、也不需要再挂一个 notifier。
+			 *
+			 * 只看以太类型是 0x8864/0x8863 的帧才进函数：普通
+			 * IPv4/IPv6 流量在门控打**开**时也不多一次调用。
+			 */
+			if (zx_pppoe_gate &&
+			    (h_proto == htons(ZX_PPPOE_ETH_P_SESSION) ||
+			     h_proto == htons(ZX_PPPOE_ETH_P_DISCOVERY))) {
+				int pfam = zx_ffe_pppoe_sniff(adapter,
+						adapter->pkt_pool +
+						(u32)bp * ZX_BUF_SIZE + 16,
+						len, port);
+
+				if (pfam >= 0)
+					fam = pfam;
+			}
+			/*
 			 * 只在对应族是 ffe 时才进判据链（其它模式零开销）。
 			 * 非 IPv4/IPv6 的帧（fam<0：ARP/PPPoE/VLAN 外层…）没有
 			 * 协议族，只要有一族在 ffe 里也让它们过一遍判据链并记
@@ -2363,11 +2401,39 @@ accel_slow:
 					       (u32)bp * ZX_BUF_SIZE + 16 +
 					       ETH_HLEN;
 				u32 l3_avail = (u32)len - ETH_HLEN;
+				u32 poff = 0;
 				u32 claimed = 0;
 				bool have_len = false;
 
+				/*
+				 * M2：PPPoE 会话帧的内层 L3 在 14 B 以太头 +
+				 * (6 B PPPoE 头 + 1/2 B PPP 协议) 之后。l3 与
+				 * l3_avail **必须一起**减这个偏移：
+				 *   claimed 是 IP 层长度（v4 tot_len / v6
+				 *   40+payload_len），它相对 l3 计量；
+				 *   只改 l3 不改 l3_avail 会让可用长度多算
+				 *   7/8 B（短帧漏判）；只改 l3_avail 不改 l3
+				 *   会让 claimed 比真正的小 7/8 B（长帧误判）。
+				 * 只认 h_proto == 0x8864：探针判过 SESS 的帧
+				 * 才会把 fam 换成内层族，才会走到这里；PADT
+				 * （fam 仍 < 0）与普通 IP 帧 poff 恒 0。
+				 */
+				if (h_proto == htons(ZX_PPPOE_ETH_P_SESSION)) {
+					poff = zx_pppoe_l3_off(l3 -
+						ETH_HLEN);
+					l3 += poff;
+					l3_avail -= poff;
+				}
+
+				/*
+				 * 两个族的门槛都用 l3_avail 而不是 len：
+				 *   l3_avail = len - ETH_HLEN - poff，
+				 * 所以 "len >= ETH_HLEN+poff+sizeof(hdr)"
+				 * 与 "l3_avail >= sizeof(hdr)" 是同一件事，
+				 * 而后者在 poff=0 时与原式逐字等价。
+				 */
 				if (fam == 1 &&
-				    len >= ETH_HLEN + sizeof(struct ipv6hdr)) {
+				    l3_avail >= sizeof(struct ipv6hdr)) {
 					struct ipv6hdr ip6;
 
 					memcpy(&ip6, l3, sizeof(ip6));
@@ -2375,7 +2441,7 @@ accel_slow:
 						  ntohs(ip6.payload_len);
 					have_len = true;
 				} else if (fam == 0 &&
-					   len >= ETH_HLEN + sizeof(struct iphdr)) {
+					   l3_avail >= sizeof(struct iphdr)) {
 					struct iphdr ip;
 
 					memcpy(&ip, l3, sizeof(ip));

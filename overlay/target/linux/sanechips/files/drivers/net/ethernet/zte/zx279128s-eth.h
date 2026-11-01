@@ -23,6 +23,14 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
+/*
+ * M2：PPPoE 会话记录（struct zx_pppoe_sess）与"只清 PPPoE 条目"的 work 都要
+ * 挂在本文件的结构体里，所以这里必须能看到 zx279128s-pppoe.h。该头文件在
+ * __KERNEL__ 下只借 <linux/types.h>，宿主单测另有 stdint 分支，加这一行不会
+ * 把内核头带进宿主编译。
+ */
+#include "zx279128s-pppoe.h"
+
 #define DRV_NAME		"zx279128s-eth"
 
 /*
@@ -406,6 +414,15 @@ struct zx_ffe_fb_base {
  *             wifi-rx 是 struct sk_buff *；
  *   prepared  判据已完成、尚未提交（"先判据、后批量提交"两段式预留，
  *             现在只置位不读，恒为 0 或 1）。
+ *
+ * M2 追加三个 PPPoE 字段（**只在结构体尾部追加**，既有字段偏移一个字节都不动；
+ * 本结构体只作为 zx_ffe_rx() 的栈上局部量和 ingress/egress op 的参数指针出现，
+ * 不进 DMA 环、不进任何池——见 .scratch/ffe-fastpath/pppoe-m2/20261102-0450/
+ * RESULT.md §0）：
+ *   l3_off    内层 L3（IP 头）相对**以太头**的偏移；0 = 非 PPPoE，7/8 = PPPoE
+ *             （6 B PPPoE 头 + 1/2 B PPP 协议字段）。M7 剥头时要用。
+ *   sid       PPPoE 会话号（0 = 非 PPPoE）。只用于命中前比对与打印，**不进键**。
+ *   orig_len 入口处的原始帧长。M7/M8 记账用（改写后 pkt->len 会变）。
  */
 struct zx_ffe_pkt {
 	u8		*data;		/* 线性帧起点（以太头） */
@@ -414,6 +431,9 @@ struct zx_ffe_pkt {
 	u8		family;		/* 0=v4, 1=v6 */
 	u8		prepared;	/* 判据已完成、尚未提交（两段式提交预留） */
 	void		*token;		/* ingress op 自用：现在 = RX 的 bp */
+	u8		l3_off;		/* M2：内层 L3 偏移（0=非 PPPoE，7/8=PPPoE） */
+	u16		sid;		/* M2：PPPoE 会话号（0=非 PPPoE） */
+	u16		orig_len;	/* M2：入口原始帧长（M7/M8 记账用） */
 };
 
 /* 入口/出口 op（定义在文件末尾，要等 enum zx_ffe_rx_result 与 zx_ffe_pkt 就位） */
@@ -942,6 +962,21 @@ struct zx_eth_adapter {
 	 */
 	void __iomem		*soc_temp_base;	/* 已挪到 0x94100034 */
 	bool			soc_temp_inited;/* 一次性使能/detector 配置已做过 */
+
+	/*
+	 * PPPoE over FFE（M2）。**必须放在结构体最尾部**：既有成员的偏移一个
+	 * 都不动（zx_accel 是中间成员，往它里面加字段会平移它后面的 sw_* /
+	 * soc_temp_* 偏移，那是大面积重排）。代价只有 sizeof(*adapter) 变，
+	 * 落在 devm_kzalloc() 的一个立即数上，判据 1 里单列（见 RESULT.md）。
+	 *
+	 *   pppoe_sess   当前这一条 PPPoE 会话（M2 只写：sid/valid/pfc/代/MAC；
+	 *                读侧在 M3/M7/M8）。写侧只有 RX NAPI，读侧还没接。
+	 *   pppoe_flush_work  会话变化（PADT / sid 变）时排一次，只清
+	 *                pppoe_in||pppoe_out 的条目。**不复用 port_flush_work**：
+	 *                那个是全清，且承担"端口全 down"的语义。
+	 */
+	struct zx_pppoe_sess	pppoe_sess;
+	struct work_struct	pppoe_flush_work;
 };
 
 /* MAC in the layout of the switch's MAC registers: bytes 2-5, then 0-1 */
@@ -1024,9 +1059,53 @@ enum zx_ffe_rx_result {
  * P6 起这一层只剩"建包描述符 + 调 ingress op"（design/extensibility.md §1）：
  * 判据链、改写、提交在 ingress->run()，裁决→计数/RX 结果在 ingress->complete()。
  * 帧的以太类型不再由这里转交（ingress op 自己从 data + 2*ETH_ALEN 读，同一个值）。
+ *
+ * M2：签名**不变**。l3_off/sid/orig_len 在函数内部填进描述符（PPPoE 帧在
+ * 探针确认是 0x8864 会话帧后才解析；pppoe=0 时只多一次"读门控 + 分支"）。
+ * 不从调用方传：两个只在 M7 才被读的字段会多压两个栈槽，把 zx_eth_rx()
+ * （内联进 zx_eth_poll 的 6500 条指令）的帧偏移整体平移。
  */
 enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 				int rx_port, int family);
+
+/* ---- M2：PPPoE 内核侧接口（宿主单测不编这里，见 pppoe.h 的 #ifdef __KERNEL__） */
+
+/*
+ * 总门控的**读侧别名**。M1 在 zx279128s-accel.c 里把它定义成
+ * `static bool pppoe`（module_param）；M1 的 hunk 必须能反向应用，所以那一行
+ * 不能改，M2 的声明也不能塞进 pppoe.h（那会让 M1.diff 的新文件补丁反不掉）。
+ * 这里的做法：accel.c 在同一个 TU 里给 `pppoe` 起一个同地址的全局别名
+ * `zx_pppoe_gate`，main.c 读别名等价于读参数本身——写走 sysfs → 写 pppoe →
+ * 别名同地址自动可见，不需要任何同步。
+ */
+extern bool zx_pppoe_gate;
+
+/*
+ * RX 窥探（M2）：在**过了 poisoned/quiesce 判据之后**、fam 分派之前调用。
+ *
+ * 返回内层协议族（0=v4、1=v6）让调用方直接当 fam 用；返回 -1 = 这一帧不是
+ * 本会话的 PPPoE 数据帧（调用方保持原 fam）。**不通过出参回传任何东西**：
+ * 慢路径要的 l3 偏移由下面的 zx_pppoe_l3_off() 从同一帧重算（两条规则都在
+ * 本头文件里，只此一处），这样 main.c 不必为它多压一个跨分支的栈槽。
+ *
+ * 写侧只有 RX，不取 accel->lock、不分配，可在软中断里跑。
+ */
+int zx_ffe_pppoe_sniff(struct zx_eth_adapter *adapter, const u8 *frame,
+		       u32 len, int port);
+
+/*
+ * 内层 L3 相对**以太头**的偏移：6 B PPPoE 头 + PPP 协议字段（PFC 1 B / 2 B）。
+ * 与 zx_pppoe_probe() 用同一个判据（frame[20] 最低位），只给慢路径门槛用；
+ * 调用方必须已经确认这一帧是 0x8864 会话帧（探针判过 SESS）。
+ */
+static inline u8 zx_pppoe_l3_off(const u8 *frame)
+{
+	return (u8)(ZX_PPPOE_HDR_LEN +
+		    ((frame[ZX_PPPOE_ETH_HLEN + ZX_PPPOE_HDR_LEN] & 0x01) ? 1 : 2));
+}
+
+/* 会话变化时排的 work：只清 pppoe_in||pppoe_out 的条目（accel.c 的 M2 段）。 */
+void zx_ffe_pppoe_flush_work(struct work_struct *work);
 
 /*
  * 判据链的裁决（P6 起由 ingress op 的 run() 返回）。两条链（v4/v6）只报告

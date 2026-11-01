@@ -149,22 +149,133 @@ static int zx_ppe_v6_ext_idx = 10;
 module_param_named(v6_ext, zx_ppe_v6_ext_idx, int, 0644);
 MODULE_PARM_DESC(v6_ext, "classifier extract index the IPv6 rule is hung off");
 
+/* 已废弃，仅历史兼容 (deprecated, historical compatibility only): the entry
+ * byte is derived from the extract index by v6_hwenc, and the old value it
+ * used to produce - (v6_entry << 4) | 8 = 0xA8 - was measured not to match.
+ * Kept so the older logs' repro commands still resolve.
+ */
 static int zx_ppe_v6_entry = -1;
 module_param_named(v6_entry, zx_ppe_v6_entry, int, 0644);
 MODULE_PARM_DESC(v6_entry,
-	"extract index byte inside the IPv6 hash entry (-1: same as v6_ext)");
+	"extract index byte inside the IPv6 hash entry (-1: same as v6_ext; deprecated under v6_hwenc)");
 
 static int zx_ppe_v6_rule_idx = ZX_PPE_V6_RULE;
 module_param_named(v6_rule, zx_ppe_v6_rule_idx, int, 0644);
-MODULE_PARM_DESC(v6_rule, "extra rule table entry the IPv6 windows are written to");
+MODULE_PARM_DESC(v6_rule,
+	"extra rule table entry the IPv6 windows are written to (deprecated under v6_hwenc: the vendor site is 2)");
 
 static int zx_ppe_v6_key = -1;
 module_param_named(v6_key, zx_ppe_v6_key, int, 0644);
-MODULE_PARM_DESC(v6_key, "id the IPv6 hash key carries (-1: same as v6_rule)");
+MODULE_PARM_DESC(v6_key,
+	"id the IPv6 hash key carries (-1: same as v6_rule; deprecated under v6_hwenc: the key carries the extr value)");
+
+/*
+ * C1, IPv6 self-consistency (default off).
+ *
+ * The vendor builds the 45-byte hash key and the 60-byte entry's extr_index
+ * from one and the same value, in one instruction stream: tm_acl_fast_add_v4v6
+ * 0x4d7f4..0x4d810 computes it, 0x4d61c..0x4d638 writes it into the key
+ * (bit23..30), 0x4d71c..0x4d748 writes it into the entry (+15[7:4] and
+ * +16[3:0]).  For IPv6 the value is (ext_idx == 10) ? 2 : ext_idx*16 + 2;
+ * for IPv4 it is ext_idx*16.  (Re-checked against the vendor tm.ko with the
+ * OpenWrt cross objdump on 2026-11-02, see the v6-selfconsist notes.)
+ *
+ * This driver has always had two independent knobs instead: v6_rule feeds the
+ * key, v6_entry plus w[3]'s top nibble feed the entry.  Their defaults
+ * disagree - key 0x99, entry 0xA8 - so the "same value in both places"
+ * contract the vendor keeps is violated.  With this on, one function derives
+ * both sides and the entry's two half-nibbles are patched from it.  Off by
+ * default so the shipped behaviour is unchanged; it is an experiment.
+ */
+static bool zx_ppe_v6_selfconsist;
+module_param_named(v6_selfconsist, zx_ppe_v6_selfconsist, bool, 0644);
+MODULE_PARM_DESC(v6_selfconsist,
+	"IPv6: derive key ex_rule_id and entry extr_index from one vendor-style value (deprecated: v6_hwenc is the delivered form)");
+
+/*
+ * The IPv6 encoding the hardware was measured to accept.  On 2026-11-02 a
+ * sweep module (independent of this driver) spread one IPv6 entry over all
+ * 520 hash slots and then watched the classifier's aging bits: with three
+ * values that are all 2 - the extract-rule table entry the vendor's v6 rule
+ * lives in, the 60 B entry's extr_index (+15[7:4] / +16[3:0]) and the 45 B
+ * key's ex_rule_id (bit23..30) - and a 33-bit zero key header, the hardware
+ * hit slot 193, which is exactly zx_ppe_crc(0x04c11db7, key, 45) & 0xff for
+ * that flow.  Each of 0x99 / 0xA8 / 0xA2 / rule 153 / a non-zero header was
+ * measured not to hit, and every hit variant immediately took the flow's
+ * frames away from the CPU, so the entry really is used for forwarding.  See
+ * .scratch/ffe-fastpath/cla-v6-v2/20261102-0510/RESULT.md.
+ *
+ * This parameter derives the three values from one number, the way the vendor
+ * does in one instruction stream (tm_acl_fast_add_v4v6 0x4d7f4..0x4d810):
+ * key rule byte == entry extr_index == the rule table id, which for the v6
+ * extract index 10 is 2.  Off by default: it is the one switch that changes
+ * what the shipped driver writes, and a wrong action word in w0 (the egress
+ * port) black-holes every flow the entry catches, so arming it is a
+ * deliberate act on a box whose serial console is reachable.
+ */
+static bool zx_ppe_v6_hwenc;
+static int zx_ppe_v6_hwenc_set(const char *val, const struct kernel_param *kp);
+static const struct kernel_param_ops zx_ppe_v6_hwenc_ops = {
+	.set	= zx_ppe_v6_hwenc_set,
+	.get	= param_get_bool,
+};
+module_param_cb(v6_hwenc, &zx_ppe_v6_hwenc_ops, &zx_ppe_v6_hwenc, 0644);
+MODULE_PARM_DESC(v6_hwenc,
+	"IPv6: write the hardware-verified encoding (rule 2 / extr 2 / key rule 2, zero header); 0 = the old 0x99/0xA8 shape");
+
+/*
+ * One-button undo, part 1: on stop (rmmod, or the unbind of the last
+ * flowtable) zero all 520 hash slots and their aging words.  The classifier
+ * keeps its entries in switch SRAM that survives a module reload, so a run
+ * that spread one entry over many slots (v6_shotgun) would otherwise leave
+ * entries behind that no bookkeeping knows about, and the next load would
+ * find the hardware full while its own bitmap says empty.  Only active
+ * together with v6_hwenc, because that is what turns such a run on.
+ */
+static bool zx_ppe_v6_wipe = true;
+module_param_named(v6_wipe, zx_ppe_v6_wipe, bool, 0644);
+MODULE_PARM_DESC(v6_wipe,
+	"zero all 520 hash slots when the engine stops (only with v6_hwenc, default 1)");
+
+/* The vendor's IPv6 extract-rule landing site.  Measured empty on this box: a
+ * read of rule table entry 2 in the delivery state (2026-11-02, uptime 4825 s,
+ * IPv6 classifier programmed) came back as 17 zero words, and this driver has
+ * only ever written 0x99 (ZX_PPE_V6_RULE).  It is still read back and saved
+ * before the first write and put back word for word afterwards: "reads as
+ * zero" is a measurement, not a promise about the next boot.
+ */
+#define ZX_PPE_V6_HW_RULE	2
 
 static unsigned int zx_ppe_v6_w1;
 module_param_named(v6_w1, zx_ppe_v6_w1, uint, 0644);
 MODULE_PARM_DESC(v6_w1, "word 1 of the IPv6 entry (0: 0xfa11c000)");
+
+/*
+ * w0's two variable fields as overrides, because which rewrite index and which
+ * egress port a *hit* needs can only be settled by one boot testing several
+ * candidates, and a rebuild per candidate costs a module load each time.
+ *
+ *	-1 / 0  derive: the rewrite index is the one this flow allocated and
+ *	        programmed (zx_ppe_alloc(), 1..127, the v4-proven mechanism),
+ *	        the egress is ZX_BRPORT() of the flow's redirect device.
+ *	v6_flow >= 0  put that index into w0 instead.  0 is the vendor's golden
+ *	        value and means "do not rewrite": no MAC swap, no hop-limit
+ *	        decrement, i.e. the frame leaves as the host addressed it.
+ *	v6_w0 != 0  use that word 0 verbatim and ignore both fields.
+ *
+ * A new value only affects flows added afterwards - the entry is assembled
+ * once, at flow-add time - so an A/B needs a new flow (the runbook uses a new
+ * --cport per candidate).
+ */
+static int zx_ppe_v6_flow = -1;
+module_param_named(v6_flow, zx_ppe_v6_flow, int, 0644);
+MODULE_PARM_DESC(v6_flow,
+	"IPv6: rewrite index in w0 (-1: the per-flow one the driver programmed; 0 = the vendor's 'no rewrite')");
+
+static unsigned int zx_ppe_v6_w0;
+module_param_named(v6_w0, zx_ppe_v6_w0, uint, 0644);
+MODULE_PARM_DESC(v6_w0,
+	"IPv6: raw word 0 of the entry (0: flow | FWD | egress | 0x44 | BIT(3))");
 
 static unsigned int zx_ppe_v6_w3;
 module_param_named(v6_w3, zx_ppe_v6_w3, uint, 0644);
@@ -436,9 +547,32 @@ static unsigned int zx_ppe_v6_key_byte(void)
 				 : (unsigned int)zx_ppe_v6_key;
 }
 
+/* The one value the vendor puts in both places: the 45 B key's ex_rule_id
+ * (bit23..30) and the 60 B entry's extr_index (+15[7:4]/+16[3:0]).  Formula
+ * from tm_acl_fast_add_v4v6 0x4d7fc..0x4d808 (v6 path) and 0x4d614 (v4 path,
+ * ext_idx*16).  Always even, which the vendor's key writer requires: it only
+ * stores extr>>1 into key[3][6:0] and clears key[2][7].
+ */
+static unsigned int zx_ppe_v6_extr_index(void)
+{
+	unsigned int ext = zx_ppe_v6_entry_idx();
+
+	return (ext == 10 ? 2 : ext * 16 + 2) & 0xff;
+}
+
 static unsigned int zx_ppe_v6_tag(void)
 {
 	return zx_ppe_v6_tag_byte & 0xff;
+}
+
+/* The rule table entry the v6 windows are written to: the vendor's landing
+ * site 2 under v6_hwenc, the old 0x99 otherwise (see ZX_PPE_V6_HW_RULE and
+ * zx_ppe_rule_remember, which saves whatever is there first).
+ */
+static unsigned int zx_ppe_v6_rule_id(void)
+{
+	return zx_ppe_v6_hwenc ? ZX_PPE_V6_HW_RULE
+			       : (unsigned int)zx_ppe_v6_rule_idx;
 }
 
 /*
@@ -685,10 +819,20 @@ static void zx_ppe_slots(const struct zx_ppe_tuple *t, u16 slot[2])
 {
 	u8 key[45] = {};
 	u16 hw[ZX_PPE_V6_WINDOWS];
+	unsigned int rule;
 	int i, n;
 
 	n = zx_ppe_halfwords(t, hw);
-	zx_ppe_put_bits(key, 23, 8, t->v6 ? zx_ppe_v6_key_byte() : ZX_PPE_V4_RULE);
+	rule = t->v6 ? zx_ppe_v6_key_byte() : ZX_PPE_V4_RULE;
+	/* The key's ex_rule_id and the entry's extr_index come from this same
+	 * value, exactly like the vendor's single instruction stream: for the
+	 * v6 extract index 10 it is 2 (v6_hwenc, the shape the hardware was
+	 * measured to accept), for v4 it is ext_idx * 16 = 0x90, and the key
+	 * byte 0x98 the v4 path writes is that value with bit 3 set.
+	 */
+	if (t->v6 && (zx_ppe_v6_hwenc || zx_ppe_v6_selfconsist))
+		rule = zx_ppe_v6_extr_index();
+	zx_ppe_put_bits(key, 23, 8, rule);
 	for (i = 0; i < n; i++)
 		zx_ppe_put_bits(key, 33 + 16 * i, 16, hw[i]);
 	slot[0] = zx_ppe_crc(0x04c11db7, key, sizeof(key)) & 0xff;
@@ -737,12 +881,20 @@ static int zx_ppe_hash_entry(const struct zx_ppe_tuple *t, u16 flow, int port,
 {
 	u8 key[44] = {};
 	u16 hw[ZX_PPE_V6_WINDOWS];
+	unsigned int idx;
 	int i, n, words;
 
 	n = zx_ppe_halfwords(t, hw);
+	idx = t->v6 ? zx_ppe_v6_entry_idx() : ZX_PPE_V4_INDEX;
+	/* Entry +16[3:0] is extr_index[7:4]; valid_en (+16 bit6) stays 1.  The
+	 * vendor patches only those four bits (cla_set_hash_table via
+	 * tm_acl_fast_add_v4v6 0x4d71c..0x4d748), keeping +16[7:4].  For the v6
+	 * extract index 10 extr_index is 2, so the byte becomes exactly 0x40.
+	 */
+	if (t->v6 && (zx_ppe_v6_hwenc || zx_ppe_v6_selfconsist))
+		idx = zx_ppe_v6_extr_index() >> 4;
 	/* valid, extract index, upstream */
-	zx_ppe_put_bits(key, 0, 8,
-			0x40 | (t->v6 ? zx_ppe_v6_entry_idx() : ZX_PPE_V4_INDEX));
+	zx_ppe_put_bits(key, 0, 8, 0x40 | (idx & 0xff));
 	/* The vendor's own flow-add (tm.ko run in tools/vendor-emu) puts 0x14
 	 * in byte 2 of a v6 key string, where the v4 string has 0.  Whether the
 	 * hardware compares that byte is unproven; this makes our entry
@@ -753,15 +905,70 @@ static int zx_ppe_hash_entry(const struct zx_ppe_tuple *t, u16 flow, int port,
 		zx_ppe_put_bits(key, 16, 8, zx_ppe_v6_tag());
 	for (i = 0; i < n; i++)
 		zx_ppe_put_bits(key, 24 + 16 * i, 16, hw[i]);
-	/* word 0 bit 3 is set in every stock v6 entry and clear in every v4
-	 * one: it marks the entry as an IPv6 flow.
+	/* word 0: rewrite index in 31:25, FWD in bit 24, egress in 15:12, the
+	 * 0x44 every stock entry carries (bits 2 and 6) and bit 3 as the IPv6
+	 * marker (every stock v6 entry has it, no v4 one does).
+	 *
+	 * The egress field holds a *bridge* port, not a switch port index: the
+	 * receiver decodes the ingress port of a frame as (desc[6] >> 3) - 1 and
+	 * ZX_BRPORT() adds that 1 back (zx279128s-eth.h:228 "0 is the PON side,
+	 * 1-5 are the switch ports 0-4"), so port p and bridge port p + 1 name
+	 * the same port and 0 means the PON.  Measured on this box in its
+	 * delivery state (2026-11-02 02:1x, two IPv4 connections, four live
+	 * entries): w0 = 03002044 / 07002044 / 05003044 / 09003044, i.e. flow 1
+	 * and 3 egress 2, flow 2 and 4 egress 3 - lan2 is switch port 1 and lan1
+	 * is switch port 2 on this board (docs/CONTRADICTIONS.md C9), so egress =
+	 * port + 1 and the two directions of one connection differ by exactly
+	 * that.  Those same entries forwarded at 942 Mbit/s.
+	 *
+	 * The rewrite index points at the packet-modifier flow entry this very
+	 * flow programmed (zx_ppe_flow_entry() at ZX_PM_FLOW, index `flow`): it
+	 * replaces both MACs and decrements the hop limit.  What IPv6 does *not*
+	 * need - and does not get - are the NAT/port rewrites and the IPv4/IPv4
+	 * checksum updates (the two !r->v6 bits), because there is no NAT66 and
+	 * the transport checksum does not cover the hop limit.  So this is the
+	 * v4-proven construction with the v4-only parts already absent, not a v4
+	 * rewrite entry reused on a v6 frame.  The vendor's golden v6 entry has
+	 * flow 0 there, i.e. "rewrite nothing": MACs and hop limit are left as
+	 * the host sent them, which only suits a topology where the far side
+	 * accepts the router's own MAC as destination (not a routed LAN->LAN
+	 * hop).  v6_flow / v6_w0 exist so both readings can be A/B'd in one boot.
+	 *
+	 * The vendor's egress 0 is the PON side, which this board has no netdev
+	 * for (docs/vendor-v6-entry-format-2026-10-31.md §5.4): a flow such an
+	 * entry catches is steered at a port that does not exist, which is the
+	 * "hit => iperf3 dies" signature every hit experiment showed
+	 * (cla-v6-v2 RESULT.md §2).  Hence the egress comes from the flow's own
+	 * redirect device - for host -> box -> server it is the server's port.
 	 */
+	if (t->v6 && zx_ppe_v6_flow >= 0)
+		flow = (u16)zx_ppe_v6_flow;
 	w[0] = FIELD_PREP(ZX_CLA_W0_FLOW, flow) | ZX_CLA_W0_FWD |
 	       FIELD_PREP(ZX_CLA_W0_EGRESS, ZX_BRPORT(port)) | ZX_CLA_W0_BITS |
 	       (t->v6 ? BIT(3) : 0);
+	if (t->v6 && zx_ppe_v6_w0)
+		w[0] = (u32)zx_ppe_v6_w0;
+	/* Words 1-3 are the constants the IPv4 fast path has been forwarding
+	 * with on this box (w1 0xfa11c000, w2 0x00000608, w3 0x80000000).  The
+	 * vendor's v6 dump has w1 = 0xf513e100 and w3 = 0 instead, i.e. the
+	 * shape that was never measured to forward; v6_w1 and v6_w3 let that be
+	 * A/B'd on a loaded module rather than in a rebuild.  w2 is identical in
+	 * both dumps.  With v6_hwenc, w3's top byte becomes 0x20 (extr_index 2
+	 * in +15[7:4]), which is exactly the w3 = 0x20000000 of the entry that
+	 * hit on hardware.
+	 */
 	w[1] = (t->v6 && zx_ppe_v6_w1) ? (u32)zx_ppe_v6_w1 : 0xfa11c000;
 	w[2] = 0x00000608;
 	w[3] = (t->v6 && zx_ppe_v6_w3) ? (u32)zx_ppe_v6_w3 : 0x80000000;
+	/* Entry +15[7:4] is extr_index[3:0]; +15[3:0] (tag_level[2]/
+	 * l2_type/pppoe_flag) is left alone, like the vendor's read-modify-write.
+	 */
+	if (t->v6 && (zx_ppe_v6_hwenc || zx_ppe_v6_selfconsist)) {
+		u32 b = (w[3] >> 24) & 0x0f;
+
+		b |= (zx_ppe_v6_extr_index() & 0x0f) << 4;
+		w[3] = (w[3] & 0x00ffffff) | (b << 24);
+	}
 	/* 4 control words plus the string, rounded up to whole words */
 	words = 4 + (24 + 16 * n + 31) / 32;
 	for (i = 4; i < words; i++)
@@ -1065,6 +1272,21 @@ static int zx_ppe_flow_add(struct zx_eth_adapter *adapter,
 	if (ret)
 		goto err_nh;
 	words = zx_ppe_hash_entry(&t, flow, port, w);
+	/* One line per IPv6 flow, and it is the line the runbook diffs against
+	 * the offline slot calculator: slot is the bank-2/3 slot the entry went
+	 * to, slot0 is what the software's own hash says the slot should be,
+	 * flow/egress/w0 are the action word's three interesting fields (flow
+	 * and egress are read back out of w0, so a v6_flow / v6_w0 override shows
+	 * up here as what the hardware really got).
+	 */
+	if (t.v6 && (zx_ppe_v6_hwenc || zx_ppe_v6_selfconsist))
+		dev_info(adapter->dev,
+			 "v6 %s: rule=%u extr=%u key_rule=0x%02x slot=%u slot0=%u flow=%u egress=%u w0=%08x\n",
+			 zx_ppe_v6_hwenc ? "hwenc" : "C1",
+			 zx_ppe_v6_hwenc ? (unsigned int)zx_ppe_v6_rule_id()
+					 : (unsigned int)zx_ppe_v6_rule_idx,
+			 zx_ppe_v6_extr_index(), zx_ppe_v6_extr_index(), slot[1],
+			 slot[0], (w[0] >> 25) & 0x7f, (w[0] >> 12) & 0xf, w[0]);
 	ret = zx_pp_write(adapter, ZX_CLA_BASE,
 			  slot[1] < ZX_PPE_HASH0_SIZE ? ZX_CLA_HASH0 : ZX_CLA_HASH1,
 			  slot[1] % ZX_PPE_HASH0_SIZE, w, words);
@@ -1359,20 +1581,139 @@ static void zx_ppe_v6_tune(void)
 		zx_ppe_v6_index[4] = zx_ppe_v6_idxw4;
 }
 
+/* ---- One-button undo, part 2: the extract-rule table ------------------ */
+
+/*
+ * The classifier tables are 17-word entries in switch SRAM that survives a
+ * module reload, so anything this engine writes into a rule it did not own
+ * has to be read back first and put back afterwards.  One snapshot per rule
+ * id, not one snapshot total: a run may touch two ids, and saving only the
+ * first would write that one back over the second (the sweep module learned
+ * this the hard way - its H1/H2 checks compare each id separately).
+ */
+#define ZX_PPE_SAVED_RULES	4
+
+static struct {
+	unsigned int	id;
+	bool		valid;
+	u32		w[17];
+} zx_ppe_rule_save[ZX_PPE_SAVED_RULES];
+
+/* Read rule table entry @id back and remember it, once per id. */
+static int zx_ppe_rule_remember(struct zx_eth_adapter *adapter, unsigned int id)
+{
+	int i, ret;
+
+	for (i = 0; i < ZX_PPE_SAVED_RULES; i++)
+		if (zx_ppe_rule_save[i].valid && zx_ppe_rule_save[i].id == id)
+			return 0;
+	for (i = 0; i < ZX_PPE_SAVED_RULES; i++)
+		if (!zx_ppe_rule_save[i].valid)
+			break;
+	if (i == ZX_PPE_SAVED_RULES)
+		return -ENOSPC;
+
+	ret = zx_pp_read_entry(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE, id,
+			       zx_ppe_rule_save[i].w, 17);
+	if (ret)
+		return ret;
+	zx_ppe_rule_save[i].id = id;
+	zx_ppe_rule_save[i].valid = true;
+	dev_info(adapter->dev,
+		 "cla rule %u saved before the first write: %08x %08x %08x ... %08x\n",
+		 id, zx_ppe_rule_save[i].w[0], zx_ppe_rule_save[i].w[1],
+		 zx_ppe_rule_save[i].w[2], zx_ppe_rule_save[i].w[16]);
+	return 0;
+}
+
+/* Put every entry we overwrote back, word for word, and forget it. */
+static void zx_ppe_rule_restore(struct zx_eth_adapter *adapter)
+{
+	int i;
+
+	for (i = 0; i < ZX_PPE_SAVED_RULES; i++) {
+		if (!zx_ppe_rule_save[i].valid)
+			continue;
+
+		zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE,
+			    zx_ppe_rule_save[i].id, zx_ppe_rule_save[i].w, 17);
+		dev_info(adapter->dev,
+			 "cla rule %u restored: %08x %08x %08x ... %08x\n",
+			 zx_ppe_rule_save[i].id, zx_ppe_rule_save[i].w[0],
+			 zx_ppe_rule_save[i].w[1], zx_ppe_rule_save[i].w[2],
+			 zx_ppe_rule_save[i].w[16]);
+		zx_ppe_rule_save[i].valid = false;
+	}
+}
+
+/* Zero all 520 hash slots and their aging words.  Caller holds ppe_lock; the
+ * hash tables and the aging words are separate address spaces (the vendor's
+ * cla_set_hash_table never clears aging), so both are written.
+ */
+static void zx_ppe_hash_zero(struct zx_eth_adapter *adapter)
+{
+	int s;
+
+	for (s = 0; s < ZX_PPE_HASH_SLOTS_EXT; s++) {
+		u32 table, index;
+
+		zx_ppe_hash_loc(s, &table, &index);
+		zx_pp_write(adapter, ZX_CLA_BASE, table, index, NULL, 0);
+		zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_AGING, index, NULL, 0);
+	}
+	bitmap_zero(adapter->ppe_hash_used, ZX_PPE_HASH_SIZE);
+}
+
 /* Put the IPv6 extract rule and index into the hardware.  Split out of
  * zx_ppe_start() because the runtime ipv6 switch below has to do the same.
+ *
+ * The rule goes to the entry the key's ex_rule_id names, which under v6_hwenc
+ * is the vendor's 2 - read back and saved first, and restored by
+ * zx_ppe_rule_restore() on stop or on leaving v6_hwenc.  Disarming restores
+ * immediately rather than only at stop, so "write 0 into v6_hwenc" is already
+ * a complete undo of the rule table half.
  */
 static int zx_ppe_v6_tables(struct zx_eth_adapter *adapter)
 {
 	int ret;
 
 	zx_ppe_v6_tune();
+	if (zx_ppe_v6_hwenc) {
+		ret = zx_ppe_rule_remember(adapter, ZX_PPE_V6_HW_RULE);
+		if (ret) {
+			dev_warn(adapter->dev,
+				 "IPv6: rule %u could not be read back, not writing it\n",
+				 ZX_PPE_V6_HW_RULE);
+			return ret;
+		}
+	} else {
+		zx_ppe_rule_restore(adapter);
+	}
 	ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE,
-			  zx_ppe_v6_rule_idx, zx_ppe_v6_rule, 17);
+			  zx_ppe_v6_rule_id(), zx_ppe_v6_rule, 17);
 	if (!ret)
 		ret = zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX,
 				  zx_ppe_v6_ext_idx, zx_ppe_v6_index, 5);
+	if (!ret && zx_ppe_v6_hwenc)
+		dev_info(adapter->dev,
+			 "IPv6 hw encoding armed: rule %u + index %d, key rule byte 0x%02x, extr %u\n",
+			 zx_ppe_v6_rule_id(), zx_ppe_v6_ext_idx,
+			 zx_ppe_v6_extr_index(), zx_ppe_v6_extr_index());
 	return ret;
+}
+
+static int zx_ppe_v6_hwenc_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (ret)
+		return ret;
+	if (zx_ppe_v6_hwenc &&
+	    (zx_ppe_v6_rule_idx != ZX_PPE_V6_RULE || zx_ppe_v6_key >= 0 ||
+	     zx_ppe_v6_entry >= 0 || zx_ppe_v6_selfconsist))
+		pr_warn("zx279128s-ppe: v6_hwenc=1: v6_rule / v6_key / v6_entry / v6_selfconsist are ignored (deprecated)\n");
+	zx_ppe_v6_wins_apply();
+	return 0;
 }
 
 static void zx_ppe_v6_toggle_adapter(struct zx_eth_adapter *adapter, void *data)
@@ -2123,21 +2464,15 @@ static void zx_ppe_dump_agewords(struct zx_eth_adapter *adapter)
  * survives a module reload, so a diagnostic run that wrote all 520 slots (the
  * shotgun) leaves them behind: the driver's bookkeeping comes back fresh while
  * the hardware is full, and every later add lands in a slot the hardware never
- * looks in.  This clears that state without a power cycle.
+ * looks in.  This clears that state without a power cycle.  The work itself is
+ * zx_ppe_hash_zero(), which zx_ppe_stop() also uses as the undo of a v6_hwenc
+ * run; v4 flows lose their hardware entries here and are re-added by the next
+ * flowtable bind (firewall reload), which is the documented cost.
  */
 static void zx_ppe_cla_clear_adapter(struct zx_eth_adapter *adapter, void *data)
 {
-	int s;
-
 	mutex_lock(&adapter->ppe_lock);
-	for (s = 0; s < ZX_PPE_HASH_SLOTS_EXT; s++) {
-		u32 table, index;
-
-		zx_ppe_hash_loc(s, &table, &index);
-		zx_pp_write(adapter, ZX_CLA_BASE, table, index, NULL, 0);
-		zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_AGING, index, NULL, 0);
-	}
-	bitmap_zero(adapter->ppe_hash_used, ZX_PPE_HASH_SIZE);
+	zx_ppe_hash_zero(adapter);
 	mutex_unlock(&adapter->ppe_lock);
 	dev_info(adapter->dev, "cla_clear: %d hash slots and their aging words zeroed\n",
 		 ZX_PPE_HASH_SLOTS_EXT);
@@ -2265,10 +2600,26 @@ static void zx_ppe_stop(struct zx_eth_adapter *adapter)
 
 	rhashtable_free_and_destroy(&adapter->ppe_flows, zx_ppe_flush, adapter);
 	rhashtable_init(&adapter->ppe_flows, &zx_ppe_ht_params);
+	/* One-button undo, in the order the runbook checks it: zero the hash
+	 * slots first (the entries are useless without the tables), then put
+	 * every extract-rule entry we overwrote back word for word.  The 520
+	 * slots are only wiped when the hardware-verified v6 encoding was on -
+	 * that is the mode that can leave entries behind (v6_shotgun), and a
+	 * wipe costs a few hundred indirect writes, so the plain v4 unload keeps
+	 * its old, instant path.
+	 */
+	if (zx_ppe_v6_hwenc && zx_ppe_v6_wipe) {
+		zx_ppe_hash_zero(adapter);
+		dev_info(adapter->dev, "cla_clear: %d hash slots and their aging words zeroed\n",
+			 ZX_PPE_HASH_SLOTS_EXT);
+	}
 	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX, ZX_PPE_V4_INDEX, NULL, 0);
 	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE, ZX_PPE_V4_RULE, NULL, 0);
 	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_INDEX, zx_ppe_v6_ext_idx, NULL, 0);
-	zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE, zx_ppe_v6_rule_idx, NULL, 0);
+	if (!zx_ppe_v6_hwenc)
+		zx_pp_write(adapter, ZX_CLA_BASE, ZX_CLA_EXTRA_RULE,
+			    zx_ppe_v6_rule_idx, NULL, 0);
+	zx_ppe_rule_restore(adapter);
 	for (i = 0; i < ARRAY_SIZE(zx_ppe_regs); i++)
 		writel(adapter->ppe_saved[i], base + zx_ppe_regs[i]);
 	dev_info(adapter->dev, "hardware flow offload disabled\n");

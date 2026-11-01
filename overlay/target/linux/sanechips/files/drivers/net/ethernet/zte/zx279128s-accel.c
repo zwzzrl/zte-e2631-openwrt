@@ -399,6 +399,15 @@ struct zx_ffe_flow {
 	u64			hits;		/* 真正转发出去的帧数（P2 起 == fwd） */
 	u64			bytes;
 	unsigned long		lastuse;	/* 最近一次命中（转发或环满回栈） */
+	/*
+	 * M2：这条条目是不是 PPPoE 进出方向（会话变化时 __zx_ffe_flush_pppoe()
+	 * 只认这两个位）。写侧在 M3 的 ffe_add 尾段与 M9a 的学习闭环；M2 只加
+	 * 字段与筛选，两个位恒 0 ⇒ 新 work 在 M2 运行期是空转（不误伤任何条目）。
+	 * 放结构体尾部：这里本来就有 4 B 尾填充，两个 u8 正好塞进去，sizeof
+	 * 仍是 120，kzalloc 的立即数不动。
+	 */
+	u8			pppoe_in;
+	u8			pppoe_out;
 };
 
 /*
@@ -3234,6 +3243,14 @@ static const struct zx_ffe_ingress_ops zx_ffe_ingress_ops[] = {
  * 包描述符（struct zx_ffe_pkt）是入口无关的那一层：data/len/family 在这里填，
  * ingress_id/token 留给 ingress op（switch-port 的 token 就是 bp）。以太类型
  * 也不在这里解析——ingress op 从帧里自己读。
+ *
+ * M2：三个 PPPoE 字段在**本函数内部**填（签名不变）：
+ *   orig_len  入口帧长，恒 = len（M7/M8 记账用，改写会动 pkt->len）；
+ *   l3_off/sid 只在 pppoe 打开且以太类型是 0x8864、探针判 SESS 时才有值，
+ *             其余（含 pppoe=0 的一切帧）都是 0。pppoe=0 时只多一次
+ *             "读门控 + cmp + 前向跳过"，与 M1 的口径一致。
+ * 为什么不从 main.c 传进来：两个只在 M7 才被读的字段会多压两个栈槽，把
+ * zx_eth_rx()（内联进 zx_eth_poll 的 6500 条指令）的帧偏移整体平移。
  */
 enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 				int rx_port, int family)
@@ -3255,6 +3272,19 @@ enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 	pkt.family = (u8)family;
 	pkt.prepared = 0;
 	pkt.token = (void *)(uintptr_t)bp;
+	pkt.orig_len = len;
+	pkt.l3_off = 0;
+	pkt.sid = 0;
+	if (zx_pppoe_gate &&
+	    *(__be16 *)(pkt.data + 2 * ETH_ALEN) ==
+			htons(ZX_PPPOE_ETH_P_SESSION)) {
+		struct zx_pppoe_hdr h;
+
+		if (zx_pppoe_probe(pkt.data, len, &h) == ZX_PPPOE_SESS) {
+			pkt.l3_off = h.l3_off;
+			pkt.sid = h.sid;
+		}
+	}
 
 	v = ops->run(adapter, &pkt);
 	return ops->complete(adapter, &pkt, v);
@@ -3899,6 +3929,7 @@ int zx_accel_init(struct zx_eth_adapter *adapter)
 	INIT_LIST_HEAD(&accel->local_ip6_list);
 	spin_lock_init(&accel->local_lock);
 	INIT_WORK(&accel->port_flush_work, zx_ffe_port_flush_work);
+	INIT_WORK(&adapter->pppoe_flush_work, zx_ffe_pppoe_flush_work);
 	INIT_DELAYED_WORK(&accel->age, zx_accel_age_work);
 
 	ret = rhashtable_init(&accel->flows, &zx_ffe_ht_params);
@@ -5553,6 +5584,186 @@ static int zx_accel_soc_temp_open(struct inode *inode, struct file *file)
 	return single_open(file, zx_accel_soc_temp_show, inode->i_private);
 }
 
+/* ==== PPPoE M2：RX 窥探 + 只清 PPPoE 条目的 work ==== */
+/*
+ * 位置：本段刻意放在 M1 段（文件末尾）“之前”，而不是它后面。原因只有一个：
+ * M1.diff 的 accel.c hunk 是**贴着 EOF 的追加块**（末尾无后续上下文），
+ * `git apply -R` 要求那 53 行补丁后像仍然紧邻文件末尾；只要在它后面再追加任何
+ * 一行，反向应用就会失败（实测 rc=1）。把 M2 整体放到前面，M1 段就仍是文件的
+ * 最后 53 行，M1.diff 反向校验保持 rc=0。
+ *
+ * 代价：`pppoe` 的定义在下面（M1 段，`static bool pppoe = false;` 一个字都不能
+ * 改），本段要读它就得先有一条前向声明。见紧随其后的 tentative definition。
+ */
+
+/*
+ * 前向可见性声明：与文件末尾 M1 段的两条定义（`static bool pppoe = false;`、
+ * `static int pppoe_wan_port = -1;`）是**同一个对象**（同一 TU 里“先 tentative
+ * definition、后带初值的定义”，C11 6.9.2 允许；不产生第二个符号，module_param
+ * 的取值路径不变）。只声明 M2 真正读的两个；pppoe_tx 在 M2 没有读者，不声明。
+ */
+static bool pppoe;
+static int pppoe_wan_port;
+
+/*
+ * M1 的 module_param 变量是 `static bool pppoe`。M1.diff 必须能反向应用，所以
+ * 那一行一个字都不能改；但数据面守卫在 zx279128s-main.c 里（另一个 TU），读不到
+ * 一个 static 变量。这里给它起一个**同地址的全局别名**：
+ *   - 写：module_param 写的是 `pppoe`（sysfs 名仍是 parameters/pppoe）；
+ *   - 读：main.c 读 `zx_pppoe_gate`（一次 ldr，与直接读全局变量同码）；
+ * 两者是同一个字节，任何时刻自动一致，不需要回调/轮询/缓存。
+ */
+extern bool zx_pppoe_gate __attribute__((alias("pppoe")));
+
+/*
+ * 只清"带 PPPoE 标志"的条目（调用者持 accel->lock）。
+ *
+ * 为什么不复用 __zx_ffe_flush(adapter, -1)：那条路是 zx_ffe_port_flush_work()
+ * 的全部动作，语义是"端口全 down，整张流表都不再可用"，会把静态条目、学习
+ * 条目、别人的会话一起清掉；会话变化只该清这一条会话的进出方向条目
+ * （REVIEW2 §2.2 洞②）。两个 work 并存，各自的触发点互不覆盖：
+ *   port_flush_work   ← zx_accel_on_close()/交换机事件（4120+ 行），全清
+ *   pppoe_flush_work  ← 本文件 zx_ffe_pppoe_sniff()，只清 pppoe_in||pppoe_out
+ */
+static u32 __zx_ffe_flush_pppoe(struct zx_eth_adapter *adapter)
+{
+	struct zx_accel *accel = &adapter->accel;
+	struct zx_ffe_flow *flow, *tmp;
+	u32 n = 0;
+
+	list_for_each_entry_safe(flow, tmp, &accel->flow_list, list) {
+		if (!flow->pppoe_in && !flow->pppoe_out)
+			continue;
+		__zx_ffe_flow_del(adapter, flow);
+		n++;
+	}
+	return n;
+}
+
+/*
+ * 会话变化（PADT / sid 变）后由 RX NAPI 排一次。不能在 NAPI 里直接清表：
+ * 要取 accel->lock（可能睡），而 NAPI 在软中断上下文。
+ */
+static void zx_ffe_pppoe_schedule_flush(struct zx_eth_adapter *adapter)
+{
+	schedule_work(&adapter->pppoe_flush_work);
+}
+
+/* work 本体：取锁、只清 PPPoE 条目、放锁。与 zx_ffe_port_flush_work 平行。 */
+void zx_ffe_pppoe_flush_work(struct work_struct *work)
+{
+	struct zx_eth_adapter *adapter =
+		container_of(work, struct zx_eth_adapter, pppoe_flush_work);
+	struct zx_accel *accel = &adapter->accel;
+
+	mutex_lock(&accel->lock);
+	__zx_ffe_flush_pppoe(adapter);
+	mutex_unlock(&accel->lock);
+}
+
+/*
+ * WAN 口判据：pppoe_wan_port >= 0 时钉死；-1 = 自动，要求这一帧的目的 MAC
+ * 就是本端口的 dev_addr（会话帧与 PADT 都是单播给我们的；PADI 是广播，但探针
+ * 只认 PADT 与 0x8864，所以广播帧不会误学分）。
+ *
+ * 只看 ports[port]，不判"端口在不在桥里"：LAN 口收到伪造的 0x8864 时目的 MAC
+ * 不是本口 dev_addr（或者钉死了 pppoe_wan_port），P1-9 要防的就是这一条。
+ */
+static bool zx_ffe_pppoe_on_wan(struct zx_eth_adapter *adapter, int port,
+				const u8 *frame)
+{
+	struct net_device *nd;
+
+	if (port < 0 || port >= ZX_NUM_PORTS)
+		return false;
+	if (pppoe_wan_port >= 0)
+		return port == pppoe_wan_port;
+
+	nd = READ_ONCE(adapter->ports[port]);
+	if (!nd)
+		return false;
+	return !memcmp(frame, nd->dev_addr, ETH_ALEN);
+}
+
+/*
+ * zx_ffe_pppoe_sniff() — M2 的 RX 窥探（调用点在 zx279128s-main.c 的
+ * poisoned/quiesce 判据之后、fam 分派之前）。
+ *
+ * 只做三件事：
+ *   1. 判定这一帧是不是 WAN 口上"我们的"PPPoE 会话/终止帧（纯函数探针
+ *      zx_pppoe_probe()，不碰硬件、不分配）；
+ *   2. 刷新 struct zx_pppoe_sess：sid/pfc/wan_port/MAC；
+ *   3. 会话变化（PADT 或 sid 变）→ generation++ 并排一次 pppoe_flush_work。
+ *      **命中前**的 gen 比对不在这里，在 M8 的判据链里（这里只发号）。
+ *
+ * 返回内层协议族（0/1）给调用方直接当 fam；-1 = 不是本会话的数据帧，调用方
+ * 保持原来的 fam（PADT 与发现阶段都走 -1，照旧交给协议栈）。
+ *
+ * 锁与并发：写侧只有 RX NAPI（同一 adapter 的多个 RX 队列可能并行，这里只写
+ * 会话结构体，字段级竞态最坏是"这一帧读到上一帧的 sid"——下一帧就会纠正，
+ * 不产生错误转发）；不取 accel->lock，不分配，可以安全地在软中断里跑。
+ * seqlock 留到 M3/M9b 有读者时再加（现在没有读者，加了是死代码）。
+ */
+int zx_ffe_pppoe_sniff(struct zx_eth_adapter *adapter, const u8 *frame,
+		       u32 len, int port)
+{
+	struct zx_pppoe_sess *s = &adapter->pppoe_sess;
+	struct zx_pppoe_hdr h;
+	enum zx_pppoe_kind kind;
+	struct net_device *nd;
+
+	if (!pppoe)		/* 调用点已判过；这里是双保险，pppoe=0 一进来就出 */
+		return -1;
+	if (!zx_ffe_pppoe_on_wan(adapter, port, frame))
+		return -1;
+
+	kind = zx_pppoe_probe(frame, len, &h);
+	if (kind == ZX_PPPOE_NONE)
+		return -1;
+
+	if (kind == ZX_PPPOE_PADT) {
+		/*
+		 * 只认"正在跟的那条会话"的 PADT：sid 对不上的 PADT 不动表
+		 * （否则任何一条无关的 PADT 都能把整张 PPPoE 流清掉）。
+		 */
+		if (s->valid && h.sid == s->sid) {
+			s->valid = 0;
+			s->generation++;
+			zx_ffe_pppoe_schedule_flush(adapter);
+		}
+		return -1;
+	}
+
+	/* ZX_PPPOE_SESS */
+	if (!s->valid) {
+		/*
+		 * 第一次学到：只立代、不清表。gen 从 0 变成 1；静态/手工条目
+		 * （M3a 起 gen=0）按"不校验代"处理，所以不会被误伤。
+		 */
+		s->valid = 1;
+		s->sid = h.sid;
+		s->generation++;
+	} else if (s->sid != h.sid) {
+		/*
+		 * 重拨 / 换会话：旧代的条目必须先清掉，否则同一内层五元组会继续
+		 * 命中旧条目（sid 不进键）。先立新代再排 work：work 到达时把
+		 * 表里所有 pppoe 条目清掉，包括排 work 之后才学进来的那一批。
+		 */
+		s->sid = h.sid;
+		s->generation++;
+		zx_ffe_pppoe_schedule_flush(adapter);
+	}
+	s->pfc = h.pfc;
+	s->wan_port = (u16)port;
+	nd = READ_ONCE(adapter->ports[port]);
+	if (nd)		/* our_mac 从 dev_addr 取，不从帧学（口径见 pppoe.h） */
+		memcpy(s->our_mac, nd->dev_addr, ETH_ALEN);
+	memcpy(s->peer_mac, frame + ETH_ALEN, ETH_ALEN);
+
+	return h.family;
+}
+/* ==== PPPoE M2 (end) ==== */
+
 /* 只读：没有 .write，权限 0444（见 zx279128s-main.c 的 debugfs 注册）。
  * 每次 cat 都会真的去触发一次转换——硬件只在读的时候碰。 */
 const struct file_operations zx_accel_soc_temp_fops = {
@@ -5562,3 +5773,53 @@ const struct file_operations zx_accel_soc_temp_fops = {
 	.llseek		= seq_lseek,
 	.release	= single_release,
 };
+
+/* ==== PPPoE M1 params ==== */
+/*
+ * 头文件放在**文件末尾**、而不是文件头的 include 区：M1 的判据 1 要求既有函数
+ * 的机器码逐函数不变，而顶插一行 include 会让后面所有 WARN 里的 __LINE__
+ * 立即数平移（实测 zx_accel_on_open 的 warn_slowpath_fmt 行号 4100→4102），
+ * 那是"指令序列差异"，哪怕语义无关。M1 没有任何调用点，include 放末尾与放
+ * 顶部等价（都只是让内核编译器解析一遍头文件）；M2 第一次真正调用探针时把
+ * 它移到顶部即可——那时本来就要插分支，判据换成 §3.2 的"纯插入 + 变更签名"。
+ */
+#include "zx279128s-pppoe.h"
+/*
+ * M1 只做“注册”，**不插任何调用点**：这三个参数默认关闭时，本文件所有既有
+ * 函数的机器码逐函数不变（比对脚本与输出在
+ * .scratch/ffe-fastpath/pppoe-m1/20261102-0400/logs/）。
+ * 回退：整段删掉——从本注释行到下面的 “PPPoE M1 params (end)” 标记为止，
+ * 一行不剩；RESULT.md 的 REVERT 一节给了可直接复制的一条命令。
+ *
+ * 参数归属：accel.c 与 main.c 一起链进 zx279128s_eth，所以运行期路径是
+ *   /sys/module/zx279128s_eth/parameters/pppoe{,_tx,_wan_port}
+ * （与 ffe_aging / learn_delay_ms 同一个模块目录，不是 _accel）。
+ *
+ * 默认值：pppoe=0（总门控，关）⇒ 行为零变化；pppoe_tx=true 只是“总门控
+ * 打开后上行也插头”的子开关，M1 没有任何代码读它；pppoe_wan_port=-1 = 自动
+ * （学到 WAN 口就钉住）。三个参数在 M1 都只有注册，读者在 M2/M8 才出现，
+ * 所以“默认关 ⇒ 零行为变化”不依赖子开关的取值。
+ */
+static bool pppoe = false;
+module_param(pppoe, bool, 0644);
+MODULE_PARM_DESC(pppoe, "PPPoE over FFE master gate (default: off)");
+
+static bool pppoe_tx = true;
+module_param(pppoe_tx, bool, 0644);
+MODULE_PARM_DESC(pppoe_tx, "PPPoE TX header insertion when pppoe=1 (default: on)");
+
+static int pppoe_wan_port = -1;
+module_param(pppoe_wan_port, int, 0644);
+MODULE_PARM_DESC(pppoe_wan_port, "PPPoE WAN port index (-1 = auto-learn, default: -1)");
+
+/*
+ * 负责人拍板的硬约束：struct zx_ffe_key 一个字都不许改，sizeof 必须仍是 44。
+ * PPPoE 会话信息（sid/generation）只进 struct zx_pppoe_sess，不参与键与哈希。
+ * 断言放在这里而不是新头文件里，是因为宿主单测看不到内核 TU（struct 定义在
+ * 本文件，依赖 40+ 个内核头）；这条断言由**每一次内核编译**强制，key 布局一变
+ * 直接编译失败。宿主侧另有 test/key_size_check.sh 从交叉对象的 DWARF 里读回
+ * sizeof 做运行期断言。
+ */
+_Static_assert(sizeof(struct zx_ffe_key) == 44,
+	       "zx_ffe_key must stay 44 bytes; PPPoE sid/generation must not enter the key");
+/* ==== PPPoE M1 params (end) ==== */
