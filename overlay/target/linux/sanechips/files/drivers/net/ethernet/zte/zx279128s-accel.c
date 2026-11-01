@@ -309,6 +309,13 @@ MODULE_PARM_DESC(learn_delay_ms, "Delay before ffe_learn auto-enables after prob
  * 注意分母口径：Δlookup 是**进了判据链**的帧（alias 丢弃的不在其中，它们
  * 根本没进 lookup），所以这是个"丢/存"比，不是总收帧的丢包率；上面两个
  * 实测比值都是按这个口径算的，比较的是同一件事。
+ *
+ * P10.4 复审 S4 的保留（上机必须实测、必要时改阈值）：若分母换成 DIAG 的
+ * 13.1k pps（`Δtx_submitted`，含双向/ACK），慢态比值只有 ~2.9‰，对 2‰ 的
+ * 余量约 1.45×（不是 2×）。所以上机要逐窗记录 `d_alias / d_lookup` 的真实
+ * 比值；**实测 <2‰ 就把本宏降到 1**（1‰ 仍是 stack 基线 0.16‰ 的 6 倍），
+ * 重新构建刷机，不要在余量不足的阈值上硬判。验收时延口径统一为 ≤35 s
+ * （仿真最坏 30.5 s），见 docs/ffe-alias-autofallback-2026-11-01.md §4。
  */
 #define ZX_FFE_FB_ALIAS_PERMILLE	2
 #define ZX_FFE_FB_ALIAS_STRIKES		2
@@ -3522,6 +3529,23 @@ int zx_accel_set(struct zx_eth_adapter *adapter, int family, u8 new_mode)
 	/* S5 切点：单字节写，数据面只会看到旧模式或新模式 */
 	WRITE_ONCE(*slot, new_mode);
 	/*
+	 * S1（P10.4 复审）：切模式**成功即清本族的 alias strike** —— "连续
+	 * 2 窗"必须严格限定在同一个 ffe 会话内。反例：慢态里已经打过
+	 * "alias strike 1/2"，用户/脚本 `echo stack; echo ffe`（两次 drain
+	 * 各 ≤100 ms，往返远小于 1 s 的 age tick）；age work 的"不在 ffe
+	 * ⇒ 清零"分支（zx_accel_autofallback）这一拍看不到非 ffe 状态，
+	 * strike 就跨会话留下来了，回来后的第一个不合格窗直接变成
+	 * strike 2 ⇒ 10 s 就降级，而不是 20 s。
+	 * 离开 ffe 时顺便把窗口作废（与 age work 的 fb_since=0 同一语义，
+	 * 只是提前一拍生效）；切入 ffe 时由下面的 S5.1 重开窗口。
+	 * 锁：本函数持 accel->lock，age work 无锁读写这两格 —— 与 fb_since
+	 * 现有的同类竞态一样是良性竞态（双方都只有"清零/开新窗"两种写，
+	 * 最坏是多等一拍重开窗，不会判错值）。
+	 */
+	accel->fb_alias_strike[family] = 0;
+	if (new_mode != ZX_ACC_FFE)
+		accel->fb_since[family] = 0;
+	/*
 	 * S5.1 切入 ffe 成功，开第一个降级窗口：fb_base[] 与 fb_since[] 都重置
 	 * 到这一刻，第一个 10 s 从入场算起，不背开机以来的历史计数
 	 * （design/extensibility.md §6.6；P8 C 起 fb_base 是窗口起点，见
@@ -3606,9 +3630,12 @@ unlock:
  * 注释。两条判据的关系：
  *   - drop/fallback 超阈值：一窗即降，行为与 P8 完全相同（没有放宽）；
  *   - alias 超阈值：本窗记一次 strike 并 dev_info（"alias strike 1/2"），
- *     **连续第 2 个**不合格窗口才降级；中间只要碰到一个合格/不判的窗口
- *     （没到阈值、帧太少、计数读撕裂、离开 ffe、关掉 autofallback、
- *     降级成功），strike 清零，重新从 1 数。
+ *     **连续第 2 个**不合格窗口才降级。strike 只在**判出确定结论**时清零：
+ *     本窗合格（CLEAR，含帧太少/计数倒挂）、离开 ffe（下一拍观察到；
+ *     P10.4 复审 S1 起，zx_accel_set() 切模式成功时也立刻清）、关掉
+ *     autofallback、降级成功。计数读撕裂（ZX_FFE_FB_RETRY）**不是**清零点：
+ *     那是"本拍不判"，窗口与 strike 都原样保持，下一拍用同一个窗口重判
+ *     （窗口因此可能顺延成 11 s、12 s，判据不看窗口长度只看增量）。
  */
 enum zx_ffe_fb_verdict {
 	ZX_FFE_FB_RETRY = -1,	/* 本拍读到的 64 位计数不一致：不判，窗口保持 */

@@ -635,10 +635,18 @@ struct zx_accel {
 	unsigned long		fb_since[2];
 	/*
 	 * P10.4：本族"连续不合格窗口"的计数（下标同 family），供 alias 判据
-	 * 的"连续 2 窗才降级"用（见 accel 的 ZX_FFE_FB_ALIAS_STRIKES）。只有
-	 * age work 里的 zx_accel_degraded()/zx_accel_autofallback() 写，无锁；
-	 * 窗口判为合格、窗口太小/不判、离开 ffe、关掉 autofallback、降级成功
-	 * 都会清零——"连续"就是靠这一条保持的。
+	 * 的"连续 2 窗才降级"用（见 accel 的 ZX_FFE_FB_ALIAS_STRIKES）。写侧：
+	 * age work 里的 zx_accel_degraded()/zx_accel_autofallback()（无锁），
+	 * 以及 zx_accel_set() 切模式成功时（持 accel->lock）—— 后者是 P10.4
+	 * 复审 S1 补的，保证 <1 s 的 stack→ffe 往返也开启新会话；与 fb_since
+	 * 的同类竞态一样是良性竞态（只可能多等一拍重开窗）。
+	 *
+	 * 清零时机（与代码一致；P10.4 复审 S2 更正过注释）：
+	 *   - 本窗判出合格 CLEAR（未达阈值、帧太少/计数倒挂）；
+	 *   - 离开 ffe（age work 下一拍观察到，或 zx_accel_set() 切走时立刻）；
+	 *   - 关掉 autofallback；降级成功。
+	 * **计数读撕裂（RETRY）不清零**：那是"本拍不判"，窗口与 strike 原样
+	 * 保持，下一拍用同一个窗口重判。
 	 */
 	u8			fb_alias_strike[2];
 };
@@ -710,7 +718,8 @@ struct zx_alias_snap {
 	u32	desc[4];	/* RX 描述符原值（已转 CPU 序），reason/copy 位在这里 */
 	u16	len;		/* 描述符报的帧长 */
 	u8	port;		/* 描述符解析出的入口端口 */
-	u8	rsvd;
+	u8	rsvd;		/* P10.5：快照时的 bp_state（0=FREE / 1=TX） */
+	u32	stamp;		/* P10.5：快照时刻 jiffies（32 条定到时间轴上） */
 	u8	head[64];	/* 池里帧的前 64 B（以太头 + IP 头前若干字节） */
 };
 
@@ -766,6 +775,30 @@ struct zx_eth_adapter {
 	u32			rx_nobuf_cnt;
 	u32			rx_rel_fail;
 	u32			rx_bad_cnt;
+	/*
+	 * P10.5：FFE 臂的 bp 生命周期账本（根因修复 A0/A2/A3/A4）。
+	 *
+	 * bp_state[bp] 只有两格（定义在 zx279128s-main.c 的 ZX_BP_FREE/TX）：
+	 * TX = 已写进发送描述符、还没记到发送完成。**不能照抄 zc_state**：
+	 * zc 的 TX 是终态，FFE 的 bp 要循环（硬件发完自己还 BMU），所以 TX
+	 * 在 zx_tx_reclaim() 里按 ZX_DMA_TX_DONE 的完成数清回 FREE。
+	 * 写侧只有 tx_lock 下的 submit/reclaim（串行）+ probe 期清零；读侧是
+	 * RX NAPI 的无锁旁观，误读只影响计数方向或一次保守的"不归还"。
+	 *
+	 * tx_bp[] 是发送环的影子（cached）：提交时记下环槽位里的 bp，完成时
+	 * 反查该清哪一个。它不替代描述符里的 byte7/8，只是让完成路径不必去
+	 * 非缓存事务区里反读硬件手里的描述符。
+	 *
+	 * bp_rx_hits[bp] 是每个 bp 的 RX 投递计数（u16 饱和）：用来回答
+	 * "这个槽位是 100% 失败（内容永久陈旧）还是 0.5% 失败（偶发重叠）"。
+	 */
+	u8			*bp_state;
+	u16			*tx_bp;
+	u16			*bp_rx_hits;
+	u64			ffe_dup;	/* RX 拿到仍在发送环里的 bp */
+	u64			bp_double_free;	/* A2 拒掉的二次归还次数 */
+	u64			rx_poison;	/* RX 帧首仍是我们归还时写的毒值 */
+	u32			bp_state_stale;	/* 完成记账漂移、状态表整体重扫 */
 	/*
 	 * P10.2 F2：慢路径的"报头声明的长度 == 描述符报的字节数"校验。
 	 * 硬件/交换机额外送给 CPU 的副本帧有两种形态（原帧已转发，不是丢包）：

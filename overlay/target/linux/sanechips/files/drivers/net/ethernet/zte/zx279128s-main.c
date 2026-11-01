@@ -55,6 +55,27 @@ module_param(pool_cacheable, bool, 0644);
 MODULE_PARM_DESC(pool_cacheable, "Map the packet pool cacheable (default: uncached)");
 
 /*
+ * P10.5 A4：归还 bp 时毒化帧首 16 B 里的 8 B（dmac 6 B + 类型后 2 B），
+ * RX 侧读到毒值就记 rx_poison 并回栈（不是静默丢）。默认开：它只影响
+ * "已经被归还"的槽位，命中时也不丢帧，留着才能在上机时把"内容没被硬件
+ * 重写"这件事变成可计数的证据。source-MAC 与以太类型故意不毒（见
+ * zx_bp_poison_write()），所以 P10.4 的 alias 分子与分族一个字节都不变。
+ * 关掉的口子留给性能 A/B。
+ */
+static bool ffe_poison = true;
+module_param(ffe_poison, bool, 0644);
+MODULE_PARM_DESC(ffe_poison, "Poison the first 16 B of a bp on return to the BMU and count poisoned RX frames (default: on)");
+
+/*
+ * P10.5 A3：RX 拿到仍在发送环里的 bp 时**拦投递**（丢帧、不归还），默认关。
+ * 只有先证明 bp_state 零假阳性（见 dma_state 的 ffe_dup/bp_double_free）
+ * 才允许打开 —— 状态误判会把合法帧丢掉。默认只由 A0 计数。
+ */
+static bool ffe_bp_drop;
+module_param(ffe_bp_drop, bool, 0644);
+MODULE_PARM_DESC(ffe_bp_drop, "Drop RX frames whose bp is still in the TX ring (A3, default: off)");
+
+/*
  * 零拷贝：接收时把 BMU 池里的槽位直接当成 skb 的数据区交给协议栈，发送时把同一个
  * bp 直接交给硬件，省掉每包两次 payload 搬运。说明见 zx_zc_* 那一节。
  * 默认关（0）：这条路径的收益全在转发（UDP 900M 单流 612 → 741 Mbit/s、8 流
@@ -361,6 +382,25 @@ EXPORT_SYMBOL_GPL(zx_eth_for_each_adapter);
 #define ZX_ZC_BS_TX	3	/* 已交给发送硬件，硬件发完自己归还 */
 #define ZX_ZC_BS_LOST	4	/* 追不到（数据被 expand 搬走），永不归还 */
 
+/*
+ * P10.5：FFE 臂的 bp 状态（与上面的 zc 状态是两套账，别混）。
+ *
+ * 只有两格就够：FREE = 不认为它在发送环里（在 BMU 空闲表、在 RX 硬件手里、
+ * 在驱动手里都算），TX = 已写进发送描述符、还没记到发送完成。
+ *
+ * **不能照抄 zc 的语义**：zc 的 TX 是终态（槽位交出去就不再要了，没有
+ * TX→FREE 的边），而 FFE 的 bp 是要循环的 —— 硬件发完会把 bp 自己还回 BMU，
+ * 下一个 RX 帧还会用它。若 TX 不清，快路上每个正常回收的 bp 都会被判成
+ * "还在发送环里"，A2 会拒绝每一次归还、A3 会丢每一帧，快路当场停摆。
+ * 所以 TX 的清除点是 zx_tx_reclaim()：按 ZX_DMA_TX_DONE 的完成数，把
+ * [tx_cur_idx - tx_pending, +n) 这批描述符对应的 bp 清回 FREE。
+ */
+#define ZX_BP_FREE	0
+#define ZX_BP_TX	1
+
+/* 每个 bp 的 RX 投递计数（取证用，u16 饱和）；见 dma_state 的 bp_hot 行 */
+#define ZX_BP_HITS_MAX	0xffffu
+
 /* 追不到的槽位超过这个数就自动关 zc，免得池子被一滴滴吃空 */
 #define ZX_ZC_LOST_MAX	64u
 
@@ -411,6 +451,70 @@ static int zx_bmu_alloc_bp(struct zx_eth_adapter *adapter)
 	return ret;
 }
 
+/*
+ * P10.5 A4：归还 bp 时毒化帧首 16 B 里的 8 B，把"槽位回到 BMU 之后又被当成
+ * 一帧送上来、但内容其实没被硬件重写"变成可计数事件（rx_poison）。
+ *
+ * 为什么毒**帧首**（槽位偏移 16..31）而不是槽位保留的 16 B 头（偏移 0..15）：
+ *  - 帧首是硬件按描述符 len 必须写的区域：只要这次真是新帧，毒值一定被覆盖。
+ *    保留头驱动从不读、也没有证据表明硬件每帧重写它；毒在那里会永久残留，
+ *    把每个正常回收槽位的合法帧都判成毒帧 —— 不可接受的假阳性（会丢流量）。
+ *
+ * 为什么 16 B 里**只毒 8 B、故意放过 source-MAC（帧字节 6..11）与以太类型
+ * （帧字节 12..13）**：这两段是 P10.4 判据的输入 —— alias 判据比的是
+ * `d + ETH_ALEN`（smac），分子分族看的又是 `d + 12`（以太类型）。若把它们也
+ * 毒掉，毒帧就既不再命中 alias、也分不出 v4/v6，`accel->alias_drop[]` 会被
+ * 截断 ⇒ P10.4 的 autofallback 对慢态失明（复审 REVIEW-P10.4 §4 的 S8）。
+ * 保留它们以后：原来的 alias 判据、分族计数、P10.4 判据**一个字节都不变**，
+ * 毒帧只是多记一笔 rx_poison（"这一帧来自一个被归还过的槽位，且没被重写"）。
+ *
+ * 布局（帧字节，16 B 里占 8 B）：
+ *   0..5    01 80 c2 00 00 0e  dmac = IEEE 保留的 link-local 组播：桥不转发，
+ *                             万一毒帧真被回栈也不会泛洪到 LAN；
+ *   6..11   （保留原样：smac，alias 判据的输入）
+ *   12..13  （保留原样：以太类型，P10.4 分族的输入）
+ *   14..15  5a a5             以太类型之后的第一处载荷字节（魔数尾）
+ * 可辨识性：真实帧要同时命中这 8 B。帧字节 0..5 = 01:80:c2:00:00:0e 的真实帧
+ * 只有 LLDP，而 LLDP 的字节 14..15 是首个 TLV 头（实测固定 02 07），不是
+ * 5a a5；其它 link-local 协议（STP/LACP）用 LLC 不是以太类型。所以真实帧
+ * 命中概率 ~2^-64 且具体为 0；即便误判一次，代价也只是这一帧回栈（不丢）。
+ *  - 只在 bp_state[bp]==FREE 时写：TX 在途的槽位归发送硬件（见调用点）。
+ */
+#define ZX_BP_POISON_MAC_LO	0x00c28001u	/* 帧字节 0..3：01 80 c2 00 */
+#define ZX_BP_POISON_MAC_HI	0x0e00u		/* 帧字节 4..5：00 0e */
+#define ZX_BP_POISON_TAIL	0xa55au		/* 帧字节 14..15 */
+
+static void zx_bp_poison_write(struct zx_eth_adapter *adapter, u16 bp)
+{
+	u8 *d = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE + 16;
+	u32 m0 = ZX_BP_POISON_MAC_LO;
+	u16 m1 = ZX_BP_POISON_MAC_HI;
+	u16 m2 = ZX_BP_POISON_TAIL;
+
+	memcpy(d, &m0, sizeof(m0));	/* dmac 前 4 B */
+	memcpy(d + 4, &m1, sizeof(m1));	/* dmac 后 2 B；d[6..11] 是 smac，不动 */
+	/* d[12..13] 是以太类型，不动（P10.4 分族要读它） */
+	memcpy(d + 14, &m2, sizeof(m2));	/* 类型后第一处载荷字节 */
+}
+
+/*
+ * RX 侧：帧首还是不是我们的毒值（调用前必须已经 cache invalidate）。
+ * 只比 8 B：dmac 6 B + 类型后 2 B；smac 与以太类型必须保持原样（见上）。
+ */
+static bool zx_bp_poisoned(struct zx_eth_adapter *adapter, u16 bp)
+{
+	const u8 *d = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE + 16;
+	u32 m0;
+	u16 m1, m2;
+
+	memcpy(&m0, d, sizeof(m0));
+	memcpy(&m1, d + 4, sizeof(m1));
+	if (m0 != ZX_BP_POISON_MAC_LO || m1 != ZX_BP_POISON_MAC_HI)
+		return false;
+	memcpy(&m2, d + 14, sizeof(m2));
+	return m2 == ZX_BP_POISON_TAIL;
+}
+
 static int zx_bmu_free_bp(struct zx_eth_adapter *adapter, u16 bp)
 {
 	u32 val;
@@ -442,10 +546,57 @@ static int zx_bmu_free_bp(struct zx_eth_adapter *adapter, u16 bp)
 	}
 
 	adapter->bmu_free_slots--;
+	/*
+	 * P10.5 A4：把槽位交还 BMU 之前毒化帧首 16 B（语义与布局见
+	 * zx_bp_poison_write()）。两个必要条件：
+	 *  - bp_state[bp]==FREE：TX 在途的槽位归发送硬件，写进去就是改坏
+	 *    正在发的帧（这是 A4 唯一的自伤面，所以它依赖 A0 的状态机）；
+	 *  - 放在 writel() 之前：写完再交还，硬件不可能先把这个槽位发给 RX。
+	 * 写 16 B 非缓存内存是纳秒量级，且只在"归还"这一侧，热路径上不占
+	 * 预算；缓存池模式（只有 A/B 实验会开）要多一次 clean，见下。
+	 */
+	if (unlikely(READ_ONCE(ffe_poison)) && bp < ZX_NUM_BUFFERS &&
+	    READ_ONCE(adapter->bp_state[bp]) == ZX_BP_FREE) {
+		zx_bp_poison_write(adapter, bp);
+		if (adapter->pkt_pool_cacheable)
+			dma_sync_single_for_device(adapter->dev,
+					adapter->pkt_pool_dma +
+					(u32)bp * ZX_BUF_SIZE + 16,
+					16, DMA_BIDIRECTIONAL);
+	}
 	writel(bp, adapter->base + ZX_BMU_BUF_FREE);
 out:
 	spin_unlock_bh(&adapter->bmu_free_lock);
 	return ret;
+}
+
+/*
+ * P10.5 A2：归还 bp 之前的属主检查 —— 同一个槽位只归还一次。
+ *
+ * 只改"还不还"，**不改"送不送"**：丢弃决定、描述符消费、索引推进一个字节
+ * 都不动；被拒的只是"再还一次 BMU"这个动作。
+ *
+ * 为什么必须拒：bp_state[bp]==TX 说明这个槽位已经写进发送描述符、发送硬件
+ * 还要读它。此时再 writel(bp, ZX_BMU_BUF_FREE)，BMU 空闲表就多出一份重复项，
+ * 该 bp 从此被两个属主循环使用 —— 正是慢态"只有 1537/1540 两个 bp 在循环"
+ * 的放大链（每命中一次多一份永久损坏，所以越跑越糟、不自愈）。
+ *
+ * zc 模式不介入：zc 有自己的 zc_state（而且它的 TX 是终态），两套账叠加只会
+ * 互相误判；A 档先在 !zc_rx 上交付（TASK-P10.5-FIX §8 风险 7）。
+ *
+ * 返回 0 = 已归还 / 按 A2 有意跳过；非 0 = BMU 归还失败（调用方照旧记
+ * bmu_free_fail，口径与改动前完全一样）。
+ */
+static int zx_bp_return(struct zx_eth_adapter *adapter, u16 bp)
+{
+	if (unlikely(READ_ONCE(adapter->zc_rx)))
+		return zx_bmu_free_bp(adapter, bp);
+	if (unlikely(bp < ZX_NUM_BUFFERS &&
+		     READ_ONCE(adapter->bp_state[bp]) == ZX_BP_TX)) {
+		adapter->bp_double_free++;
+		return 0;
+	}
+	return zx_bmu_free_bp(adapter, bp);
 }
 
 /* ---- RX descriptor release ----------------------------------------- */
@@ -947,6 +1098,9 @@ static int zx_hw_init(struct zx_eth_adapter *adapter)
 	adapter->tx_complete_cnt = 0;
 	adapter->tx_done_excess = 0;
 	adapter->bmu_free_slots = 0;
+	/* P10.5：环从头开始 ⇒ 账本也从头开始（probe 才走到这里） */
+	if (adapter->bp_state)
+		memset(adapter->bp_state, ZX_BP_FREE, ZX_NUM_BUFFERS);
 
 	writel((u32)adapter->buf_pool_dma + ZX_AREA50_OFFSET, base + ZX_DMA_AREA50);
 	writel((u32)adapter->tx_ring_dma, base + ZX_DMA_TX_RING);
@@ -1031,11 +1185,46 @@ void zx_tx_reclaim(struct zx_eth_adapter *adapter)
 {
 	u32 done = readl(adapter->base + ZX_DMA_TX_DONE) & 0xffff;
 	u32 n = min(done, adapter->tx_pending);
+	u32 tail = adapter->tx_cur_idx - adapter->tx_pending;
 
 	if (unlikely(done > adapter->tx_pending))
 		adapter->tx_done_excess += done - adapter->tx_pending;
 	adapter->tx_complete_cnt += n;
 	adapter->tx_pending -= n;
+	/*
+	 * P10.5 A0 的清除点：完成的是环上最老的 n 个描述符，即
+	 * [tx_cur_idx - tx_pending, +n)。`tail` 必须在 `tx_pending -= n`
+	 * **之前**算，否则回绕后 tail 偏移 n，会把还在飞的 bp 清成 FREE
+	 * （那正是 A2 假阳性/二次归还的来源）。
+	 *
+	 * 用提交时记下的 cached 影子环 tx_bp[] 而不是反读描述符 byte7/8：
+	 * 发送环在 dma_alloc_coherent 的非缓存事务区，反读每帧要多两次非缓存
+	 * 事务（~40–60 ns/帧，65 kpps 上 0.3–0.4%），而影子环是 cached u16
+	 * 读写（<2 ns）；描述符提交后归硬件所有，驱动也不必再从它反读自己的
+	 * 字段。语义与任务书 §5 #3 完全一致（同一个 bp、同一次完成）。
+	 */
+	if (likely(adapter->bp_state)) {
+		u32 i;
+
+		if (unlikely(done > n)) {
+			/*
+			 * 完成数超过在飞数：记账已经漂了（实测全程 0）。逐个反推
+			 * 不可信，宁可整表回 FREE（下一次提交/归还按"没有在飞"
+			 * 处理），也不要把某个 bp 永久钉在 TX 上让 A2 拒还。
+			 */
+			adapter->bp_state_stale++;
+			memset(adapter->bp_state, ZX_BP_FREE, ZX_NUM_BUFFERS);
+		} else {
+			for (i = 0; i < n; i++) {
+				u16 bp = adapter->tx_bp[(tail + i) %
+							ZX_NUM_TX_DESC];
+
+				if (bp < ZX_NUM_BUFFERS)
+					WRITE_ONCE(adapter->bp_state[bp],
+						   ZX_BP_FREE);
+			}
+		}
+	}
 	/*
 	 * 加速模式切换期间不动队列：切换自己会 netif_tx_disable() 所有端口，
 	 * 这里再把队列叫醒就等于开着门切换（设计 §1.4 S2/S6）。
@@ -1647,6 +1836,16 @@ bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
 
 	adapter->tx_cur_idx++;
 	adapter->tx_pending++;
+	/*
+	 * P10.5：从这一行起 bp 归发送硬件（直到 zx_tx_reclaim() 记到这次完成）。
+	 * 影子环 tx_bp[] 与 bp_state[] 一起写：前者给 reclaim 反查是哪一个 bp，
+	 * 后者给 RX/归还侧判断"槽位是否还在发送环里"。三处写侧
+	 * （这里、reclaim、hw_init）都在 tx_lock 下或 probe 期，不需要新锁。
+	 */
+	if (likely(adapter->bp_state && bp < ZX_NUM_BUFFERS)) {
+		adapter->tx_bp[tx_idx] = bp;
+		WRITE_ONCE(adapter->bp_state[bp], ZX_BP_TX);
+	}
 	/* 快路与栈共用一个环，dma_state 的 qlen_peak 记整环占用峰值 */
 	if (adapter->tx_pending > READ_ONCE(adapter->accel.cnt[0].qlen_peak))
 		WRITE_ONCE(adapter->accel.cnt[0].qlen_peak, adapter->tx_pending);
@@ -1834,7 +2033,7 @@ static void zx_alias_count(struct zx_eth_adapter *adapter, const u8 *d)
  * WRITE_ONCE 发布索引，读到半条也只是取证数据不完整，重读一次即可。
  */
 static void zx_alias_snapshot(struct zx_eth_adapter *adapter,
-			      const __le32 *desc, u16 len, int port,
+			      const __le32 *desc, u16 len, int port, u16 bp,
 			      const u8 *frame)
 {
 	u32 slot = adapter->alias_snap_idx & (ZX_ALIAS_SNAP_N - 1);
@@ -1846,7 +2045,15 @@ static void zx_alias_snapshot(struct zx_eth_adapter *adapter,
 		s->desc[i] = le32_to_cpu(desc[i]);
 	s->len = len;
 	s->port = (port >= 0 && port <= 0xff) ? (u8)port : 0xff;
-	s->rsvd = 0;
+	/*
+	 * P10.5：记录"alias 判据命中那一刻，这个 bp 在不在发送环里"。
+	 * 这是切开 H1/H2（bp 在途被二次投递）与 H3/永久陈旧（bp 已是 FREE）
+	 * 的那一格，A0 的必采项（TASK-P10.5-FIX §7 第 3 条）。
+	 */
+	s->rsvd = bp < ZX_NUM_BUFFERS ?
+		  (u8)READ_ONCE(adapter->bp_state[bp]) : 0xff;
+	/* P10.5：快照时刻（jiffies），把 32 条定到时间轴上（§9 第 5 条） */
+	s->stamp = (u32)jiffies;
 	/*
 	 * 只拷描述符声明的长度：len 最小可以到 14（守卫只挡 <14），此时
 	 * 拷贝 64 B 会把"本帧之后"的槽内残留（上一条帧的尾巴/未初始化垃圾）
@@ -1884,6 +2091,7 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			u16 bp, len;
 			int port;
 			bool zc;
+			bool poisoned;
 			struct sk_buff *skb;
 			struct net_device *dest_dev;
 			u64 t0, t1, t2, t3, t4, t5;
@@ -1920,7 +2128,7 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 					work_done++;
 					avail--;
 					if (bp && bp < ZX_NUM_BUFFERS &&
-					    zx_bmu_free_bp(adapter, bp))
+					    zx_bp_return(adapter, bp))
 						adapter->bmu_free_fail++;
 					continue;
 				}
@@ -1960,6 +2168,38 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			}
 
 			/*
+			 * P10.5 A0：每个 bp 的 RX 投递计数（取证，见 dma_state 的
+			 * bp_hot 行与 alias_dump 每条表项的 hits=）。一个 bp 的
+			 * 投递速率是"该槽位 100% 失败（内容永久陈旧）"与
+			 * "0.5% 失败（偶发在途重叠）"唯一的分辨器。
+			 */
+			if (likely(adapter->bp_rx_hits)) {
+				u16 h = adapter->bp_rx_hits[bp];
+
+				if (h != ZX_BP_HITS_MAX)
+					WRITE_ONCE(adapter->bp_rx_hits[bp], h + 1);
+			}
+
+			/*
+			 * P10.5 A0：这个 bp 还在发送环里 —— 同一个槽位同时被 RX 与
+			 * TX 拥有，正是慢态里"少数 bp 反复错配"的签名。
+			 *   A0（默认）：只计数 ffe_dup，帧照旧走下面的判据链。
+			 *   A3（ffe_bp_drop=1，默认关，会丢帧）：消费描述符、丢帧、
+			 *   **不归还** bp（它属于发送环，再还一次就是二次归还）。
+			 */
+			if (unlikely(READ_ONCE(adapter->bp_state[bp]) ==
+				     ZX_BP_TX)) {
+				adapter->ffe_dup++;
+				if (READ_ONCE(ffe_bp_drop)) {
+					zx_rx_consume(desc, rel);
+					adapter->rx_cur_idx[q]++;
+					work_done++;
+					avail--;
+					continue;
+				}
+			}
+
+			/*
 			 * The frame sits in cacheable memory that the BMU wrote
 			 * by DMA: drop the stale cache lines before the CPU
 			 * touches it.  The 16 B header and the frame live in the
@@ -1973,6 +2213,24 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 							16 + len,
 							DMA_FROM_DEVICE);
 			t2 = ZX_TS();
+
+			/*
+			 * P10.5 A4：帧首还是我们归还时写的毒值 ⇒ 这个槽位回到
+			 * BMU 之后又被当成"有一帧"送了上来，但内容没有被硬件
+			 * 重写（否则毒值一定被覆盖）。记 rx_poison。
+			 *
+			 * 这里**只计数、不改变后面的判据**：毒值只落在 dmac 与
+			 * 类型后的 2 B 上，source-MAC 与以太类型保持原样，所以
+			 * 下面的 alias 判据、P10.4 的分族计数照旧命中 —— 这是
+			 * 复审要求的口径（毒帧既算 alias 分子又单独计数，二者
+			 * 不重复扣）。真正改变行为的地方只有一个：毒帧**不进
+			 * 快路**（见下面 fam/h_proto 之后的 goto），因为它的
+			 * dmac 已经是保留组播，被 FFE 改写后发上线就是脏帧。
+			 */
+			poisoned = READ_ONCE(ffe_poison) &&
+				   zx_bp_poisoned(adapter, bp);
+			if (unlikely(poisoned))
+				adapter->rx_poison++;
 
 			/* Aliasing detector: frames from one of our own addresses */
 			if (len >= ETH_HLEN) {
@@ -1992,7 +2250,7 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 					 * 池槽位里，head 直接从 d 拷。
 					 */
 					zx_alias_snapshot(adapter, desc, len,
-							  port, d);
+							  port, bp, d);
 					zx_rx_consume(desc, rel);
 					adapter->rx_cur_idx[q]++;
 					work_done++;
@@ -2003,7 +2261,7 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 					 * its own: return it, or every such
 					 * frame leaks one BMU buffer.
 					 */
-					if (zx_bmu_free_bp(adapter, bp))
+					if (zx_bp_return(adapter, bp))
 						adapter->bmu_free_fail++;
 					continue;
 				}
@@ -2028,6 +2286,17 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 			int fam = zx_eth_family(h_proto);
 			int ffe = ZX_FFE_RX_STACK;
 
+			/*
+			 * P10.5 A4 的后半句：毒帧不进快路。走到这里的是"投毒过、
+			 * 但 source-MAC 不是本机"的毒帧（alias 的那一类已经在上面
+			 * 按**原有规则**丢弃并计数了，行为没变）。这些帧的 dmac 已经
+			 * 是保留组播，内容也不可信，绝不能进 FFE 被改写后发上线；
+			 * 回栈交给协议栈按它自己的规则处理（下面照常消费描述符、
+			 * 按规则把 bp 还给 BMU，A2 仍会拦"还在发送环里"的那一种）。
+			 * 放在 fam/h_proto 初始化之后，慢路径拿到的口径与普通回栈一致。
+			 */
+			if (unlikely(poisoned))
+				goto accel_slow;
 			if (unlikely(READ_ONCE(adapter->accel.quiesce)))
 				goto accel_slow;
 			/*
@@ -2117,14 +2386,14 @@ accel_slow:
 					adapter->rx_len_short_cnt++;
 					if (adapter->rx_len_short_cnt <= 5)
 						dev_warn_ratelimited(adapter->dev,
-							"rxq%d: short frame? port=%d len=%u claimed=%u proto=0x%04x; dropping (the stack would call it truncated)\n",
+							"rxq%d: short frame? port=%d len=%u claimed=%u proto=0x%04x bp=%u; dropping (the stack would call it truncated)\n",
 							q, port, len, claimed,
-							ntohs(h_proto));
+							ntohs(h_proto), bp);
 					zx_rx_consume(desc, rel);
 					adapter->rx_cur_idx[q]++;
 					work_done++;
 					avail--;
-					if (zx_bmu_free_bp(adapter, bp))
+					if (zx_bp_return(adapter, bp))
 						adapter->bmu_free_fail++;
 					continue;
 				}
@@ -2133,9 +2402,9 @@ accel_slow:
 					adapter->rx_len_long_cnt++;
 					if (adapter->rx_len_long_cnt <= 5)
 						dev_warn_ratelimited(adapter->dev,
-							"rxq%d: long frame? port=%d len=%u claimed=%u proto=0x%04x; not dropping (pskb_trim will cut it)\n",
+							"rxq%d: long frame? port=%d len=%u claimed=%u proto=0x%04x bp=%u; not dropping (pskb_trim will cut it)\n",
 							q, port, len, claimed,
-							ntohs(h_proto));
+							ntohs(h_proto), bp);
 				}
 			}
 			/*
@@ -2241,7 +2510,7 @@ zc_skip:
 			adapter->rx_cur_idx[q]++;
 			work_done++;
 			avail--;
-			if (!zc && zx_bmu_free_bp(adapter, bp))
+			if (!zc && zx_bp_return(adapter, bp))
 				adapter->bmu_free_fail++;
 			t5 = ZX_TS();
 			if (unlikely(timing)) {
@@ -2282,7 +2551,7 @@ ffe_done:
 			work_done++;
 			avail--;
 			if (ffe == ZX_FFE_RX_DROPPED &&
-			    zx_bmu_free_bp(adapter, bp))
+			    zx_bp_return(adapter, bp))
 				adapter->bmu_free_fail++;
 			continue;
 		}
@@ -2622,6 +2891,51 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 		   adapter->rx_alias_cnt, adapter->rx_nobuf_cnt,
 		   adapter->rx_rel_fail, adapter->rx_bad_cnt,
 		   adapter->rx_len_short_cnt, adapter->rx_len_long_cnt);
+	/*
+	 * P10.5：bp 生命周期取证（§6 的判读表按这几格读，TASK-P10.5-FIX §7）。
+	 *   ffe_dup        RX 拿到的 bp 仍在发送环里（A0 只计数；A3 才拦）
+	 *   bp_double_free A2 拒掉的二次归还（bp 仍是 TX 时又想还 BMU）
+	 *   rx_poison      RX 帧首仍是我们归还时写的毒值（A4）
+	 *   bp_state_stale 完成记账漂移、状态表整体重扫的次数（应恒 0）
+	 *   bp_tx_now      账上仍在发送环里的 bp 个数（应 ≤ tx_pending）
+	 *   bp_poison/bp_drop 两个模块参数的现态（A4 默认 1、A3 默认 0）
+	 *   bp_hot         投递次数最多的 8 个 bp —— "同一 bp 的投递速率"
+	 */
+	{
+		u32 tx_now = 0;
+		u16 hot_bp[8] = { 0 }, hot_n[8] = { 0 };
+		int k, r;
+
+		if (adapter->bp_state)
+			for (i = 0; i < ZX_NUM_BUFFERS; i++)
+				if (READ_ONCE(adapter->bp_state[i]) == ZX_BP_TX)
+					tx_now++;
+		for (i = 0; i < ZX_NUM_BUFFERS && adapter->bp_rx_hits; i++) {
+			u16 n = READ_ONCE(adapter->bp_rx_hits[i]);
+
+			if (!n)
+				continue;
+			for (k = 0; k < 8; k++)
+				if (n > hot_n[k])
+					break;
+			if (k == 8)
+				continue;
+			for (r = 7; r > k; r--) {
+				hot_n[r] = hot_n[r - 1];
+				hot_bp[r] = hot_bp[r - 1];
+			}
+			hot_n[k] = n;
+			hot_bp[k] = (u16)i;
+		}
+		seq_printf(s, "ffe_dup=%llu bp_double_free=%llu rx_poison=%llu bp_state_stale=%u bp_tx_now=%u bp_poison=%d bp_drop=%d\n",
+			   adapter->ffe_dup, adapter->bp_double_free,
+			   adapter->rx_poison, adapter->bp_state_stale, tx_now,
+			   READ_ONCE(ffe_poison), READ_ONCE(ffe_bp_drop));
+		seq_puts(s, "bp_hot:");
+		for (k = 0; k < 8 && hot_n[k]; k++)
+			seq_printf(s, " %u=%u", hot_bp[k], hot_n[k]);
+		seq_putc(s, '\n');
+	}
 	seq_printf(s, "ppe_active=%u ppe_flows=%u ppe_add_skip=%u ppe_add_fail=%u\n",
 		   adapter->ppe_active, adapter->ppe_count,
 		   adapter->ppe_add_skip, adapter->ppe_add_fail);
@@ -3087,9 +3401,26 @@ static int zx_eth_alias_dump_show(struct seq_file *s, void *data)
 			   ((idx + i) & (ZX_ALIAS_SNAP_N - 1)) : i;
 		const struct zx_alias_snap *a = &adapter->alias_snap[slot];
 
-		seq_printf(s, "#%u slot=%u desc0=%08x desc1=%08x desc2=%08x desc3=%08x len=%u port=%u\n",
-			   i, slot, a->desc[0], a->desc[1], a->desc[2],
-			   a->desc[3], a->len, a->port);
+		/*
+		 * P10.5：行尾追加 bp= / st= / hits= / stamp=（既有字段与顺序
+		 * 一字不动，按 len=/port= 或行首 #N 解析的脚本不受影响；
+		 * 仍然保持"一条两行：#N 行 + head= 行"的既有形状）。
+		 *   bp   = 描述符字节 7/8 还原的槽位号（与 RX 解码同一口径）
+		 *   st   = 快照那一刻的 bp_state（0 FREE / 1 TX / 0xff 无效）
+		 *   hits = 该 bp 的 RX 投递计数（bp_rx_hits）
+		 *   stamp= 快照时刻的 jiffies
+		 */
+		{
+			u16 bpn = (u16)((((a->desc[1] >> 24) & 0xff) >> 1) |
+					((a->desc[2] & 0xff) << 7));
+			u16 hits = (adapter->bp_rx_hits && bpn < ZX_NUM_BUFFERS) ?
+				   READ_ONCE(adapter->bp_rx_hits[bpn]) : 0;
+
+			seq_printf(s, "#%u slot=%u desc0=%08x desc1=%08x desc2=%08x desc3=%08x len=%u port=%u bp=%u st=%u hits=%u stamp=%u\n",
+				   i, slot, a->desc[0], a->desc[1], a->desc[2],
+				   a->desc[3], a->len, a->port, bpn, a->rsvd,
+				   hits, a->stamp);
+		}
 		seq_puts(s, "  head=");
 		for (j = 0; j < sizeof(a->head); j++)
 			seq_printf(s, "%02x", a->head[j]);
@@ -3337,6 +3668,17 @@ static int zx_eth_probe(struct platform_device *pdev)
 	 * 登记给 skb destructor（SoC 上只有一个以太网控制器）。
 	 */
 	adapter->zc_state = devm_kzalloc(dev, ZX_NUM_BUFFERS, GFP_KERNEL);
+	/*
+	 * P10.5：bp 生命周期账本（A0）。bp_state 4096 B（两态，u8），
+	 * tx_bp 1024×2 B（发送环影子），bp_rx_hits 4096×2 B（投递计数）。
+	 * 都是常驻小数组，devm 管生命周期；全零 = 全部 FREE。
+	 */
+	adapter->bp_state = devm_kzalloc(dev, ZX_NUM_BUFFERS, GFP_KERNEL);
+	adapter->tx_bp = devm_kzalloc(dev, ZX_NUM_TX_DESC *
+				      sizeof(*adapter->tx_bp), GFP_KERNEL);
+	adapter->bp_rx_hits = devm_kzalloc(dev, ZX_NUM_BUFFERS *
+					   sizeof(*adapter->bp_rx_hits),
+					   GFP_KERNEL);
 	adapter->zc_skb = devm_kzalloc(dev, ZX_NUM_BUFFERS *
 				       sizeof(*adapter->zc_skb), GFP_KERNEL);
 	adapter->zc_snap = devm_kzalloc(dev, (size_t)ZX_NUM_BUFFERS * ZX_ZC_CANARY,
@@ -3355,7 +3697,8 @@ static int zx_eth_probe(struct platform_device *pdev)
 	if (!adapter->zc_state || !adapter->zc_skb || !adapter->zc_snap ||
 	    !adapter->zc_snap_len || !adapter->zc_free_at ||
 	    !adapter->zc_free_tog || !adapter->zc_ev || !adapter->zc_ev_n ||
-	    !adapter->zc_inring) {
+	    !adapter->zc_inring || !adapter->bp_state || !adapter->tx_bp ||
+	    !adapter->bp_rx_hits) {
 		ret = -ENOMEM;
 		goto err_dma;
 	}
