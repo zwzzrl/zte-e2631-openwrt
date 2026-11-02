@@ -184,12 +184,12 @@ Everything up to "AP beaming, monitor interface, air RX" has been verified alive
 board. Two things have not: the **first firmware download after a power cycle** succeeds on
 roughly one attempt in three (three cold boots on this exact image: hung, worked, hung),
 and a **client associating** still hard-hangs the machine, silently, with no AER record and
-no oops. Both are documented with their sample data in `docs/02-...md` section P.
+no oops. Both are documented with their sample data in `docs/history/2026-10-13-plan.md` section P.
 
 ## What is deliberately not in here
 
-`out/` stays outside the repository, at `$E2631_WORK` (on this machine
-`D:\AI\Qoder\E2631-OpenWRT\out`): every build directory, packed image, log and one-off
+`out/` stays outside the repository, at `$E2631_WORK` (the repo's parent directory by
+default): every build directory, packed image, log and one-off
 experiment script. It is 1.1 GB of things that are either regenerable or evidence with a
 filename quoted in `docs/`, and `docs/` says so inline - a path written as `out/xxx.log`
 means that directory, not this repo. `.env` is not in here either (`.env.example` is): it
@@ -237,7 +237,7 @@ the literal token never does.
   without it this port starts from an empty `target/`. Several of its published claims did not survive contact with
   this board (the `kernel1`/`kernel2` partition names, "erase `kernel1` to get stock back", the `TESTED.md` sha256
   and its "USB 3.0" line); each is listed with the measurement that closed it in
-  [docs/01-情报汇总与事实核验-2026-10-13.md](docs/01-情报汇总与事实核验-2026-10-13.md).
+  [docs/history/2026-10-13-intel.md](docs/history/2026-10-13-intel.md).
   The thanks and the corrections are both meant sincerely.
 - [cubingmucus998/zte-zx279128s-recon](https://github.com/cubingmucus998/zte-zx279128s-recon) - the public recon
   material for this SoC. A large share of the first DTB, partition-table and flash facts came from there.
@@ -253,5 +253,5 @@ the literal token never does.
   one mt76 patch (`overlay/package/kernel/mt76/patches/002-mt7915-use-caldata-file-before-efuse.patch`) and three
   target patches (`029`/`030` JFFS2-on-SPI-NAND, `031` the PCIe link-retrain gate); everything else is upstream as-is.
 
-If any of the above is wrong or incomplete, the fix belongs in `docs/01-...md` next to the evidence, not in a footnote here.
+If any of the above is wrong or incomplete, the fix belongs in `docs/history/2026-10-13-intel.md` next to the evidence, not in a footnote here.
 

@@ -14,7 +14,7 @@ split is why some checks are two commands instead of one.
 
 | script | what it does |
 |---|---|
-| `sync.sh` | copy the workspace repo into `~/e2631` so the build sees it |
+| `sync.sh` | copy the workspace repo into `e2631` under the build box's home directory so the build sees it |
 | `check-kit.sh` | the gates the retired CI used to run: compile the slot tool with `-Werror`, then have it accept a synthesized package and reject one byte altered. Needs `node build/tools/make_fixture.mjs out/fixture` first (Windows side) |
 | `build.sh` | full local `make world`, with the download workarounds in README.md |
 | `build-gen1.sh` | the same, pinned to what shipped on the board: sync -> apply -> `package/kernel/mt76/{clean,download,prepare}` -> witnesses -> `target/linux/{clean,prepare}` -> witnesses -> `make world` -> `collect.sh` -> copy to `out/gen1` |
@@ -59,7 +59,7 @@ bytes pulled from the live board), `dwc-linkspeed.sh` (our host controller drive
 `vendor-dtb-wdt.sh`, `twd-wdt-check.sh` (no watchdog can self-recover from an IRQs-off hang here),
 `failsafe-check.sh`, `failsafe-route.sh` (failsafe is the way back in without serial TX).
 
-Two conclusions are recorded in `../docs/02-...md` section P rather than in a script, and
+Two conclusions are recorded in `../docs/history/2026-10-13-plan.md` section P rather than in a script, and
 should not be re-litigated with a build: `/dev/mem` is unreachable from any fragment
 (`# CONFIG_DEVMEM is not set` in the built config while every fragment says `=y`), and the
 widened `FW_STATE` wait does not help (a cold bind hung with 8 s too).

@@ -1,3 +1,13 @@
+---
+title: Architecture - how a clone of this repo becomes a system that boots on the board
+date: 2026-11-02
+status: done
+topic: hw-datapath
+summary: 三个仓库如何拼成一台能启动的机器：镜像几何、驱动结构、CLA 取值、trap 代价与验证栈。
+evidence: docs/README.md
+supersedes:
+---
+
 # Architecture - how a clone of this repo becomes a system that boots on the board
 
 Read this before changing anything structural. BUILD.md is the procedure; README.md
@@ -36,7 +46,7 @@ map: which piece exists, what it is responsible for, and what breaks if you move
     board/            board-side scripts and the vendor evidence we do publish
                       (ser-*.log serial captures); dumps and harvests stay ignored
     seed/e2631.config the .config the build starts from
-    docs/             01 facts, 02 the working log, refs-local/ the earlier notes
+    docs/             reference/ tables, reverse/ vendor findings, features/, operations/
 
 ## From source to something that boots
 
@@ -154,7 +164,7 @@ because "reverse engineered" is a word that hides where each fact came from:
   `.rodata`, and the extract indices 9/10 with rules `0x98`/`0x99` come from tm.ko's
   parameter marshaler. Each was checked by writing it and reading the register back;
   the witness is the register comparisons in `docs/known-issues.md` plus the vendor dumps
-  kept in the workspace (`06-分析与对比/`).
+  captured from the stock firmware's own tables (not committed).
 * **The plumbing is mainline's.** The vendor has no `nf_flow_table`: `nf_flow_table`,
   `flow_cls_offload` and `TC_SETUP_FT` each appear zero times in its vmlinux. So
   `ndo_setup_tc`, the `flow_block` trampolines, dissector parsing and the offload
@@ -184,7 +194,7 @@ IPv6 flows are "learned into the table for accounting, kept on the CPU path. The
 offloads v6 through the `npu_cap_nat6` plugin whose key/extract formats are not
 reconstructed yet", and `zx_ffe_flow_add()` returns `-EOPNOTSUPP` for v6 on purpose
 (:220). So no, upstream's reverse engineering never produced a v6 fast path - it produced
-a v6 *trap*, and an explicit "not reconstructed". `docs/upstream-absorb-2026-10-29.md`
+a v6 *trap*, and an explicit "not reconstructed". `docs/history/2026-10-29-upstream-absorb.md`
 is the commit-by-commit account of what was taken from it.
 
 ## The capacity ceiling, and what happens past it
@@ -204,7 +214,7 @@ where *lookups* land by crc32, and several flows can share the tables without sh
 slot. "384 entries" in older text (README v1.3, the uci-defaults comment) conflated the
 two; the flow ceiling is 127.
 
-## Traps, and the one thing that made IPv6 offload impossible
+## Traps, and what keeps IPv6 on the CPU path
 
 The switch sends a frame to the CPU when a trap matches it, and a trapped frame is
 *diverted*: it never reaches the classifier, so it can never be offloaded. That is not
@@ -236,22 +246,26 @@ runtime for exactly this reason - it programs the v6 tables and lifts the trap, 
 puts it back - and with it on those 2,000 frames cost 18 CPU packets
 (`docs/known-issues.md`, PPE-IPV6-TRAP-CPU).
 
-That leaves the third finding, which is why this section is not called "the fix": with
-the trap lifted and the extract in place, the classifier hands IPv6 to the CPU, the driver
-writes the hash entry, and the hardware still never matches it - not with the entry in
-every slot at once, not with any window offset type, not with a key of 7 to 19 halfwords.
-The ninth round closed the last explanation that still pointed at our key: a rule patched
-to extract a *single* window (protocol only) cannot miss for key-format reasons, and it
-missed anyway - 617 CPU submissions per 600 packets against 98 for IPv4 in the same
-hairpin topology, with the rule read back exactly as written. So it is not the key: this
-classifier has no IPv6 hash lookup on this silicon, and the vendor never wrote one either
-- its v6 "ACL add" writes a 13-byte entry that contradicts its own shipped rule mask and
-no rule or index at all (every write captured by `tools/vendor-emu/t_v6rule.py`), because
-vendor IPv6 acceleration lives in the NPU (`npu_drv_*`, `npu_cap_nat6`), not in the
-classifier. IPv6 therefore stays on the CPU path in every configuration we ship; the v6
-tables and `ipv6=1` stay in the driver as the record of the attempt and as one command to
-re-test (`docs/known-issues.md`, `PPE-IPV6-TCP`, holds the falsified hypotheses and the
-counter-conditions that would revive the idea).
+That leaves the third finding, which is why this section is not called "the fix". For a
+while the reading here was "this classifier has no IPv6 hash lookup on this silicon": with
+the trap lifted and the extract in place the hardware appeared never to match our entry -
+not with the entry in every slot at once, not with any window offset type, not with a key of
+7 to 19 halfwords - and a rule patched to extract a *single* window (protocol only), which
+cannot miss for key-format reasons, missed anyway (617 CPU submissions per 600 packets
+against 98 for IPv4 in the same hairpin topology, rule read back exactly as written).
+
+**That reading is wrong** (settled 2026-11-02): the v6 lookup does hit. The entry is found
+in the slot our own CRC predicts, and 19 of the 20 candidate windows are usable as extract
+sources. The earlier rounds were measuring the step *after* the hit - the frames are eaten
+there instead of being forwarded, so user throughput stays flat while the hit counter
+moves. The blocker is "what happens between a hit and a departure", not "can this
+classifier look up v6 at all"; what the vendor does differently in that interval is still
+open. Delivery state is unchanged and stated plainly: IPv6 runs on the CPU path in every
+configuration we ship, and the v6 tables plus `ipv6=1` stay in the driver as the record of
+the attempt and as one command to re-test. Hit experiments, the window sweep and the
+vendor-side contrast are in [reverse/cla-v6-offload.md](reverse/cla-v6-offload.md);
+`docs/known-issues.md` (`PPE-IPV6-TCP`) keeps the falsified hypotheses and the
+counter-conditions that would revive the idea.
 
 ## Wi-Fi, and why it is off by default
 
@@ -310,7 +324,7 @@ C-level = inferred). `docs/02-...md` is the working log, section by section, inc
 sections that record a falsified assumption - those are the ones worth reading before
 re-trying something. `docs/known-issues.md` is the machine-readable honest list.
 `board/ser-*.log` are serial captures, committed on purpose: they are the primary witness
-for every "it died at this second" conclusion. `out/` is not in git - it is 1.1 GB of
-build directories, packed images, logs and one-off experiments, all either regenerable or
-named inline in `docs/`. A path written as `out/xxx.log` means the workspace, not this
-repository.
+for every "it died at this second" conclusion. Build directories, packed images and one-off
+experiment logs are not in git; where a number came from such a run, the document says how it
+was measured and what the pass criterion was, instead of pointing at a path that only exists
+on the machine that produced it.

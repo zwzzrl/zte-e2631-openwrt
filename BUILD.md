@@ -69,10 +69,10 @@ You still want a real official package in two cases:
   packed header against it.
 
 We have not found a copy of an uploaded package left behind on the box - the vendor
-flasher is copied into `/var` during an upgrade (`docs/02-...md` section F), the firmware
+flasher is copied into `/var` during an upgrade (`docs/history/2026-10-13-plan.md` section F), the firmware
 file itself was not located - and `e2631-fwslot info -j` prints a slot's header *fields*,
 not a package you can reuse. The format is fully decoded in
-`docs/01-情报汇总与事实核验-2026-10-13.md` section 2 - every field of four official
+`docs/history/2026-10-13-intel.md` section 2 - every field of four official
 packages verified by recomputing CRC1 and CRC2 - and `tools/make_fixture.mjs` synthesizes
 a self-consistent header from nothing so the slot tool is testable without any vendor
 binary. **What has not been tested** is whether the vendor web page accepts a package
@@ -144,7 +144,7 @@ Run it twice in a row to see the loop you will actually live in: the second pass
 Two routes, both used on real hardware. The upgrade package is the same file for both.
 
 **A. The vendor web page** (verified 2026-10-14, this is the acceptance route). Boot the
-box into the vendor system, log into its admin UI (it lives on `192.168.5.3`), open the
+box into the vendor system, log into its admin UI (it lives on `<ADMIN_IP>`), open the
 hidden firmware-upgrade page - the writeups call it `supgrade.html`, and its form POSTs
 the multipart field `VersionUpload` to `/?_type=hiddenData&_tag=firmware_upgrade` on
 port 8085 - select the package, submit. It writes the **inactive** slot, raises the slot
@@ -163,9 +163,10 @@ touched. This also works from failsafe, because the tool only needs `/dev/mtd*` 
 slot partitions from the dtb. There is no `sysupgrade` path that overwrites the vendor
 slot, by design.
 
-**After first boot.** The image comes up with `br-lan` at `192.168.1.1/24` serving DHCP
-(measured on the console: `lan1: Link is Up - 1Gbps/Full`, then `ssh root@192.168.1.1`,
-LuCI on `http://192.168.1.1/`, Argon theme). The WAN port and the three LAN ports are
+**After first boot.** The image comes up with `br-lan` at `<LAN_IP>/24` (the stock OpenWrt
+LAN subnet, host part `.1`) serving DHCP (measured on the console: `lan1: Link is Up -
+1Gbps/Full`, then `ssh root@<LAN_IP>`, LuCI on `http://<LAN_IP>/`, Argon theme). The WAN
+port and the three LAN ports are
 one WAN + `lan1 lan2 lan3`, all four on the SoC's internal PHYs.
 
 ## 7. When the build itself is the problem
@@ -248,13 +249,13 @@ worked on. It is therefore package `overlay/package/kernel/kmod-e2631-ppe` inste
 third object of the built-in driver, and a change there is:
 
     make package/kernel/kmod-e2631-ppe/compile     # seconds, not minutes
-    scp -O build_dir/*/linux-*/kmod-e2631-ppe/zx279128s-ppe.ko root@192.168.1.1:/tmp/
-    ssh root@192.168.1.1 'rmmod zx279128s_ppe; insmod /tmp/zx279128s-ppe.ko'
+    scp -O build_dir/*/linux-*/kmod-e2631-ppe/zx279128s-ppe.ko root@<LAN_IP>:/tmp/
+    ssh root@<LAN_IP> 'rmmod zx279128s_ppe; insmod /tmp/zx279128s-ppe.ko'
 
 (Use `rmmod`, not `modprobe -r`: busybox modprobe has no `-r`.  Use `scp -O`: this
 dropbear has no sftp-server.)  No firewall restart is needed: module init attaches to the
 flowtable that is already bound, so the tables come back and the first flow re-offloads
-within a second.  `bash 04-构建环境与脚本/ppe-kmod-inner.sh` inside the builder container
+within a second.  `ppe-kmod-inner.sh` inside the builder container
 does the compile half of this.
 
 A bind that arrives while no engine is registered is still refused and never retried
@@ -305,11 +306,11 @@ hash entry).
 **(c) A flat CPU counter does not prove the hardware forwarded anything.** A dropped frame
 also keeps the CPU out, and that ambiguity produced a wrong "IPv6 offload works" reading.
 Make the far end something that counts: `ip -6 route add fd88::/64 via <sender> dev br-lan`
-on the router, `ip -6 route replace fd88::/64 via <router> dev ens34` on the sender, and the
-frames come back to the sender's own NIC, where a 30-line AF_PACKET script counts them
-(.scratch/ppe-v6/cnt.py, non-zero = forwarded, 0 = dropped; the whole bench
-harness that drove these runs is next to it). A negative result then
-means something.
+on the router, `ip -6 route replace fd88::/64 via <router> dev <host-nic>` on the sender, and
+the frames come back to the sender's own NIC, where a 30-line AF_PACKET script counts them
+(the local, uncommitted `ppe-v6/cnt.py`; non-zero = forwarded, 0 = dropped - the whole
+bench harness that drove these runs sits next to it and is likewise outside the repo).
+A negative result then means something.
 
 Three traps cost a day each before they were found, both worth remembering:
 

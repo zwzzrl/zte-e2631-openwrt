@@ -53,7 +53,7 @@ reference too.
 
 ## What is in these 532 bytes, and what is not
 
-Field-by-field decoding is [docs/01-情报汇总与事实核验-2026-10-13.md](../docs/01-情报汇总与事实核验-2026-10-13.md)
+Field-by-field decoding is [docs/history/2026-10-13-intel.md](../docs/history/2026-10-13-intel.md)
 section 2, and `tools/mkfactory.mjs` header comment carries the offset table (`M`).
 Nothing here is secret that is not already in every package published under this repo's
 Releases: `v1.0`, `v1.1` and `v1.2` each embed this same 512-byte header, so the keys,

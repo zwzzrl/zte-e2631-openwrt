@@ -1,3 +1,13 @@
+---
+title: Known issues
+date: 2026-11-02
+status: done
+topic: known-issues
+summary: 机器可读的问题块 + 每条一则"现象/根因/证据"；verified 与 unverified 严格分开。
+evidence: docs/README.md
+supersedes:
+---
+
 # Known issues
 
 The honest list, in two forms: a machine-readable block for tooling and grep, and one
@@ -55,7 +65,7 @@ points at something in the repository or at a measurement.
   status: fixed
   surface: kernel config
   symptom: CONFIG_DEVMEM=y is requested in both generic and the target fragment, and the built .config comes out "not set"
-  verified: yes (out/gen1/config-6.18:2314 vs generic/config-6.18:1494 and sanechips/config-6.18:147); mechanism confirmed upstream and the fix verified in a local build on 2026-10-29
+  verified: yes (build 树的 config-6.18:2314 vs generic/config-6.18:1494 and sanechips/config-6.18:147); mechanism confirmed upstream and the fix verified in a local build on 2026-10-29
   cause: |
     include/kernel-defaults.mk appends every CONFIG_KERNEL_* line of the top-level
     .config to the merged kernel config with the CONFIG_KERNEL_ prefix stripped
@@ -252,7 +262,7 @@ points at something in the repository or at a measurement.
         - The classifier matched an IPv4 entry and has never matched an IPv6 one.  The
           aging word - which zx_ppe_flow_stats already used for IPv4 hits - is the
           oracle: install the flow, send one 1.2 s UDP burst, read the banks back.
-            IPv4 192.168.1.250:41234 -> 10.88.0.1:9999: flows at slots 29/38, slot 29
+            IPv4 <宿主地址>:41234 -> <内网地址>:9999: flows at slots 29/38, slot 29
             aging bit 0 = 1 immediately after the burst, and a second 67,800-packet
             burst costs the CPU 18 tx_submitted (hardware forwarding).
             IPv6 fd99::2:48211 -> fd88::2:9999: flows at 144/180, aging bit 0 = 0
@@ -303,12 +313,12 @@ points at something in the repository or at a measurement.
       last-byte-first, init 0, no final xor), so "which slot would the driver write"
       can be recomputed offline.  Feeding the two recorded tuples back in reproduces
       the slots the hardware was seen to hold, exactly:
-        IPv4 192.168.1.250:41234 -> 10.88.0.1:9999  ->  slots 29 / 38  (bank 1: 260 / 369)
+        IPv4 <宿主地址>:41234 -> <内网地址>:9999  ->  slots 29 / 38  (bank 1: 260 / 369)
         IPv6 fd99::2:48211       -> fd88::2:9999    ->  slots 144 / 180 (bank 1: 297 / 268)
       the same numbers `dump` read back from the hardware, and in the same direction
       order (the reverse tuple swaps ports *and* addresses).  So the entry really is
       where the classifier looks; what still does not match is the key inside it.
-      The recomputation lives in the kit's `09-工具脚本/cla_slot.py` (`--selftest`
+      The recomputation lives in a small script (`cla_slot.py`, not committed) (`--selftest`
       asserts those four slots).  It also shows the v6 key byte matters for the other
       family's slot (0x99 -> 144, 0x98 -> 16), which is exactly why the all-520-slot
       shotgun, not a single correct byte, is what ruled the slot side out.
@@ -508,12 +518,12 @@ points at something in the repository or at a measurement.
       live in their 4.1 vmlinux and talk to `CSPKernel_skb_SelectQueue`.  IPv6 stays
       on the CPU path (`ipv6=1` = correct forwarding, no fast path, which is why it
       is not the default), IPv4 stays accelerated.
-    * Bench that made the above cheap, for the next round: DESKTOP-A5A2TK2 runs an
+    * Bench that made the above cheap, for the next round: <桌面主机> runs an
       iperf3 server on 5201 and its firewall accepts 192.168.0.0/16 plus IPv6
       link-local only.  So a *routed* IPv4 flow is made by using a second subnet
-      inside 192.168/16 (`iperf3 -c 192.168.1.243 -B 192.168.5.50`, host route
-      `192.168.1.243/32 via 192.168.1.1`, router route `192.168.5.0/24 via
-      192.168.1.250`), and routed IPv6 to that peer is blocked by policy, which
+      inside 192.168/16 (`iperf3 -c <内网主机> -B <宿主地址>`, host route
+      `<内网主机>/32 via 192.168.1.1`, router route `<工位网段>/24 via
+      <宿主地址>`), and routed IPv6 to that peer is blocked by policy, which
       leaves the one-way hairpin bench (`fd99::2:48211 -> fd88::2:9999`) as the IPv6
       traffic source.  The iperf3 server hung twice mid-session and had to be left
       alone; the hairpin bench needs no far end and is the reliable one.
@@ -542,7 +552,7 @@ points at something in the repository or at a measurement.
           v6 快表项只用前缀+端口做 key、地址靠规则掩码在硬件侧比，要么
           `tm_acl_fast_add_v4v6()` 不是原厂 IPv6 快路径走的那条。
     * 2026-10-31：按端口 provision extract index 1..8 的方案**在真机上执行完了**
-      （`docs/vendor-cla-extract-index-2026-10-30.md` §4.4 那份流水，全用模块参数，
+      （`docs/reference/cla-registers.md` §4.4 那份流水，全用模块参数，
       没刷机、没改源码），结果是一条明确的负结果，但把问题缩小到了表项格式：
         - index 3（lan1）+ rule 56 + `v6_key=0x38` + entry byte16 `0x43` 之后，
           **分类器变成"活的"**：同一股 v6 流（`ipv6=0` 时 60,000 帧里 52,137 帧回到
@@ -564,7 +574,7 @@ points at something in the repository or at a measurement.
           所以原厂那种 egress=PON 的 v6 快转在这台机器上也没有可测的出口；
           下一步要么先把原厂 v6 表项的真实 key 反解出来（离线），要么给驱动加一个
           "整条 60 字节 v6 表项直写"的调试参数，用它验证原厂形状能不能被硬件接受。
-          细节、原始读数、复现命令：`docs/vendor-v6-entry-format-2026-10-31.md`。
+          细节、原始读数、复现命令：`docs/reverse/cla-v6-offload.md`。
     * 2026-10-31 第二轮：**"缺的那次写"找到了，就是外部哈希表；而这块板子没有那张表。**
       把上一轮 `t_v6flowdump.py` 的会话换成地址真实存在的形状（`desc[0x0c]=10`，16 字节
       地址真的进了会话）之后，让 `tm.ko` 真身跑（只桩函数栈底部，见
@@ -586,12 +596,15 @@ points at something in the repository or at a measurement.
         `index | table<<22 | sel<<27`，`table ≤ 9`（0 索引、1 规则、2..6 哈希五档库、
         7 cpu queue、8 aging、9 dscp/tc/qid）。真机 `dump 8` 扫 0..15 号表，只有 2..6
         读得回我们写的数据，和这张表一致。
-      - 结论：**CLA 内部哈希不查 v6（上一轮已从反面证过），CLA 的 v6 单播快表在另一块
-        存储上，这块板子没有那块存储。** 原厂在这台机器上的 v6 加速只能是 FFE（内核里的
-        conntrack 软件快转）+ NPU（他们 switch.ko 的 ACL L3 hardfast，能力矩阵里 ipv6
-        只有 tcp/udp/mc 且限 WAN↔LAN）。
-      细节：`docs/ppe-ipv6-external-hash-2026-10-31.md`。本轮之后 `ipv6=1` 的定位可以
-      收口成"二层 IPv6 硬件交换 + IPv6 组播硬件表"，不再包含路由 v6 快转的期待。
+      - 结论（**2026-11-02 已更正**）：上面那句"CLA 内部哈希不查 v6 / 这块板子没有那块存储"
+        **不成立**。后续本板实测证明 CLA 的 v6 查表**能命中**：表项落在软件 CRC 算出的那个
+        槽上，20 个候选窗口里 19 个可用。卡点在**命中之后**——帧被丢弃而不是被转发，
+        不是"没有表可写"。原厂在这台机器上的 v6 加速因此在 FFE 与 NPU 之外，确实还用了
+        这套 CLA 查表（它的 v6 会话走 `cla_set_external_hash_table`，见上一段流水）。
+      交付态定位没变：`ipv6=1` 仍是"二层 IPv6 硬件交换 + IPv6 组播硬件表"，路由 v6 走 CPU；
+      变的只是**原因**不再写错。细节见 [cla-v6-offload](reverse/cla-v6-offload.md) 与
+      [2026-10-31-ppe-ipv6-external-hash](history/2026-10-31-ppe-ipv6-external-hash.md)（后者
+      是被推翻的过程记录）。
     Measurement note, because it cost a wrong conclusion once: tx_submitted in
     /sys/kernel/debug/92000000.ethernet/dma_state proves that the CPU did *not* touch
     a packet, which is not the same as proving the hardware forwarded it - a dropped
@@ -599,7 +612,7 @@ points at something in the repository or at a measurement.
     routes back out the same LAN port, so the sending host counts the frames arriving
     on its own NIC (non-zero means forwarded, 0 means dropped).  Both tricks are in
     BUILD.md "Measuring the packet processor".
-  docs: 01-文档/BUILD-NOTES.md 2026-10-27; 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md; 06-分析与对比/拿原厂运行时表内容-方案-2026-10-27.md; docs/vendor-cla-extract-index-2026-10-30.md; docs/vendor-v6-entry-format-2026-10-31.md
+  docs: docs/reference/cla-registers.md; docs/reverse/cla-v6-offload.md
 - id: PPE-IPV6-TRAP-CPU
   severity: minor
   status: mitigated
@@ -693,9 +706,9 @@ points at something in the repository or at a measurement.
       也就是说第九轮"CLA 的 IPv6 哈希查找被排除"这个结论，排除掉的很可能**本来就
       不是原厂的 v6 快转路径** —— 六种 CLA 实验全负与此自洽。
       下一步应改为移植 ACL 的 L3 hardfast 条目格式（能力矩阵见
-      `docs/vendor-ipv6-accel-2026-10-30.md` §4/§7），而不是继续在 CLA 里试窗口/槽号。
+      `docs/reverse/vendor-ipv6-behavior.md` §4/§7），而不是继续在 CLA 里试窗口/槽号。
       补充（2026-10-30 晚）：CLA 侧不再是黑盒 —— 哈希与 353 位键布局都已复原
-      （`docs/vendor-cla-hash-recovered-2026-10-30.md`），真要回到 CLA 路线时有据可依；
+      （`docs/reference/cla-hash.md`），真要回到 CLA 路线时有据可依；
       但"硬件调试面 `calculatehashaddr` 不能当全量基准"这一点必须先记住。
     * 同上那份文档 §4 还有一条会限制"任意有线口可作 WAN"的硬事实：原厂的
       NPU 能力表按 **(入端口组, 出端口组)** 穷举，IPv6 只给了
@@ -703,7 +716,7 @@ points at something in the repository or at a measurement.
       我们的 ACL 移植必须自己定义这张端口组表，不能照抄。
     * 2026-10-30 第十轮（仿真 + 一次只读真机对照）：`cla_set_extra_rule_table()` **不是**
       IPv6 缺的那一步，这个候选可以结案。细节与新工具见
-      `docs/vendor-cla-extra-rule-2026-10-30.md`（`tools/vendor-emu/t_v6extra.py`）：
+      `docs/reference/cla-registers.md`（`tools/vendor-emu/t_v6extra.py`）：
       - 它写的是 CLA 间接口 `ram_id=1`（驱动里叫 `ZX_CLA_EXTRA_RULE`）第 rule_id 项的
         17 个字，命令字 `0x9238c014 = 0x00400002`（rule_id=2、ram_id=1），数据字 16..0
         写 `0x9238c05c..0x9238c01c`、字 0 最后落表 —— 与驱动
@@ -724,7 +737,7 @@ points at something in the repository or at a measurement.
       同样不命中，CLA 这条路可以正式结案。** 台子是主机侧现搭的单向回环（地址/路由都是
       运行时的，不落配置）：主机 `fdee:70df:d02e::2` → 路由器 → `fd88::2`（盒子侧
       `ip -6 route add fd88::2/128 via fdee:70df:d02e::2 dev br-lan`、主机侧
-      `... via fe80::e660:4dff:fe86:71ef dev ens34`），判据仍是 `dma_state` 的
+      `... via fe80::e660:4dff:fe86:71ef dev <宿主网卡>`），判据仍是 `dma_state` 的
       `tx_submitted`：
       - 先用 50 个 ICMPv6 echo 验台子：主机侧 AF_PACKET 抓到 **47 个**回来的帧
         （目的 `fd88::2`），说明确实"进 br-lan → 路由 → 又出 br-lan"，不是本地投递；
@@ -738,11 +751,10 @@ points at something in the repository or at a measurement.
         常数，不是卸载），所以结论是"条目照样写进去了，但硬件一个包都没走快路"。
       - 顺带复验了文档里那条：`rmmod` + `insmod` 之后 `ppe_active` 自己就回到 1，
         不需要再动防火墙。
-      工具：主机的 `.scratch/bench6.py`（`sniff <秒> <前缀>` / `blast <包数> <源> <目的>
-      <端口>`，AF_PACKET + UDP 盲发，不依赖 tcpdump/iperf3 对端），搭/拆台子的命令在
-      `.scratch/bench6-setup.sh up|down`。
+      工具：主机侧两个临时脚本（未入库）——`sniff <秒> <前缀>` / `blast <包数> <源> <目的> <端口>`，
+      AF_PACKET + UDP 盲发，不依赖 tcpdump/iperf3 对端；搭/拆台子用同一套脚本的 up/down。
       **同一台子同一时刻的 IPv4 对照（这才是"硬件到底卸没卸"的尺子）**：
-      主机 `192.168.1.250` → 盒子 → `10.88.0.1`（盒子把它路由回主机），两轮各 64,000 个
+      主机 `<宿主地址>` → 盒子 → `<内网地址>`（盒子把它路由回主机），两轮各 64,000 个
       UDP，`tx_submitted` 只涨 **+138**，`ppe_flows=2` —— 即 99.9% 的包没经过 CPU。
       所以这台的计量是可信的：同一个台子、同一天、同一版镜像，
       **IPv4 +138 / IPv6 +115,407**，差三个数量级。
@@ -773,7 +785,7 @@ points at something in the repository or at a measurement.
     * Untested with the trap lifted: MLD/multicast IPv6 (the switch has its own MLD
       tables in the vendor design - `drv_add_mld_addr_gpon_sfu` - and our port does not
       program them), and IPv6 over the (unused) WAN.
-  docs: BUILD.md "Measuring the packet processor"; 06-分析与对比/原厂硬件加速驱动-IPv6-对比-2026-10-27.md
+  docs: BUILD.md "Measuring the packet processor"; docs/reverse/vendor-ipv6-behavior.md
 - id: USERDATA-EXTROOT
   severity: minor
   status: mitigated
@@ -921,7 +933,7 @@ points at something in the repository or at a measurement.
   status: mitigated
   surface: flashing
   symptom: host/stage.mjs serves the file from the PC address it is told, and the box can only reach the interface actually wired to it
-  verified: yes (the PC's LAN address moved 192.168.5.5 -> 192.168.5.17 when the adapter changed)
+  verified: yes (the PC's LAN address moved <内网地址> -> <内网地址> when the adapter changed)
   workaround: pass --pc with the address of the interface that has the router on it
 - id: NO-CI
   severity: minor
@@ -949,7 +961,7 @@ points at something in the repository or at a measurement.
     the list is empty, and the module's init re-attaches to whatever it finds. Verified on slot 1
     serial 26: ppe_active=1 at boot, fw4 restart leaves it at 1 (the log is now enabled, disabled,
     enabled - the last transition is a bind), rmmod/insmod alone brings it back to 1 without touching
-    the firewall, and a 12 s IPv4 TCP stream through the router (VM 192.168.10.2 -> 192.168.1.243,
+    the firewall, and a 12 s IPv4 TCP stream through the router (VM <内网地址> -> <内网主机>,
     hairpin, so a genuinely forwarded flow) ran at 934 Mbit/s with ppe_flows=4, ppe_add_skip=0,
     ppe_add_fail=0
   next: none - but note that this counter existed in the built-in driver too, so this was not introduced by the module split, only exposed by it (the reload path was never reachable before)
@@ -965,7 +977,7 @@ points at something in the repository or at a measurement.
     L2 control lan<->lan 929/942 Mbit/s with 0 % sirq; box terminating 4 streams 451 Mbit/s
   cause: |
     There is no hardware fast path for v6 on this SoC (the PPE classifier does not take v6 -
-    docs/ppe-ipv6-external-hash-2026-10-31.md), so the data plane is always driver RX ->
+    docs/history/2026-10-31-ppe-ipv6-external-hash.md), so the data plane is always driver RX ->
     stack -> driver TX. The per-packet cost of zx279128s-eth (BMU free with spinlock + MMIO,
     a 1.5 KB memcpy per RX into napi_alloc_skb, another copy per TX, no checksum offload)
     puts the saturation point near 400 Mbit/s for 8 streams, with both cores still below
@@ -982,7 +994,7 @@ points at something in the repository or at a measurement.
   next: |
     single-stream 145 Mbit/s (window vs per-packet cost), the 0.3-0.5 % retransmits on a LAN
     path with softnet time_squeeze, and the driver per-packet cost if 700 Mbit/s+ is wanted.
-    Numbers and harness: docs/v6-software-fastpath-2026-10-30.md
+    Numbers and harness: docs/features/v6-software-fastpath.md
 ```
 
 ## WIFI-ASSOC-HARD-HANG
@@ -1103,7 +1115,7 @@ UpTime 单调增长（没有重启循环），WebUI 响应正常（也没有 res
 所以到 2026-10-28，槽 A 里躺的是我们改过的原厂镜像（v5），**不是出厂镜像**。
 此前任何"slot0 原厂完好"的说法都是错的 —— 那是按"我们只让它写 slot1"的意图推的，不是读出来的。
 
-已恢复：把 `工作文件/03-固件备份/router-flash/mtd5_slot0.bin`
+已恢复：把出厂备份镜像（`mtd5_slot0.bin`，未入库）
 （sha256 `4c7a83f6bcb48225440788a5aeaddba36ee135278163047311aa1ff8595fabcb`，
 头 `V1.0.0.8B8.8000` / `serial=4` / `slotStart=0x700000`，CRC1/CRC2/fs_crc 三处自洽）
 整段写回 slot0，回读整个 `0x1c00000` 分区，sha256 与备份一致。
@@ -1139,11 +1151,11 @@ UpTime 单调增长（没有重启循环），WebUI 响应正常（也没有 res
 目的：在原厂 8B8 上拿一个 root shell，用它 dump PPE 运行时表、或改 `TelnetCfg`。
 （`VENDOR-RUNTIME-TABLES` 之后换的路子：不再刷镜像，只打它自己的 WebUI。）
 
-手段与结果都在 `192.168.5.1` 实测，本轮**零 flash 写入**，slot0 仍是原厂镜像：
+手段与结果都在 `<盒子地址>` 实测，本轮**零 flash 写入**，slot0 仍是原厂镜像：
 
 | 入口 | 实测结果 |
 | --- | --- |
-| `ping_diag_data` 的 `Host` | 白名单：`;`、`|`、`$()`、反引号、`127.0.0.1`、`0.0.0.0` 全被 `IF_ERRORPARAM=Host`（`-257`）拒；`localhost`、`192.168.5.50` 通过。而且诊断**从不执行**：`DiagnosticsState` 恒为 `Requested`、`PingAck` 恒为 `NULL` —— 既没回显也没副作用 |
+| `ping_diag_data` 的 `Host` | 白名单：`;`、`|`、`$()`、反引号、`127.0.0.1`、`0.0.0.0` 全被 `IF_ERRORPARAM=Host`（`-257`）拒；`localhost`、`<宿主地址>` 通过。而且诊断**从不执行**：`DiagnosticsState` 恒为 `Requested`、`PingAck` 恒为 `NULL` —— 既没回显也没副作用 |
 | `do_restore_usrcfg` 上传的文件名 | 14 种载荷（`;`、`$(curl …)`、`${IFS}`、反引号、换行、`|`、`&`、`../`、`%00`）全部 `IF_ERRORID=414`，宿主机 `:8000` 监听**零命中**。`414` 与文件名无关（纯 `cfg.bin` 同样 `414`），是内容校验 |
 | `do_download_usercfg` 配置备份 | HTTP 200 + `application/octet-stream`，**0 字节** |
 | 网络面 | 80/443/8085 开，23/22/2323 全关；131 个 thinklua tag 里没有命令/调试类 |
@@ -1251,7 +1263,7 @@ zx279128s_ppe: Unknown symbol zx_eth_for_each_adapter (err -2)
    ```
 
    这两条经 HTTP 的 `/ubus` JSON-RPC 就能发，封装好的客户端是
-   `工作文件/05-路由器操作脚本/ubus.py`（另有 `ubus.py sh '<命令>'` 与
+   主机侧的 ubus 小工具（未入库；另有 `ubus sh '<命令>'` 与
    `ubus.py cat <路径>`，权限受 luci-base ACL 限制——`file exec` 对该镜像放行，
    `/sbin/reboot`、`/sbin/wifi`、`/bin/kill` 等都在允许列表里）。
 5. **无线要等约 3 分钟**：`e2631-wifi-load`（START=95，`DEFER=25`）+ 开机 pending
@@ -1317,9 +1329,8 @@ e2631-wanport apply lan3                # 实测输出：e2631-wanport: WAN 口 
 早，所以重新全量构建，并把这个新镜像用 `e2631-fwslot flash --slot 1` 写进了**正在
 运行的那个槽**（slot1），重启。
 
-**结果**：盒子再也回不来。症状很具体：ens34 的链路一直 1000M/Full（PHY/交换侧活着），
-但 12 个候选 LAN 地址（192.168.1.1 / 0.1 / 2.1 / 4.1 / 8.1 / 10.1 / 31.1 / 43.1 /
-100.1 / 5.1 / 10.0.0.1 / 172.16.0.1）裸 ARP 全部无应答，8 秒抓包 ens34 上连一帧都没有。
+**结果**：盒子再也回不来。症状很具体：<宿主网卡> 的链路一直 1000M/Full（PHY/交换侧活着），
+但 12 个常见私网候选地址（产品默认段与三个常用家用段的典型网关）裸 ARP 全部无应答，8 秒抓包 <宿主网卡> 上连一帧都没有。
 断电重启无效。
 
 **归类**：属于"内核跑起来之后挂死"，不是"CRC 层起不来"。前者 cspboot **没有任何自动
@@ -1401,12 +1412,12 @@ v9 要验的那件事（引擎能不能在真机上以模块方式活下来）**
   - 认领用 `set -C`（noclobber）原子创建，抢输的实例安静退出，不会误写 failed；
   - 60 秒确认子进程只撤**属于自己这次 boot 的**标记，避免跨启动误清。
 
-**验证**：`05-路由器操作脚本/ppe-guard-test.sh` 在真机上 10 项全过（pending 首行是本次
+**验证**：`ppe-guard-test.sh`（真机自测脚本，未入库）在真机上 10 项全过（pending 首行是本次
 boot_id / 正常路径不写 failed / 同启动重复调用被识别且不写 failed / 确认窗口到点撤标记 /
 日志有确认记录 / 无 failed 残留 / 旧 boot_id 触发跳过 / failed 写明原因 / 跳过时保留 pending），
 随后冷重启复验：一次开机只有一条"引擎已加载"，60 秒后 pending 自动消失，`failed` 不出现。
 
-修好后的产物是 v9c：`02-固件产物/e2631-openwrt-v9c-ppe-20261029-slot1.bin`
+修好后的产物是 v9c：`e2631-openwrt-v9c-ppe-20261029-slot1.bin`（未入库）
 （slot1、`serial=43`、`V1.0.0.8B8.9800`、sha256 `bc75048d…6fd7`），
 经 `sysupgrade -n` 刷进 slot1 后冷启动复验通过，机器现在跑的就是它。
 
@@ -1449,7 +1460,7 @@ boot_id / 正常路径不写 failed / 同启动重复调用被识别且不写 fa
 （见下面的 PPE-AUTOLOAD-BOOT-LOCKOUT 条目）。**内核从头到尾没有被加载过**，不是加载
 之后挂死。
 
-**证据（v8 与 v9 的包逐字节比较，两个包都在 `02-固件产物/`）**
+**证据（v8 与 v9 的包逐字节比较，两个包都在构建产物目录，未入库）**
 
 | 观测点 | v8（能启动） | v9（起不来） |
 |---|---|---|
@@ -1509,7 +1520,7 @@ v9/v10 是绕过 `release.mjs`、直接调 `mkfactory.mjs pack` 出的包，所�
    解压后**静默挂死**——一样不可启动，只是死法不同。
 
 自测（本机跑过）：v8 的内核打包通过并 `post-write verify` 全 ok；v9、v11 的内核都被
-拒且给出具体理由；`mkfactory.mjs selftest --template 06-分析与对比/原厂包分析/fwinspect/vendor.bin`
+拒且给出具体理由；`mkfactory.mjs selftest --template <原厂包解出的 vendor.bin>（未入库）`
 仍然 `byte-exact: YES`。
 
 **教训**：打包器的输入必须是"能启动的内核镜像"，而不是"某个叫 zImage 的文件"；
@@ -1517,19 +1528,19 @@ v9/v10 是绕过 `release.mjs`、直接调 `mkfactory.mjs pack` 出的包，所�
 
 ## VM-FIREWALLD-BLOCKS-TFTP - U-Boot 的 TFTP 被防火墙以 admin-prohibited 拒掉（2026-10-29）
 
-现象：U-Boot 里 `ping 192.168.1.250` 是 `alive`，但
+现象：U-Boot 里 `ping <宿主地址>` 是 `alive`，但
 `tftp 0x43000000 init.uImage` 只有一行 `Loading: *T T T T …`，五轮 `Retry count
 exceeded` 之后回到 `=>`。TFTP 服务端日志里一个请求都没有。
 
-定位方式（`AF_PACKET` 抓 ens34，不用装 tcpdump）：RRQ 确实到了网卡上——
+定位方式（`AF_PACKET` 抓 <宿主网卡>，不用装 tcpdump）：RRQ 确实到了网卡上——
 
 ```
-UDP  192.168.1.10>192.168.1.250 3507>69 ulen=49 uck=0x0000
-ICMP 192.168.1.250>192.168.1.10 type=3 code=13 len=97     ← 紧跟其后 0 ms
+UDP  <内网地址>><宿主地址> 3507>69 ulen=49 uck=0x0000
+ICMP <宿主地址>><内网地址> type=3 code=13 len=97     ← 紧跟其后 0 ms
 ```
 
 `code 13` = administratively prohibited，即**本地策略拒绝**，不是"端口没人听"（那是
-`code 3`）。查下来 `ens34` 没有绑定区域，落在默认的 `public` 区，而 `firewalld` 的
+`code 3`）。查下来 `<宿主网卡>` 没有绑定区域，落在默认的 `public` 区，而 `firewalld` 的
 `public` 是 `target: default`：入站外来连接一律 reject，只放行了 `3080/3099/3100/tcp`
 ——ICMP echo 默认放行，所以 ping 通、UDP 69 全灭。
 
@@ -1548,7 +1559,7 @@ firewall-cmd --zone=public --list-ports      # 确认 69/udp 在列表里
 
 ## OVERLAY-BACKUP-TTYD-CORRUPT - 回灌用的 ttyd 配置是二进制垃圾（2026-10-29）
 
-`03-固件备份/openwrt-overlay-from-backup/upper/etc/config/ttyd` 只有 59 字节，内容是
+备份里的 `etc/config/ttyd`（未入库）只有 59 字节，内容是
 `\0\5\032\234\0?I\306Yk9.\274\347 -…` 这样的二进制，不是配置文本：抓取 overlay 那一步
 就把它写坏了。镜像里的正常内容是：
 
@@ -1601,7 +1612,7 @@ for p in $(ls /etc/config); do msg=$(uci commit "$p" 2>&1); [ -n "$msg" ] && ech
 
 2. **"`Starting kernel ...` 之后静默 = 内核崩了"——错的。**
    用同样的方式让 cspboot 选 slot0 启动**未改动过的原厂固件**：串口同样一片空白，
-   但系统正常起来——`192.168.5.1` 的 80/443 可达、原厂登录握手成功
+   但系统正常起来——`<盒子地址>` 的 80/443 可达、原厂登录握手成功
    （`SoftwareVer=V1.0.0.8B8.9201`）、ping 0.7 ms。原厂 4.1.25 内核根本不往 ttyAMA0
    打内核日志，所以**"静默"什么也证明不了**，能作为"死没死"依据的只有两件事：
    有没有复位（掉电重启循环）、网络有没有起来。
@@ -1645,12 +1656,12 @@ for p in $(ls /etc/config); do msg=$(uci commit "$p" 2>&1); [ -n "$msg" ] && ech
 
 ### 修法与验证
 
-`09-工具脚本/build-vendor-rootsh.py`：从原厂镜像读回每个设备节点的
+`build-vendor-rootsh.py`（未入库）：从原厂镜像读回每个设备节点的
 (类型, mode, uid, gid, major, minor)，用 `os.mknod` 建真节点；删掉 `.chr`/`.blk`
 占位；按 `-m priority -x lzma` 出镜像；版本头整份沿用原厂 slot0 的头，只改
 body 长度 / fs_crc / 槽起点 / serial / H_NEW / 两个 CRC。
 
-产物 `02-固件产物/vendor-root-shell/e2631-vendor-rootsh-slot1-fixed.pkg`
+产物 `e2631-vendor-rootsh-slot1-fixed.pkg`（未入库）
 （21,234,196 B）自检全过：
 
 - inode 类型 `{目录 47, 链接 23, 字符 173, 块 168, 普通 108}`（普通 =107+1，多的是 `/sbin/shd`）
@@ -1670,14 +1681,14 @@ body 长度 / fs_crc / 槽起点 / serial / H_NEW / 两个 CRC。
 把 fixed 包刷进 slot1（`e2631-fwslot flash <pkg> --slot 1`），预期：
 
 - 串口**仍然静默**（原厂内核不打日志），所以别拿串口判断死活；
-- 判据换成网络：起来后 LAN 是 `192.168.5.1`，WebUI 80/443 通；
+- 判据换成网络：起来后 LAN 是 `<盒子地址>`，WebUI 80/443 通；
 - 然后 `telnet <IP> 2323` 拿 root shell（`/sbin/shd`，口令见 `shd.c`）；
 - 若依然 10 秒复位，则剩下的唯一变量就是"内容"本身（3 个改动 + shd），按
   `/etc/init.norm` → `/etc/shadow` → `shd` 的顺序二分。
 
 ## VENDOR-SHELL-VIA-WEBUI-UPGRADE - 成功：只追加节点 + 原厂 WebUI 升级（2026-10-30）
 
-**结论：通了。** 原厂系统跑在 slot1，`telnet 192.168.5.1 2323` 直接是 root
+**结论：通了。** 原厂系统跑在 slot1，`telnet <盒子地址> 2323` 直接是 root
 （`uid=0`），slot0 一个字节没动。整个过程没有手写过一次 `nand write`。
 
 ### 关键思路（用户提的）
@@ -1688,7 +1699,7 @@ body 长度 / fs_crc / 槽起点 / serial / H_NEW / 两个 CRC。
 
 ### 工艺一：一个字节都不重建 rootfs，只在尾部**追加节点**
 
-`09-工具脚本/jffs2_append.py` 在 pristine 镜像尾部追加节点，前 `0x1100000` 字节
+`jffs2_append.py`（未入库）在 pristine 镜像尾部追加节点，前 `0x1100000` 字节
 与出厂 `mtd5` 逐字节相同（已 diff 验证）。追加的三个：
 
 | 路径 | ino | 作用 |
@@ -1775,7 +1786,7 @@ pdt_getimgindex:230 pdt_getimg select = 1, serial0=0x30, serial1=0x31,
 ```
 
 顺带一条没定案的：cspboot 报 slot0 的头在 `0x1b60000`（= slot0 + 0x1460000），
-而早前 `.scratch/cspboot-slot-select.md` 记的是 `0x1b40000`（= slot0 + 0x1440000）。
+而早前一份过程记录里记的是 `0x1b40000`（= slot0 + 0x1440000）。
 按几何规则，头位置 = slot 起点 + `H_FW_SIZE`，所以两种记录对应两个不同的 fs_size
 （0x1120000 / 0x1100000）—— slot0 里可能同时留着两个头，扫描挑哪一个没有定案。
 以串口实际打出来的 `correct header has been found @...` 为准。
@@ -1798,7 +1809,7 @@ pdt_getimgindex:230 pdt_getimg select = 1, serial0=0x30, serial1=0x31,
 > 之前"都写成 49"是因为那时两槽最大本来就是 48（48+1=49），与 max+1 一致。
 > 另外这一轮也确认：httpd **没有重盖活动槽的头**（slot1 的 51 没被动），
 > 所以 1765 行那个"连活动槽也重盖"的猜测不成立。
-> 过程记录见 `docs/slot0-restore-factory-2026-10-30.md`。
+> 过程记录见 `docs/operations/flashing.md`。
 
 > 待验：本轮启动日志里 `serial0=0x30`（48），而 10-29 的笔记记的是 `0x2f`（47），
 > 中间除了两次原厂 httpd 上传没有别的写入 —— 所以 httpd 很可能**连活动槽的头也重盖**
@@ -1812,7 +1823,7 @@ pdt_getimgindex:230 pdt_getimg select = 1, serial0=0x30, serial1=0x31,
 
 **在 OpenWrt 里要切槽，别走这条路：用系统工具** `e2631-fwslot switch` + `reboot`
 （`cmd_switch()` = `retitle_slot(running ^ 1, max_serial() + 1)`，只改另一槽的版本头，
-不碰 firmware 体；详见 `01-文档/路由器当前状态与回滚手册.md` 的"路线 0"）。
+不碰 firmware 体；详见 `operations/recovery.md` 的"路线 0"）。
 下面的串口流程只在**盒子已经跑着原厂**、拿不到工具时用。
 
 ```
@@ -1822,11 +1833,11 @@ pdt_getimgindex:230 pdt_getimg select = 1, serial0=0x30, serial1=0x31,
 => nand erase 0x3760000 0x20000
 => reset
 # 2) slot0 原厂起来后，用 WebUI 接口把包写进 slot1
-./vendor-web.py upload 02-固件产物/e2631-openwrt-v12fix-ppe-20261030-slot1.bin --yes
+./vendor-web.py upload <v12fix 镜像> --yes
 # 3) 盒子自己重启进 slot1（serial 更高的那个）
 ```
 
-工具：`09-工具脚本/ser-flash-prep.py` 把第 1 步做成事件驱动（匹配串到了才发，
+工具：`ser-flash-prep.py`（未入库）把第 1 步做成事件驱动（匹配串到了才发，
 不 sleep）；两个擦除偏移是写死常量，并断言落在 slot1 窗口内。演练不加 `--yes`，
 只走到 `=>` 就停。
 
@@ -1845,11 +1856,11 @@ been found @1b60000`。所以 `e2631-fwslot switch` 从 slot1 切回原厂时，
 ### 顺带查清的两件事
 
 1. **"自动推流一直没到"不是工具问题。** 原厂 nat 表里有
-   `SNAT all -- 192.168.5.0/24 → 192.168.5.0/24 to:192.168.43.119`，把去
-   `192.168.5.50` 的包源地址改成了 `192.168.43.119`（因为原厂把 br0 既当 LAN 又当
-   WAN，`br0` 上就是 `192.168.43.119`，默认路由 `via 192.168.43.1 dev br0`）。
-   主机侧只把 `192.168.5.0/24` 配在 ens34 上 → 回程走默认路由 → 连接永远停在
-   `SYN_SENT`。抓包实证：`192.168.43.119 -> 192.168.5.50 [SYN]`。
+   `SNAT all -- <工位网段>/24 → <工位网段>/24 to:<热点侧地址>`，把去
+   `<宿主地址>` 的包源地址改成了 `<热点侧地址>`（因为原厂把 br0 既当 LAN 又当
+   WAN，`br0` 上就是 `<热点侧地址>`，默认路由 `via <热点网段> dev br0`）。
+   主机侧只把 `<工位网段>/24` 配在 <宿主网卡> 上 → 回程走默认路由 → 连接永远停在
+   `SYN_SENT`。抓包实证：`<热点侧地址> -> <宿主地址> [SYN]`。
    **结论：这条路线用 vsh 拉取，别推。**
 2. **"内核日志采空"是 `timeout` 用错。** 原厂 busybox 1.17 的 `timeout` 要
    `timeout -t 3 cat …`；写成 `timeout 3 cat …` 直接报
@@ -1858,7 +1869,7 @@ been found @1b60000`。所以 `e2631-fwslot switch` 从 slot1 切回原厂时，
 
 ### 原厂 IPv6 加速的实测事实
 
-已单独成文：`docs/vendor-ipv6-accel-2026-10-30.md`。三条要点先记在这里：
+已单独成文：`docs/reverse/vendor-ipv6-behavior.md`。三条要点先记在这里：
 
 - 加速分两层：**FFE**（软件快转，内核里，v4/v6 的 raw/tcp/udp/mc 全支持）+
   **NPU**（硬件，`switch.ko` 的 ACL L3 hardfast，v6 只支持 tcp/udp/mc）；
@@ -1889,5 +1900,5 @@ been found @1b60000`。所以 `e2631-fwslot switch` 从 slot1 切回原厂时，
   改用事件流水：每个 bp 8 条 `type:aux:jiffies`，其中 `type 9` = 把 bp 还给 BMU，
   同一个 bp 出现两次 9 就是双还的直接证据。`debugfs .../zc_ev` 可以直接读快照。
 
-详见 `docs/zc-rx-lifetime-2026-10-31.md` §6（含判据与下一步：查厂商归还协议、
+详见 `docs/features/zero-copy.md` §6（含判据与下一步：查厂商归还协议、
 退化方案 bp 世代 epoch、长期按 page_pool 重做）。

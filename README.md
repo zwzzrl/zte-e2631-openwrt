@@ -112,7 +112,7 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
    v6 虽然拿不到硬件快转，nft flowtable 的**软件快转**对它同样有效（2026-10-30 实测：
    `Ip6OutForwDatagrams` 从逐包 +1 变为 15 s 只 +几百，8 流 392–412 Mbit/s；同时把 RPS
    从"和网卡中断同一个核"改成分核，+12 %）。数字、判据与复现脚本见
-   [docs/v6-software-fastpath-2026-10-30.md](docs/v6-software-fastpath-2026-10-30.md)。
+   [docs/features/v6-software-fastpath.md](docs/features/v6-software-fastpath.md)。
    **零拷贝直通（默认关，按协议族打开）**：收包把这个 BMU 池缓冲直接 `build_skb()` 成 skb、发包把同一个
    `bp` 交回硬件，省掉每包两次 payload 搬运 —— 驱动内 RX 17.5 → 5.1 µs、TX 8.1 → 1.7 µs，
    转发 8 流 TCP 385–472 → 598–722 Mbit/s、UDP 900M 单流 606–628 → 716–756 Mbit/s。
@@ -123,7 +123,7 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
    uci `e2631.fastpath.zerocopy` 已废弃、开机不再应用它，**网络 → 转发加速**页只读显示状态。
    设计、三条硬约束（GRO 必须关、`tx_queue_len` 必须小、池上有 `ZX_ZC_OUT_MAX` 闸门）
    与全部实测见
-   [docs/ffe-zero-copy-2026-10-30.md](docs/ffe-zero-copy-2026-10-30.md)。
+   [docs/history/2026-10-30-zero-copy.md](docs/history/2026-10-30-zero-copy.md)。
 2. **Wi-Fi 开机自启（默认开启）**：时序与恢复机制来自 tigaotg 的交接 PR#1（真机验证过双频自动
    广播、改 SSID/密码重启保留）。首次开机配 WPA2-PSK（密码由本机 MAC 派生并打印在 console），
    绝不广播开放网络；上次启动未完成则跳过本次自启。不想要：`touch /etc/e2631-wifi-noautoload`。
@@ -151,7 +151,7 @@ musl.libc.org 在 12 秒探测窗口内一个字节都不给）。三件事让�
 ### v1.4：WAN 口可选（任意有线口当 WAN，手动指定）
 
 原厂叫「WAN/LAN 自适应」/ 盲插。原厂是在 cspd 的 NetAdapt 里探测，再 ioctl 给交换芯片设
-端口角色（逆向记录见 [docs/wanlan-adaptive-逆向记录-2026-10-27.md](docs/wanlan-adaptive-逆向记录-2026-10-27.md)）。
+端口角色（逆向记录见 [docs/reverse/wanlan-adaptive.md](docs/reverse/wanlan-adaptive.md)）。
 这里完全不碰芯片：四个口本来就是四个独立 netdev，"谁当 WAN"只等于
 **wan 接口绑在哪个 netdev、那个 netdev 不在 br-lan 里**。
 
@@ -184,7 +184,7 @@ WAN 区 input 是 REJECT，SSH/HTTP 立刻全断、只剩 ping，只能到现场
 **真机状态**：v4 通过原厂 `supgrade.html` 写进 slot1，v5（手动版收尾）是**在
 OpenWrt 里用 `sysupgrade -n` 刷的**，都起来了：`OpenWrt SNAPSHOT 0e2631` / 内核
 `6.18.55`。手动切口、网桥重排、MAC 固化与还原、LuCI 页面都在这台机器上验过；
-`05-路由器操作脚本/verify-wanport.sh` 只读 15 项 + 真切换 6 项全过。
+`verify-wanport.sh`（仓库外的本地验收脚本）只读 15 项 + 真切换 6 项全过。
 
 ### 旧状态表（v1.2 口径，留作对照）
 
@@ -201,11 +201,11 @@ OpenWrt 里用 `sysupgrade -n` 刷的**，都起来了：`OpenWrt SNAPSHOT 0e263
 "AP 在广播、monitor 接口、空口 RX"之前的每一步都已在真机上确认可用。两件事还没确认：
 **冷启动后的第一次固件下载**大约三次里成一次（同一份镜像上三次冷启：挂、成、挂）；
 以及**客户端关联**仍然会把机器硬死机 —— 静默、没有 AER 记录、没有 oops。
-两条都带着样本数据写在 `docs/02-...md` 的 P 节。
+两条都带着样本数据写在 `docs/history/2026-10-13-plan.md` 的 P 节。
 
 ## 这里刻意不放的东西
 
-`out/` 留在仓库之外，在 `$E2631_WORK`（本机是 `D:\AI\Qoder\E2631-OpenWRT\out`）：每一个构建目录、
+`out/` 留在仓库之外，在 `$E2631_WORK`（默认是本仓库的父目录）：每一个构建目录、
 打好的镜像、日志和一次性实验脚本。那里是 1.1 GB 要么可再生、要么是 `docs/` 里点了名的证据的东西，
 `docs/` 也就地说明了这点 —— 写成 `out/xxx.log` 的路径指的是那个目录，不是本仓库。
 `.env` 同样不在这里（在的是 `.env.example`）：它是唯一可能写着某人磁盘路径的文件。
@@ -246,7 +246,7 @@ nvmem MAC 接线和 JFFS2 那组补丁；它的 `tools/*.py` 筛查被重写成�
   没有它，这个端口得从一个空 `target/` 开始啃。同时要说清楚：其中若干公开说法在这块板子上没活下来
   （`kernel1`/`kernel2` 这两个分区名、"`mtd erase kernel1` 就能回原厂"、`TESTED.md` 里那个 sha256 和它的"USB 3.0"），
   每条都连同"是哪个实测把它关掉"的记在
-  [docs/01-情报汇总与事实核验-2026-10-13.md](docs/01-情报汇总与事实核验-2026-10-13.md) 里。
+  [docs/history/2026-10-13-intel.md](docs/history/2026-10-13-intel.md) 里。
   感谢和更正都是认真的。
 - [cubingmucus998/zte-zx279128s-recon](https://github.com/cubingmucus998/zte-zx279128s-recon) —— 这颗 SoC 的公开侦察材料。
   最早那批 DTB、分区表和 flash 事实，很大一块出自这里。
@@ -264,4 +264,4 @@ nvmem MAC 接线和 JFFS2 那组补丁；它的 `tools/*.py` 筛查被重写成�
   （`029`/`030` 是 SPI-NAND 上的 JFFS2，`031` 是 PCIe 链路重训练那道闸）；其余全是上游原样。
 - **深度求索 与 梁文谷**，伟大无须多言。
 
-上面这些若有写错或漏掉的，正确的地方是把它连同证据一起补进 `docs/01-...md`，而不是在这里加个脚注。
+上面这些若有写错或漏掉的，正确的地方是把它连同证据一起补进 `docs/history/2026-10-13-intel.md`，而不是在这里加个脚注。

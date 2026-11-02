@@ -498,7 +498,7 @@ table_sel == 2:  index = ((hash << 2) & 0xff) | 0x300     #  64 个桶，每桶 
 - **稳定**：隔几秒再读一次，内容不变；
 - **作用域对**：同一个槽号读 table 1/2/3 全是 0，说明 `table` 字段真的被硬件解释，
   我们的写只落在 table 0（与厂商"只写 table 0"一致）；
-- **不伤网络**：写完 `ping 192.168.1.250` 正常、`br-lan` 仍在，没有交换机挂死。
+- **不伤网络**：写完 `ping <PEER_IP>` 正常、`br-lan` 仍在，没有交换机挂死。
 
 至此这三件事从"仿真推出来的"变成"硬件事实"：访问协议、槽号寻址、48 字节表项布局。
 
@@ -574,7 +574,7 @@ sbrg:   w09 000099fd 00000000 00000000
 | `a …`（vlan 1, fd88::2 / fd99::2） | 写 `0x3f4..0x3f7`，`r 0 0x3f4..0x3f7` 读回逐字相同 |
 | `a …`（vlan 7, fd34::2 / fd12::1, pt 0） | 槽 `0x238`，读回与预测相同 |
 | `d …` 两条 | 四个块读回全 0 |
-| 写完 `ping 192.168.1.1` | 正常，`br-lan` 未受影响 |
+| 写完 `ping <LAN_IP>` | 正常，`br-lan` 未受影响 |
 
 这一步同时**反证了读编码**：`r` 用 `start=1` 能读回刚写的字，说明第七轮只验证过的写方向
 之外，读方向的命令字也对了。
@@ -673,11 +673,11 @@ NPU/hardfast 那一套（`npu_ipv6_l3{tcp,udp}{up,down}_cap`、`npu_drv_create_f
 
 ### 5. 下一轮可用的对端
 
-`DESKTOP-A5A2TK2` 上有一个 iperf3 服务（5201），它的防火墙只放行 `192.168.0.0/16` 和 IPv6
+一台独立测试主机上有一个 iperf3 服务（5201），它的防火墙只放行 `192.168.0.0/16` 和 IPv6
 链路本地地址。因此：
 
-- **IPv4 路由流**可以自己造：`iperf3 -c 192.168.1.243 -B 192.168.5.50`，主机加
-  `192.168.1.243/32 via 192.168.1.1`，路由器加 `192.168.5.0/24 via 192.168.1.250`。
+- **IPv4 路由流**可以自己造：`iperf3 -c <PEER_IP> -B <BIND_IP>`，主机加
+  `<PEER_IP>/32 via <LAN_IP>`，路由器加 `<PEER_SUBNET> via <NEXT_HOP>`。
 - **IPv6 路由流**被对端策略挡住（只收 fe80 源），所以 IPv6 仍用单向回环台
   `fd99::2:48211 -> fd88::2:9999`；这台不需要对端，是最可靠的那套。
 - 该 iperf3 服务本会话里挂过两次（连不上、SYN 无回），别把它当唯一判据。
@@ -705,7 +705,7 @@ NPU/hardfast 那一套（`npu_ipv6_l3{tcp,udp}{up,down}_cap`、`npu_drv_create_f
   第 2 个实参；拦掉之后 `tmOnuRegWrite/Read` 拿到 NULL 描述符，偏移全变 0。
 
 细节、逐次写流水的表、68 字节规则项的完整位图和下一步真机实验：
-`docs/vendor-cla-extra-rule-2026-10-30.md`。
+`docs/reference/cla-registers.md`。
 
 ---
 
@@ -726,14 +726,14 @@ NPU/hardfast 那一套（`npu_ipv6_l3{tcp,udp}{up,down}_cap`、`npu_drv_create_f
   `grep 'bl.*<name>' tm.dis`。
 * `t_hfsess.py` —— 两段式取证。`sess` 在 switch.ko 里跑 `sw_acl_l3_hardfast_session_add(desc)`，
   拦 `zte_api_fast_l3_session_add` 把 168 字节 `zteHffEntry` 落到 `$HFSESS`
-  （默认 `/o/ztehff.bin`，所以要把 `.scratch/hf2` 挂到 `/o`）；`hw` 再把这个条目喂给 tm.ko，
+  （默认 `/o/ztehff.bin`，所以要把本地仿真目录里的 `hf2` 挂到 `/o`）；`hw` 再把这个条目喂给 tm.ko，
   录下 CLA 表项 + `tmOnuRegWrite` + 调用序列；`ab <off> <val>` 只改一个字节做 A/B。
   里面有几个必要补丁：`patch_sym_ptr()` 把 `g_sw_cap` 挪到自建页（整表写进去会踩坏相邻 stub
   代码，症状是 `!! handler __memzero: Invalid memory write (UC_ERR_WRITE_UNMAPPED)`）；
   以及给 `findSubnetIdBySrcMac` / `pp_pm_*` / `pon_pp_set*` / `tm_ipv6table_*` / `sbrg_add*`
   的入口打 `mov r0,#0 ; bx lr`（否则 `ret=-12` + `invalid source mac addr`）。
 
-**结论（细节与地址见 `docs/vendor-acl-hardfast-re-2026-10-30.md`）：**
+**结论（细节与地址见 `docs/reverse/cla-v6-offload.md`）：**
 
 1. 60 字节 / 15 字的 CLA 规则条目里**没有任何入端口 bitmap / 端口组 id / WAN 侧标记**。
    唯一的端口字段是 `word0` 的 **bit12..23**，由 `zteHffEntry+0x9a`（= 出口设备名经
@@ -770,7 +770,7 @@ NPU/hardfast 那一套（`npu_ipv6_l3{tcp,udp}{up,down}_cap`、`npu_drv_create_f
 全部跑真身。
 
 ```bash
-KO=/绝对路径/工作文件/03-固件备份/vendor-rootfs-decrypted/kmodule-unsquashfs
+KO=/绝对路径/vendor-rootfs-decrypted/kmodule-unsquashfs
 docker run --rm -v "$KO":/ko:ro -v "$PWD":/w -w /w --entrypoint python3 e2631-uni:py312 t_extidx.py <cmd>
 #   map      端口->index 表的原始字节 + 解码
 #   init     aclRamInit 真身（含随后的 tm_acl_fast_init）
@@ -783,7 +783,7 @@ docker run --rm -v "$KO":/ko:ro -v "$PWD":/w -w /w --entrypoint python3 e2631-un
 坑：`km.py` 不保证 `.bss` 为 0（实测 `g_aclRamInited` 读出来是 `0x7b6`），
 `aclRamInit` 会立刻返回"已初始化"；脚本里显式清零 `.bss` 之后才有 18088 步。
 
-**结论（细节与地址见 `docs/vendor-cla-extract-index-2026-10-30.md`）：**
+**结论（细节与地址见 `docs/reference/cla-registers.md`）：**
 
 1. 端口表 `s_aclPortExtIdxTblMap` 在 `.rodata` 0x1cd8（24×{port,idx}）：
    `0→1, 1→2, 2→3, 3→4, 4→5, 5→8, 0x10..0x17→6, 0x18..0x1f→7`。**编译期常量，运行时无人写它**；
@@ -833,10 +833,10 @@ inport 2 的 60 B 表项:
    = PON 侧、多一个 bit3）、`w3=0`、`w1=0xf513e100`、**key 只有 w4..w6 三个字**；
    驱动写的是 `w0=0x03003044`（flow=1、egress=3=lan1）、`w3=0x80000000`、
    `w4..w14` = 40 字节 19 窗口 key。两边唯一相同的是 `w2=0x00000608` 和 byte16=`0x43`。
-3. 真机侧：按 `docs/vendor-cla-extract-index-2026-10-30.md` §4.4 原样 provision
+3. 真机侧：按 `docs/reference/cla-registers.md` §4.4 原样 provision
    （index 3 + rule 56 + `v6_key=0x38` + entry `0x43`）后，v6 分类器**确实被唤醒**——
    但帧被吃掉（回程 0、CPU 不涨），铺满 0..519 槽也一样。读数与解释：
-   `docs/vendor-v6-entry-format-2026-10-31.md`。
+   `docs/reverse/cla-v6-offload.md`。
 
 坑（别踩第二次）：168 B 会话里的 IPv6 地址是掩码编码（`00 40 03 00 50 ...`），不是
 `fd99...` 原始字节，所以"改地址再 dump 看哪几个字变"在仿真里做不成；`t_extidx.py flow`
@@ -881,6 +881,6 @@ docker run --rm -e TRACE_ARGS=1 -e DUMP_LR=1 -v "$KO":/ko:ro -v "$PWD":/w -w /w 
   参数是 `(out, tmp, regid, 1)`，`outspace cfg` 就是 ONU reg 0xd。
 * `redis.py` —— 就是原来那份 capstone 反汇编小工具（文件名不能叫 `dis.py`，会顶掉标准库）。
 
-结论与复现命令写进 `docs/ppe-ipv6-external-hash-2026-10-31.md`；一句话：外部表的落点是
+结论与复现命令写进 `docs/history/2026-10-31-ppe-ipv6-external-hash.md`；一句话：外部表的落点是
 `phys 0x20000 + 64*addr`，落盘时每 8 字节一组逆序，而本板那里是启动 ROM 的别名、
 写会 external abort——CLA 的 v6 单播快表在这块板上没有存储。
