@@ -571,8 +571,11 @@ dmesg | grep -i "cacheable packet pool"   # 没有这行 = 分配成功（有这
 1. 若 §6 收益符合预期，下一刀砍**固定成本 6.1 µs**：发包侧 `TX_START` 批量化（每 N 包一次
    寄存器写）、BMU 申请/释放从"每包一次锁 + MMIO"改成软件自由链表 + 批量归还。
 2. 再看把桥接出口（`br-lan`）换成端口直出（`rxdev/txdev` 缓存），省一次 FDB 查找。
-3. ~~才有必要考虑 fkb 式零拷贝~~ **已做**：`docs/history/2026-10-30-zero-copy.md`。
+3. ~~才有必要考虑 fkb 式零拷贝~~ **已做，但已回退/搁置（交付态 `zc_mask=0`，2026-11-03 更正）**：
+   `docs/history/2026-10-30-zero-copy.md`。
    skb 直接 `build_skb()` 池内缓冲，析构时把 bp 送进隔离环延迟归还；池缓冲的三种归属
    （FREE/SKB/DROPQ/TX）、`ZX_ZC_OUT_MAX` 闸门、GRO 必须关、`tx_queue_len` 必须小，
-   都在那篇里。默认开、LuCI「网络 → 转发加速」可关。
+   都在那篇里。~~默认开、LuCI「网络 → 转发加速」可关。~~〔原文如此，已不成立：它在本机终结路径上
+   损坏数据（20 MB 上传 10 次坏 2 次），交付态已回退，`uci e2631.fastpath.zerocopy` 废弃——
+   见 [v6-software-fastpath.md](v6-software-fastpath.md) §6 与 [2026-10-30-zero-copy.md](../history/2026-10-30-zero-copy.md) 文件头〕
 

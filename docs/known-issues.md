@@ -975,10 +975,17 @@ points at something in the repository or at a measurement.
     flow_offloading=0 -> 310 Mbit/s and Ip6OutForwDatagrams +338939 (every packet through
     ip6_forward); flow_offloading=1 -> 392-412 Mbit/s and +~200 (the flowtable carries v6);
     L2 control lan<->lan 929/942 Mbit/s with 0 % sirq; box terminating 4 streams 451 Mbit/s
+    (that one is **local receive, not forwarding**; 本机终结口径，不可比 - do not compare it with
+    any forwarding throughput)
   cause: |
-    There is no hardware fast path for v6 on this SoC (the PPE classifier does not take v6 -
-    docs/history/2026-10-31-ppe-ipv6-external-hash.md), so the data plane is always driver RX ->
-    stack -> driver TX. The per-packet cost of zx279128s-eth (BMU free with spinlock + MMIO,
+    There is no hardware fast path for v6 on this SoC ~~(the PPE classifier does not take v6 -
+    docs/history/2026-10-31-ppe-ipv6-external-hash.md)~~, so the data plane is always driver RX ->
+    stack -> driver TX. [2026-11-03 correction: that parenthetical is wrong - the PPE/CLA v6 lookup
+    does hit: all 6 armings gave ag=1 with reproducible hit slots (161/45 ... 177/189). What fails is
+    after the hit - the frames are swallowed and forwarding never completes (armed 9/9 flows dead;
+    withdrawing the arm restores 735-754 Mbit/s). So "no hardware fast path" holds only in the sense
+    of "no working one". Raw records not committed.]
+    The per-packet cost of zx279128s-eth (BMU free with spinlock + MMIO,
     a 1.5 KB memcpy per RX into napi_alloc_skb, another copy per TX, no checksum offload)
     puts the saturation point near 400 Mbit/s for 8 streams, with both cores still below
     100 % - i.e. the ceiling is per-packet cost, not a single pegged core.

@@ -68,13 +68,18 @@ supersedes:
 
 ### 原厂 vs 我们
 
-| 段 | 原厂 | 我们 |
-|---|---|---|
-| 摘帧点 | `netif_receive_skb_sk` **之前**（FFE 先判） | 必经 `netif_receive_skb → bridge/nft/conntrack` |
-| 命中后 | 直接交硬件发送 | 走完协议栈再 `dev_queue_xmit` |
-| 发送队列 | FFE 私有 napi + per-CPU 队列，未走 `netif_napi_add` | 五口共享环 + `tx_lock`，每描述符一次门铃 |
-| 成本 | 转发 0 拷贝，≈4.7–7.7 µs/包（推算），900M 用 0.4 核 | 0 拷贝，驱动内 5.1+1.7 µs，整栈 13.18 µs/包 |
-| IPv6 | NPU `hit:0`，CPU 软件快转；NAT66 不支持 | 纯软件栈 + zc（598–722 Mbit/s） |
+> **口径先行（2026-11-03 补）**：下面这张表原来只有三列，"我们"那一列没说清在讲哪条臂。同一列里
+> 混了**源码/反汇编事实**、**已回退的 zc 臂**（交付态 `zc_mask=0`，见本文文件头 summary 与
+> [v6-software-fastpath.md](v6-software-fastpath.md) §6）和**本机接收口径**，原厂侧那个 µs 又只是
+> **反算区间**。逐行的口径见第 4 列；**µs 类数字只在同一口径内可比**。
+
+| 段 | 原厂 | 我们 | 口径（这条讲的是哪条臂 / 什么证据） |
+|---|---|---|---|
+| 摘帧点 | `netif_receive_skb_sk` **之前**（FFE 先判） | 必经 `netif_receive_skb → bridge/nft/conntrack` | 两侧都是**代码/反汇编事实**、不是实测吞吐：原厂=本节「五」的静态反汇编（`ffe_backlog_poll`）；我们=我方驱动/协议栈源码路径 |
+| 命中后 | 直接交硬件发送 | 走完协议栈再 `dev_queue_xmit` | 同上，代码/反汇编事实。注意原厂"直接交硬件发送"是**驱动 ops**，本节「五」已写明 skb 形态出口仍过 qdisc |
+| 发送队列 | FFE 私有 napi + per-CPU 队列，未走 `netif_napi_add` | 五口共享环 + `tx_lock`，每描述符一次门铃 | 原厂=静态反汇编（本节「五」）；我们=**源码事实**：`tx_lock` 见 `zx279128s-accel.c:2984`；一门铃一描述符是**实测**（§2.5：批量提交后退化成三秒一个包）。**「五口共享环」一句在本仓文档里没有出处 ⇒ 口径未注明（待补）** |
+| 成本 | 转发 0 拷贝，≈4.7–7.7 µs/包（推算），900M 用 0.4 核 | 0 拷贝，驱动内 5.1+1.7 µs，整栈 13.18 µs/包 | **三个数三种口径，互不可比**：原厂 4.7–7.7 = `sirq%÷kpps` **反算区间**、**转发**口径（[vendor-ipv6-behavior.md](../reverse/vendor-ipv6-behavior.md) §8.4 第 1 条，"0.4 核"同段推算）；我们 5.1+1.7 = **已回退的 zc 臂**的驱动内 RX/TX 计时（[ffe-fastpath.md](ffe-fastpath.md) §6 读法第 2 条）；我们 13.18 = **本机接收**口径（1400 B、300 M UDP 灌包，sirq 增量 ÷ `lan1` 收包数，[ffe-fastpath.md](ffe-fastpath.md) §6），**不含转发与再发送** |
+| IPv6 | NPU `hit:0`，CPU 软件快转；NAT66 不支持 | 纯软件栈 + zc（598–722 Mbit/s） | 原厂=上机读 NPU 命中计数（[vendor-ipv6-behavior.md](../reverse/vendor-ipv6-behavior.md) §8.4 第 4 条）+ `CONFIG_CSPKERNEL_NPU_SUPPORT_NAT6 is not set`（同文 `:699`）；我们 598–722 = **已回退的 zc 臂**的 8 流 TCP **转发** A/B（§3 选项 4 的代价段），不是交付态数字 |
 
 ---
 
