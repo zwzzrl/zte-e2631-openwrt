@@ -1,0 +1,208 @@
+---
+title: FFE 楔死归因结案：kexec × kernel-only 构建的 #N 内核
+date: 2026-11-02
+status: done
+topic: flash-boot
+summary: 楔死只出现在 kexec × kernel-only 的 #N 内核；#0 与 #16 冷启动均不楔死。
+evidence: .scratch/ffe-fastpath/kexec-contam/20261102-2025/RESULT.md, .scratch/ffe-fastpath/kexec-zero/20261102-2020/RESULT.md, .scratch/ffe-fastpath/flash-head/20261102-2130/RESULT.md, .scratch/ffe-fastpath/STATUS.md
+supersedes:
+---
+
+# FFE 楔死归因结案（kexec × kernel-only `#N` 内核）
+
+> 日期：2026-11-02。范围：ZXHN E2631（ZX279128S）自研固件的驱动内 FFE 快路楔死。
+> 结论性质：今日上机实测（2×2 对照）+ 既有台账横比；本文不再增补新实验。
+> 口径：源码行号来自本仓 HEAD `2dab71d`；盒子交付态是 P10.5（`623a812`，`image-p10.5.bin`）。
+> 两者不一致处逐句注明；`.scratch/` 下的过程日志只以文字路径引用，不作链接。
+> 缩写：`A/` = `.scratch/ffe-fastpath/`；文中未写前缀的 `kexec-contam/…`、`kexec-zero/…`、
+> `flash-head/…`、`kexec-run/…`、`regression-evidence/…` 均指 `A/…`。
+
+## §0 结论
+
+**楔死的变量是「kexec × kernel-only 构建的 `#N` 内核」这个组合，不是其中任一单因子。**
+
+| 启动方式 \ 内核 | `#0`（整镜像构建戳） | `#N`（kernel-only 构建戳，N≥2） |
+|---|---|---|
+| **冷启动**（刷槽/reboot） | **好**：11 个刷机冷启动现场 0 楔死（`.scratch/ffe-fastpath/STATUS.md:519`）；本日收尾复核健康（`kexec-contam/20261102-2025/RESULT.md` §6） | **好**：plain `#16` 冷启动 **6/6** 存活（`flash-head/20261102-2130/RESULT.md` §3） |
+| **kexec** | **好 5/5**：A1/A2/A3（`kexec-contam/20261102-2025/RESULT.md` §1）+ 旧 S2/S3（`kexec-run/20261102-0012/RESULT.md:28-29`） | **楔死**：B1（D2=`#19`，`kexec-contam/20261102-2025/RESULT.md` §2–§3）+ plain `#16` 08:38 现场（`.scratch/ffe-fastpath/STATUS.md:471`） |
+
+1. **kexec 单独不成立**：同一颗「冷启动从不楔死」的 `#0` 内核，用 kexec 起来 A1/A2/A3 3/3 全活，
+   加上更早的 S2/S3 两次成功自举，合计 **5/5**（`kexec-contam/20261102-2025/RESULT.md:11`、
+   `kexec-run/20261102-0012/RESULT.md:28-29`）。
+2. **`#N` 单独不成立**：plain `#16` 刷进 slot1 冷启动 6 轮，每轮 uptime 45–49 s 起 100 Mbps v6 单流 120 s，
+   吞吐全部 1.40 GBytes / 100 Mbits/sec，`30:` 与 `rxq0 consumed` 双快照都在涨 ⇒ **0/6 楔死**
+   （`flash-head/20261102-2130/RESULT.md` §3 的 R1–R6 表）。
+3. **组合成立**：今日两次合格楔死现场都同时满足「kexec 换核」与「受试内核是 kernel-only 构建的 `#N`」：
+   B1 是 D2=`#19`（`kexec-contam/20261102-2025/RESULT.md:12,31,35`），plain `#16` 那次在 08:38
+   以串口抓到同样的冻结现场（`.scratch/ffe-fastpath/STATUS.md:471`）。
+4. **`#0` / `#N` 是构建戳，不是日期**：`#0 SMP Mon Oct 12 17:14:44 2026` 是整镜像构建钉死的常量，
+   与真实构建日期无关；`#N`（N≥2）才是 kernel-only 构建的计数器（见 §2）。
+5. **「HEAD 族内核有楔死缺陷」作为独立命题作废**：它的证据是「10 例楔死全在 HEAD 系」，
+   但那 10 例**全部发生在 kexec 之后**，而「HEAD 内核 + 冷启动」这一格当时的样本数是 0
+   （`.scratch/ffe-fastpath/STATUS.md:519,541`）。补上这一格后是 6/6 不楔。
+6. **下游影响**：交付物 P10.5 是 `#0` 整镜像冷启动，从未被污染；被污染的是**取证方法**（见 §7）。
+
+## §1 2×2 事实表逐格证据
+
+### 1.1 `#0` 冷启动：好
+
+- 历史台账：11 个「刷机冷启动」现场的内核全是交付 `#0`，**0 楔死**
+  （`.scratch/ffe-fastpath/STATUS.md:519`，转引 `A/regression-evidence/20261102-2000/EVIDENCE.md` §1/§4/§10）。
+- 本日收尾：B 臂最后一次复位回 `#0`，`uname -v = #0 SMP Mon Oct 12 17:14:44 2026`，uptime 129→152 s，
+  `30:` 2562→2587，`lan1 rx` 967849→977209，dmesg 异常 0
+  （`kexec-contam/20261102-2025/RESULT.md` §6）。
+- 交付态恢复到 `#0` 的过程见 `flash-head/20261102-2130/RESULT.md` §7.3：slot1 刷回 P10.5（serial 63），
+  `uname -v` 同上，v6 单流 100 Mbits/sec 下 `30:` 248→3314、`consumed` 402→106732。
+
+### 1.2 `#0` + kexec：5/5 好
+
+| 轮 | kexec 后真换核证据 | 判活（两次快照） | 出处 |
+|---|---|---|---|
+| A1 | 串口 `Starting new kernel` + `Bye!`；boot_id 变；uptime 352.22→26.28 | uptime 67.10→165.22：`30:` 194→261、`consumed` 1246→1347 | `kexec-contam/20261102-2025/RESULT.md:23` |
+| A2 | 同上；uptime 329.13→27.91 | 56.53→128.46：`30:` 212→217、`consumed` 487→493 | 同文件 `:24` |
+| A3 | 同上；uptime 135.73→27.87 | 56.47→128.41：`30:` 201→206、`consumed` 1266→1272 | 同文件 `:25` |
+| S2 | boot_id 00094bfc→ca817cf8，uptime 归零 | 活 ≈108 s；v4 四流 926 Mbit/s | `kexec-run/20261102-0012/RESULT.md:28` |
+| S3 | boot_id ca817cf8→fe5cbae9，uptime 归零 | 活 ≈4770 s；600 s v6 长稳 59.52 GB / 4558 万帧 / 均值 793.5 | `.scratch/ffe-fastpath/STATUS.md`（20:10 追加 AN） |
+
+- A1/A2/A3 的 `consumed` 增量很小（A2/A3 各 +6、A1 +101）是**零流量**任务书下的正常值：只靠后台 wifi/lan2 流量驱动，
+  判活本来就压在 `30:` + `consumed` + SSH 可达三项上（`kexec-contam/20261102-2025/RESULT.md` §5.3）。
+- 结论：**kexec 换核本身不是楔死的充分条件**；用 `#0` 整镜像内核走 kexec 没有楔死样本。
+
+### 1.3 `#16`（HEAD，plain）冷启动：6/6 好
+
+- 6 轮 R1–R6，回 SSH 的 uptime 25.95–27.91 s，起流 uptime 45.80–49.16 s，120 s 单流全部
+  `1.40 GBytes / 100 Mbits/sec`；每轮 t0/t1 两次快照间隔 60.8–62.3 s，`consumed` 与 `30:` 两个都在涨，
+  最小增幅分别是 `consumed +635600`、`30: +23174`；每轮 `dmesg | grep -ciE 'oops|panic|BUG:|stall' = 0`
+  （`flash-head/20261102-2130/RESULT.md` §3）。
+- 统计边界：若以历史约 1/2 命中率作先验，6 轮全活的死概率上界约 1.6%；n=6 仍在噪声内，不能外推到任意负载
+  （同文件 §4.1）。本实验只覆盖 45–49 s 起流、100 Mbps、单一台子。
+
+### 1.4 `#16` + kexec：楔死
+
+- **plain `#16`（P1）**：08:38 装 P1（`#16`，sha MATCH），起流 uptime 47.89，A 臂零接触；
+  约 30 s 后整机网络不可达，串口两次快照间隔 90 s，`rxq0 consumed 2121→2121`、`/proc/interrupts 30: 0 608→0 608`
+  逐字冻结（`.scratch/ffe-fastpath/STATUS.md:471`）。
+- **D2（`#19`，带只读插桩）**：B1 全程 SSH 一次都没成功连上，楔死点 ≤ uptime ≈38 s，且发生在任何成功接触与
+  任何流量之前（`kexec-contam/20261102-2025/RESULT.md:58`）；现场见 §4。
+- 两例都指向同一格：「kexec 换核」+「kernel-only `#N`」。`#19` 是 `#16` 同族的后续 kernel-only 构建，
+  两者不能拿来互相证否（构建戳不同，见 §2）。
+
+## §2 `#0` 与 `#N` 是两种构建戳，不是两个日期
+
+- **`#0` 是整镜像构建戳**：`#0 SMP Mon Oct 12 17:14:44 2026` 由整镜像构建的
+  `KBUILD_BUILD_VERSION=0` 与 `KBUILD_BUILD_TIMESTAMP` 钉死；因此**所有整镜像内核都自称 `#0`**，
+  与真实构建日期无关。旁证：同一版本串下 p10 与 p10.2 的 uImage `Data Size` 不同（3502967 vs 3506359）
+  ⇒ 用版本串判镜像新旧是无效判据（`.scratch/ffe-fastpath/STATUS.md` 20:10 追加 AI/AJ，
+  转引 `regression-evidence/20261102-2000/EVIDENCE.md` §6/§10）。
+- **`#0` 也是 uImage 头里的时间**：`ih_time = 1791825284` 正好换算为 `2026-10-12 17:14:44 UTC`，
+  与内核 banner 一字不差；这不是 `#0` 的构建日期，而是整镜像构建时钉死的时间戳
+  （`kexec-zero/20261102-2020/RESULT.md` §1）。
+- **`#N`（N≥2）是 kernel-only 构建戳**：只编内核时 `.version` 递增；`#16 SMP Sun Nov 1 23:54:31 UTC 2026`
+  （`flash-head/20261102-2130/RESULT.md` §2）、`#19 SMP Mon Nov 2 00:18:56 UTC 2026`
+  （`kexec-contam/20261102-2025/RESULT.md:31`）才是真实构建时刻。
+- **作废的推理链**：曾把 `#0` 当成「10-13 的旧代码对照物」，据此判「是后来的 HEAD 改动引入的楔死」。
+  前提错（`#0` 不是旧代码，而是整镜像构建戳），整条结论作废；「`#0` 是旧代码对照物」这句话本仓文档里不许再用
+  （`.scratch/ffe-fastpath/STATUS.md` 20:10 追加 AI 的撤回段）。
+
+## §3 运行规则（由此 2×2 直接得出）
+
+1. **iter 出来的 `#N` 内核一律冷启动刷写，禁止 kexec。** 冷启动这一格已 6/6；kexec 这一格已有两次合格楔死现场。
+2. **kexec 只对 `#0` 整镜像内核安全**（5/5）。即便如此，kexec 不是冷启动：它会继承上一内核的脏硬件状态，
+   不能把 kexec 后的结果当「冷启动基线」（`kexec-zero/20261102-2020/RESULT.md` §7.1）。
+3. **kexec `#N` 得出的数据全部作废**：用户 2026-11-02 19:51 已拍板「若确认 kexec 污染，后面全部抛弃 kexec，
+   kexec 得出的数据全部报废」（`.scratch/ffe-fastpath/STATUS.md:549`）。需要这些结论的场合，用冷启动重做。
+4. **交付态不动**：P10.5（`623a812`）就是 `#0` 整镜像，slot1 现为 serial 63 的 P10.5，slot0 原厂未动
+   （`flash-head/20261102-2130/RESULT.md` §7.3）。
+
+## §4 楔死现场特征（B1，D2/`#19`，kexec 那次）
+
+| 时刻（host） | uptime | `30:` | `consumed` | `tx_submitted:completed:pending` | `lan1 rx:tx` |
+|---|---|---|---|---|---|
+| 20:34:06 | 424.73 | **18** | **914** | 98:49:49 | 2073:9220 |
+| 20:35:20 | 498.75 | **18** | **914** | 102:49:53 | 2073:9400 |
+
+- 两对快照的间隔分别是 **74 s** 与 **30 s**，`30:`/`consumed`/`tx_completed` 逐字不动
+  （`kexec-contam/20261102-2025/RESULT.md:48-55`）。
+- **不是脏态**：脏态要求 `30: 0 0` + `consumed=0` + `lan1 rx=0` + `bp_rx_used=0`；这里 `consumed=914`、
+  `30:` 到过 18、`lan1 rx=2073` ⇒ 帧投递过之后才停（同文件 `:56`、`:96`）。
+- **零成功 SSH、零流量**：全程一次成功 SSH 都没有；楔死点 ≤ uptime ≈38 s，发生在任何成功接触与任何流量之前
+  （同文件 `:58`、`:97`）。
+- **三刀全部无效**：`trap_override=0x080086dd`、`rmmod zx279128s_ppe`、`ffe_bp_drop=0` 之后，
+  `30:`/`consumed` 的四个读数**完全相同（18/914 ×4）**（同文件 `:63-71`）。
+- **`trap_override` 确实写穿了硬件**：`spa_trap_eth_type` 读回 `000086dd → 080086dd → 00000000`，
+  `match` 同步 `1→0→0`，楔死态与健康态各验证一次（同文件 §4）⇒ 第一刀的「无效」是有效结论，
+  不是「刀没落到」。
+- **判读**：帧死在 PPE 分类器之前那条路（MAC/TM/BMU → RX 环），或该状态只有硬件复位能清；
+  与 PPE 引擎表、与 A3 的 `ffe_bp_drop` 丢帧路径都无关（同文件 `:13`）。
+- **边界**：B1 是 `#19` 的样本；plain `#16` 的 08:38 现场同型（§1.4）。这两例不能区分「`#N` 内核本身的缺陷」
+  与「`#N` × kexec 脏硬件状态的交互」——机制未定，**待裁决**。
+
+## §5 踩坑：今天实测打穿的三条工具坑
+
+### 5.1 `sysupgrade` 的包后缀必须是 `.bin`，`.pkg` 会被 `platform_check_image` 拒
+
+- 现场原文（`flash-head/20261102-2130/RESULT.md` §1.2）：
+  ```
+  upgrade: Image metadata not present
+  This board upgrades with the factory-format .bin (or: e2631-upgrade run)
+  Image check failed.
+  ```
+- 根因是**按文件名**匹配：`overlay/target/linux/sanechips/base-files/lib/upgrade/platform.sh:31-47` 的
+  `case "$1" in *.bin)` 只收 `.bin`，`.pkg` 落到 `*)` 分支并返回 1。
+- 后果：`validate_firmware_image` 判 `valid=false`，**不写 flash**（首次下发后 serial 仍 61、uptime 连续）；
+  `cp` 成 `.bin` 后 `valid:true` 才刷成功（同文件 §1.2）。
+- 规矩：下发前只改后缀不够保险，必须让 `validate_firmware_image` 打出 `valid:true` 再刷。
+
+### 5.2 `/dev/mtdN` 是字符设备，`test -b` 永远为假
+
+- `ls -l`：`crw------- 90,10 /dev/mtd5`、`crw------- 90,12 /dev/mtd6`；用 `test -b` 判设备存在，
+  `DEV-OK` 永远打不出来。改用 `test -c` ⇒ `DEV-OK-CHAR`（`flash-head/20261102-2130/RESULT.md` §1.3、
+  §7.1）。
+- 这条会伪装成「设备不存在」而中止刷机/校验，实际设备好着。
+
+### 5.3 v4 流量不能当「数据面活着」的判据
+
+- v4 走硬件 flow offload（`accel_ipv4` 首行 = `hw`），CPU 不碰帧：10 s / 100 Mbps 只让
+  `consumed 453→487（+34）`、`30: 262→285（+23）`
+  （`flash-head/20261102-2130/RESULT.md` §1.4）。
+- v6 同条件走 FFE 软件逐帧：`consumed 639→121280（+120641）`、`30: 388→3360（+2972）`（同处）。
+- 后果：**健康态在 v4 配方下也会「双冻结」**，会把健康轮误判成楔死。判活必须用 v6 配方，
+  不能拿 v4 的 `consumed`/`30:` 增量当生命体征。
+
+## §6 判活三项（v6 配方下）
+
+1. `/proc/interrupts` 的 `30:` 在涨；
+2. `/sys/kernel/debug/92000000.ethernet/dma_state` 的 `rxq0 consumed` 在涨；
+3. SSH 可连。
+
+配套要求：两次快照间隔 ≥60 s；SSH 最早也要 uptime **26.3–27.9 s** 才活（2026-11-02 kexec 轮次 6 次实测
+26.28 / 27.91 / 27.87 / 26.86 / 26.74 / 26.75），所以「uptime 25 s 去摸一条只读 SSH」物理上做不到
+（`kexec-contam/20261102-2025/RESULT.md` §5.2）。
+
+**零流量下 `tx_completed` / `lan1 rx` 天然不涨**（A2/A3/B2/B3b/B4 的 72–82 s 窗口里 `lan1 rx` 完全没涨），
+不能当独立判据（同文件 §5.3）。v6 配方（120 s / 100 Mbps 单流）原文见
+`flash-head/20261102-2130/RESULT.md` §1.4：`iperf3 -6 -c <台架服务器 ULA> -B fd00:5::251 -C cubic -b 100M -t 120 --cport <新端口>`。
+
+## §7 下游影响
+
+- **未被污染**：交付物 P10.5 是 `#0` 整镜像**冷启动**（11/11 台账 0 楔死）；本日另有 `#16` 冷启动
+  6/6 对照。产品本身没有 kexec 楔死样本。盒子现态是 slot1 P10.5 / `#0`，slot0 原厂未动。
+- **被污染的是取证方法**：kexec `#N` 的观测（含由此得出的「HEAD 族内核有缺陷」「轮询/接触触发楔死」等）
+  一律按作废处理；需要保留的结论必须用冷启动重做（§3）。
+- **仍开的缺口**：① 楔死机制（`#N` 缺陷 vs `#N` × kexec 脏态）未定；② `#16` 冷启动 n=6、只覆盖单台子与
+  100 Mbps；③ 无物理断电条件下没测「内核早期（<25 s）接触」；④ 上游驱动与本板改动的归属按四分类另行核对，
+  本文不展开。
+
+## §8 证据索引
+
+| 文件（文字路径，不作链接） | 内容 |
+|---|---|
+| `.scratch/ffe-fastpath/kexec-contam/20261102-2025/RESULT.md` | 今日 A 臂 3 轮 + B 臂 4 轮 + B1 三刀 + 寄存器写穿 |
+| `.scratch/ffe-fastpath/kexec-contam/20261102-2025/logs/B1-*.txt`、`KNIFE-B1.txt` | 楔死现场、三刀、trap 寄存器验证原文 |
+| `.scratch/ffe-fastpath/kexec-zero/20261102-2020/RESULT.md` | `#0` zImage 提取、uImage 头、`#0` 戳来源 |
+| `.scratch/ffe-fastpath/kexec-run/20261102-0012/RESULT.md:28-29` | 旧 S2/S3 两次 `#0` + kexec 成功自举 |
+| `.scratch/ffe-fastpath/flash-head/20261102-2130/RESULT.md` | `#16` 冷启动 6/6、`.bin`/mtd/v4 三坑、刷机与回滚 |
+| `.scratch/ffe-fastpath/STATUS.md:471,519,541,549` | plain `#16` kexec 楔死、冷启动/kexec 共线台账、用户作废令 |
+| `.scratch/ffe-fastpath/regression-evidence/20261102-2000/EVIDENCE.md` §6/§10 | 整镜像 `#0` 构建戳钉死的原始证据 |
+| `overlay/target/linux/sanechips/base-files/lib/upgrade/platform.sh:31-47` | `.bin` 后缀检查的源码 |
+| `overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128s-main.c:3537` | debugfs 目录 = `dev_name(adapter->dev)` |
