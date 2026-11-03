@@ -17,3 +17,6 @@ target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128s-ppe.c
 # 老的 fastpath uci-defaults（种 e2631.fastpath.zerocopy=1）换成只保证
 # /etc/config/e2631 存在的 61_e2631_config；老文件留着会继续种一个没人读的键。
 target/linux/sanechips/base-files/etc/uci-defaults/61_e2631_fastpath
+# 台架专用的 63_e2631_mgmt_ra_defaults 已移出仓库（它会重建 192.168.5.1 管理网，
+# 不该影响别人的默认配置）；旧树里那份仍会被打进镜像，必须删掉。
+target/linux/sanechips/base-files/etc/uci-defaults/63_e2631_mgmt_ra_defaults
