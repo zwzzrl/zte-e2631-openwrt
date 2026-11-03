@@ -254,16 +254,51 @@
 
 /* DMA descriptor rings */
 #define ZX_NUM_TX_DESC		1024
-#define ZX_TX_QUEUE_LIMIT	256
+/* FIX1：BMU 空闲表满时"待归还"bp 的环形队列深度（每轮 NAPI 最多排 4 个） */
+#define ZX_BMU_DEFER_MAX	32
+/*
+ * P1（tx-lock-scope）：发送环深度限值从编译期常量（原 #define 256）改成
+ * 运行期参数。
+ *
+ * 默认值 1024 是**实测/经验取值 + 环长上限**，不是"对齐原厂"：
+ *  - 本板实测 tx_pending 峰值只有 64（限 256 时），256 不是约束
+ *    （.scratch/ffe-fastpath/vendor-sw-pipeline/20261103-0100/PIPELINE.md:240）；
+ *  - 1024 = ZX_NUM_TX_DESC 就是环长，是本参数能取的最大值（再大就会在
+ *    描述符在飞时覆盖槽位）；它让 A/B 时能看到"完全不限"的那一端；
+ *  - 原厂 txq_max=0x400 是 per-CPU 软件 backlog 的 b->qlen，**不是** DMA
+ *    环占用（PIPELINE.md Q3：ldr r2,[r5,#4]; ldr r3,[r4,#8]; cmp r3,r2），
+ *    量纲不同、满了就丢帧，所以**不能**拿它当"我方环深应设 1024"的证据。
+ * 首次上机建议先在 256 跑一轮、再切 1024 做 A/B。允许运行期改：
+ *
+ *   echo 1024 > /sys/module/zx279128s_eth/parameters/txq_limit
+ *
+ * 取值 [ZX_TX_QUEUE_MIN, ZX_NUM_TX_DESC]：上限就是环长 —— 再大 tx_pending
+ * 就能越过 ZX_NUM_TX_DESC，写描述符时会覆盖还在飞的槽位。写入口在
+ * zx279128s-main.c（module_param_cb 带范围校验），读侧一律
+ * READ_ONCE(zx_txq_limit)。
+ */
+#define ZX_TX_QUEUE_MIN		64
+#define ZX_TX_QUEUE_DEFAULT	1024
+extern unsigned int zx_txq_limit;
 #define ZX_TX_POLL_US		250	/* see zx_tx_kick() */
+/*
+ * FIX1（复审 BLOCKER）：BMU 申请失败后的处置参数。
+ *  - RETRY_MIN/MAX：同一次 xmit 内允许的探测次数（实际取值还按环空位裁，
+ *    见 zx_tx_alloc_retry_cnt()）；单帧 MMIO 预算 ≤ 2 × 8 拍。
+ *  - STARVE_MAX_POLLS：停口后最多探测几轮 NAPI（64 × 250 µs ≈ 16 ms），
+ *    到点即使 BMU 还没恢复也放开队列，保证没有任何"永久停住"的口。
+ */
+#define ZX_TX_BP_RETRY_MIN	1
+#define ZX_TX_BP_RETRY_MAX	2
+#define ZX_TX_STARVE_MAX_POLLS	64
 
 /*
  * The RX interrupt comes after this many frames, or this long after the
  * first one.  Larger batches cost less per frame: 500 us receive faster
  * than polling every 1 ms did and still answer sooner.
  */
-#define ZX_RX_IRQ_FRAMES	64
-#define ZX_RX_IRQ_USECS		500
+#define ZX_RX_IRQ_FRAMES	16	/* 我方改：本板实测最优 16（上游/基线 64） */
+#define ZX_RX_IRQ_USECS		250	/* 我方改：本板实测最优 250（上游/基线 500）；开机由 /etc/config/zx_ffe 覆盖 */
 #define ZX_NUM_RX_DESC		1024
 #define ZX_DESC_SIZE		16	/* bytes per descriptor */
 
@@ -743,6 +778,140 @@ struct zx_alias_snap {
 	u8	head[64];	/* 池里帧的前 64 B（以太头 + IP 头前若干字节） */
 };
 
+/* ---- DIAG：诊断插桩（2026-11-03，全部默认关） -----------------------
+ *
+ * 目标是回答"单流的包在盒内被怎么延迟、怎么乱序、怎么丢"，所以本组插桩
+ * **只读、只计数**，不参与任何转发判据，默认全关时每条插桩点的代价是
+ * "ldr + tst + beq" 三条指令（地址在 .data 里，永远命中缓存）。
+ *
+ * 开关：每项一个 module_param（默认全 0），写进去只改 zx_diag_mask 的
+ * 一位；热路径读的是这一个 u32，所以关掉时既有分支的方向、顺序、
+ * 结果一个字节都不变。参数名见 zx279128s-main.c 的 diag_* 一组。
+ *
+ * 输出：debugfs 的 `diag`（0444，只读）。
+ */
+#define ZX_DIAG_B_RESIDENCE	BIT(0)	/* 1. 盒内停留：RX 快路入口 -> TX 提交成功 */
+#define ZX_DIAG_B_SEQ		BIT(1)	/* 2. TCP seq 反演：RX 入口 / TX 提交各一张表 */
+#define ZX_DIAG_B_POLL		BIT(2)	/* 3. 每 NAPI poll 处理/转发帧数 */
+#define ZX_DIAG_B_TXQ		BIT(3)	/* 4. TX 环占用 + 限流挡回 */
+#define ZX_DIAG_B_TXLAT		BIT(4)	/* 5. TX 完成延迟：TX_START -> reclaim 见到完成 */
+#define ZX_DIAG_B_DROP		BIT(5)	/* 6. 丢点逐项（新增 rx_drop_nondev/down/skb_nomem） */
+#define ZX_DIAG_B_BURST		BIT(6)	/* 8. 每出口突发长度 + 突发空档 */
+
+/* 时间桶：<1us，然后 [1,2) [2,4) … [512,1024) us，[1024us,1ms)，>=1ms */
+#define ZX_DIAG_TBUCKETS	13
+/* TX 环占用桶：0-1、2-3、4-7 … 512+（10 桶） */
+#define ZX_DIAG_QBUCKETS	10
+/* 每 poll 帧数桶：0..63 逐值 + 64+ */
+#define ZX_DIAG_PBUCKETS	65
+/* 每出口突发长度桶：0..15 逐值 + 16..31 + 32+ */
+#define ZX_DIAG_BBUCKETS	18
+/* seq 反演表：**每方向** 1024 槽（两向各一张，见 struct zx_diag 的注释） */
+#define ZX_DIAG_SEQ_SLOTS	1024
+
+/* 丢点原因（严格一项一格，不合并；打印名见 main.c 的 zx_diag_dlabel[]） */
+enum zx_diag_drop {
+	ZX_DIAG_DROP_RX_NONDEV = 0,	/* 新增：dest_dev == NULL（端口越界/未 probe） */
+	ZX_DIAG_DROP_RX_DOWN,		/* 新增：dest_dev 存在但 !IFF_UP */
+	ZX_DIAG_DROP_SKB_NOMEM,		/* 新增：napi_alloc_skb 失败（dev 还在） */
+	ZX_DIAG_DROP_FFE_RX_DROP,	/* accel.c：已改写、提交失败，只能丢 */
+	ZX_DIAG_DROP_QFULL,		/* accel.c #19：环满回栈（ffe_qfull_drop=0） */
+	ZX_DIAG_DROP_QFULL_DROP,	/* accel.c #19：环满直接丢（ffe_qfull_drop=1） */
+	ZX_DIAG_DROP_TXQ_BLOCK,		/* main.c：zx_tx_submit_bp 被 txq_limit 挡回 */
+	ZX_DIAG_DROP_TXQ_BUSY,		/* main.c：xmit 环满 NETDEV_TX_BUSY 回栈 */
+	ZX_DIAG_DROP_N
+};
+
+/*
+ * seq 反演表项：tag = 5 元组哈希（32 位），seq = 上次见到的 TCP seq。
+ * "上次"按哈希槽维护，冲突**只计数不纠正**（任务书要求）：tag 不同就当成
+ * 新流覆盖，并把这一格记进 coll；tag 相同才比 seq。
+ */
+struct zx_diag_seq {
+	u32		tag;
+	u32		seq;
+};
+
+/*
+ * 全部诊断状态。**独立分配**（probe 里 devm_kzalloc，不是内嵌进 adapter），
+ * 这样默认关掉时 struct zx_eth_adapter 里只多一个指针，既有字段偏移一个
+ * 都不动；分配失败时 diag == NULL，所有插桩点直接跳过（不崩、不影响转发）。
+ *
+ * 时间戳一律存 u32 的低 32 位纳秒：差值用无符号回绕算法，4.29 s 以内的
+ * 停留/延迟都精确；0 保留为"没有打点"。桶的上界是 1 ms，超过 4 s 的样本
+ * 会被当成"过期"记进 stale，不进直方图。
+ */
+struct zx_diag {
+	/* 1. 盒内停留：bp -> RX 快路入口时刻；TX 提交时结算并按出口口分桶 */
+	u32		rx_ts[ZX_NUM_BUFFERS];
+	u64		res[ZX_NUM_PORTS][ZX_DIAG_TBUCKETS];
+	u64		res_n[ZX_NUM_PORTS];
+	u64		res_max_ns[ZX_NUM_PORTS];
+	u64		res_nostamp;		/* 提交时 bp 上没有戳 = 这帧来自栈路径 */
+
+	/* 5. TX 完成延迟：描述符下标 -> TX_START 时刻；reclaim 时结算 */
+	u32		tx_ts[ZX_NUM_TX_DESC];
+	u8		tx_port[ZX_NUM_TX_DESC];	/* 该描述符的出口口（分方向用） */
+	u64		txlat[ZX_DIAG_TBUCKETS];
+	u64		txlat_port[ZX_NUM_PORTS][ZX_DIAG_TBUCKETS];
+	u64		txlat_n;
+	u64		txlat_max_ns;
+
+	/* 2. seq 反演：两向各一张表（同一张表会互相覆盖，见 main.c 注释） */
+	struct zx_diag_seq	*seq;		/* [2][ZX_DIAG_SEQ_SLOTS]，单独分配 */
+	u64		seq_probe[2];		/* 0=RX 入口，1=TX 提交 */
+	u64		seq_hit[2];		/* tag 命中（真正比过 seq） */
+	u64		seq_roll[2];		/* seq 相对"上次"回退的次数 */
+	u64		seq_coll;		/* 槽位被别的 tag 占着（覆盖，只计数） */
+	/* 按端口分开的同一组数，用来单独读"盒子->宿主"（出口 lan1）那一路 */
+	u64		seq_hit_in[ZX_NUM_PORTS];	/* RX 入口，按**入**口 */
+	u64		seq_roll_in[ZX_NUM_PORTS];
+	u64		seq_hit_out[ZX_NUM_PORTS];	/* TX 提交，按**出**口 */
+	u64		seq_roll_out[ZX_NUM_PORTS];
+
+	/* 3. 每 poll */
+	u64		poll_frames[ZX_DIAG_PBUCKETS];	/* 本轮处理帧数 */
+	u64		poll_fwd[ZX_DIAG_PBUCKETS];	/* 本轮快路转发帧数 */
+	u64		poll_n;
+	u64		poll_work;		/* 累计处理帧数 */
+	u64		poll_ffeframes;		/* 累计快路转发帧数 */
+
+	/* 4. TX 环占用（提交前 tx_pending）与限流 */
+	u64		txq[ZX_DIAG_QBUCKETS];
+	u64		txq_port[ZX_NUM_PORTS][ZX_DIAG_QBUCKETS];
+	u64		txq_block[ZX_NUM_PORTS];	/* 提交被 txq_limit 挡回（per 出口） */
+	u64		txq_trip[ZX_NUM_PORTS];		/* 提交后触顶 -> 停所有队列 */
+
+	/* 6. 丢点（新增的那几格；既有计数仍在 adapter 上，diag 文件一并打印） */
+	u64		drop[ZX_DIAG_DROP_N];
+
+	/* 8. 突发：连续提交到同一出口的段长 + 段间空档 */
+	u64		burst_len[ZX_NUM_PORTS][ZX_DIAG_BBUCKETS];
+	u64		burst_gap[ZX_NUM_PORTS][ZX_DIAG_TBUCKETS];
+	u64		burst_seg[ZX_NUM_PORTS];	/* 已结算的段数 */
+	u64		burst_frames[ZX_NUM_PORTS];
+	u64		burst_cur[ZX_NUM_PORTS];	/* 当前段长度（未结算） */
+	u32		burst_last_ns[ZX_NUM_PORTS];	/* 上一帧提交时刻 */
+	u64		burst_gap_min_ns[ZX_NUM_PORTS];
+	u64		burst_gap_max_ns[ZX_NUM_PORTS];
+};
+
+/* 热路径唯一的读：一个 u32 的位测试。见文件上方 DIAG 段注释。 */
+extern unsigned int zx_diag_mask;
+
+static inline bool zx_diag_on(unsigned int bit)
+{
+	return unlikely(READ_ONCE(zx_diag_mask) & bit);
+}
+
+/*
+ * accel.c 需要的三个入口（实现在 main.c，都在 mask 关掉时只做一次位测试；
+ * 调用点本身也带 zx_diag_on() 判断，见各自的调用处）。
+ */
+void zx_diag_res_stamp(struct zx_eth_adapter *adapter, u16 bp);
+void zx_diag_res_clear(struct zx_eth_adapter *adapter, u16 bp);
+void zx_diag_drop(struct zx_eth_adapter *adapter, unsigned int why);
+
 struct zx_eth_adapter {
 	struct device		*dev;
 	void __iomem		*base;
@@ -979,6 +1148,70 @@ struct zx_eth_adapter {
 	struct work_struct	pppoe_flush_work;
 	/* C1：submit 因 bp 已在发送环而拒掉的次数（放尾部：既有成员偏移一个都不动） */
 	u64			tx_dup_reject;
+
+	/*
+	 * FIX2（ABI 稳定）：下面这些是 fix1 新增的字段，**全部集中在结构体最尾部**。
+	 * 原因：fix1 把它们插在 bmu_alloc_pending 之后、bmu_free_fail 之前（另有一把
+	 * bmu_alloc_lock 插在 bmu_free_lock 之后），`struct zx_eth_adapter` 因此整体
+	 * 后移 108 B：ppe_flows 0x4eec -> 0x4f58。而镜像里复用的旧 zx279128s-ppe.ko
+	 * 是按 0x4eec 编的，boot 期 nft flowtable abort 调 zx_ppe_stop() 时按错位取
+	 * ppe_flows，rhashtable_free_and_destroy 写垃圾地址 -> Oops -> panic 回环。
+	 * 放到尾部后既有字段偏移一个都不变（ppe_flows 回到 0x4eec），旧 ko 即使被
+	 * 复用也不会踩错位；sizeof 只增大，落在 devm_kzalloc() 的立即数上。
+	 * 数字见 .scratch/ffe-fastpath/fix2-abi/20261103-0200/IMPL-ABI.md（offsetcheck）。
+	 */
+	/*
+	 * P0（tx-lock-scope）：zx_eth_xmit() 在 tx_lock 外申请 BMU 缓冲，
+	 * tx_bp_alloc_fail 记"这次申请没拿到"的次数。与 bmu_alloc_fail 分开：
+	 * 后者是"请求没在探测预算里完成"（硬件侧），前者是调用侧遇到的事件数。
+	 *
+	 * FIX1（复审 BLOCKER）：**不再**用 NETDEV_TX_BUSY 把帧交回 qdisc
+	 * （6.18 会立即 dev_requeue_skb → qdisc_run，队列开着就是无界重试）。
+	 * 失败的三步各有计数：
+	 *   tx_bp_alloc_retry：同一次 xmit 内追加的探测次数（1~2，按环空位裁）
+	 *   tx_bp_alloc_drop ：重试耗尽后丢掉的帧（同时 dev_dstats_tx_dropped）
+	 *   tx_starve_stop   ：因申请失败停掉入口口的次数
+	 * tx_bmu_starved/tx_starve_polls 是"停口 → NAPI 探测 → 唤醒"的状态。
+	 */
+	u32			tx_bp_alloc_fail;
+	u32			tx_bp_alloc_retry;
+	u32			tx_bp_alloc_drop;
+	u32			tx_starve_stop;
+	bool			tx_bmu_starved;
+	u32			tx_starve_polls;
+	/*
+	 * FIX1：zx_bmu_free_bp() 撞上"BMU 空闲表满、5 ms 内回不来"时**不吞 bp**，
+	 * 放进这个环形队列（bmu_free_lock 保护），由 NAPI poll 每轮再还 4 个。
+	 * head/tail 单调递增，用 % ZX_BMU_DEFER_MAX 取下标。
+	 */
+	u16			bmu_defer[ZX_BMU_DEFER_MAX];
+	u16			bmu_defer_head;
+	u16			bmu_defer_tail;
+	u32			bmu_free_defer;
+	u32			bmu_free_defer_ok;
+	u32			bmu_free_defer_drop;
+	/*
+	 * P0（tx-lock-scope）：BMU 申请寄存器 + bmu_alloc_pending/bmu_alloc_late。
+	 * 申请已经不在 tx_lock 里做（也不允许在 tx_lock 里等硬件），所以它自己
+	 * 一把锁；这把锁只在几拍 MMIO 读写期间持有，里面从不轮询、不睡。
+	 */
+	spinlock_t		bmu_alloc_lock;
+	/*
+	 * P2 的"环满直接丢"计数也是 fix1 同批新增的。它原本在
+	 * struct zx_ffe_cnt 里（rx_drop 之后），会把 cnt[2] 撑大 8 B、进而把
+	 * accel 之后的既有字段整体推后 16 B。为满足"所有既有字段偏移不变"，
+	 * 移到 adapter 尾部按族记（行为、打印口径都不变：仅是计数存放位置）。
+	 */
+	u64			accel_qfull_drop[2];
+
+	/*
+	 * DIAG（2026-11-03）：诊断状态指针，**结构体最后一个字段**。
+	 * 既有字段偏移一个都不动（ppe_flows 仍是 0x4eec），只让 sizeof 多 8 B
+	 * （0x5818 -> 0x5820，结构体 8 字节对齐）。指向独立分配的
+	 * struct zx_diag；分配失败时为 NULL，插桩点全部静默跳过。
+	 * BUILD_BUG_ON 断言见 main.c 的 zx_diag_abi_check()。
+	 */
+	struct zx_diag		*diag;
 };
 
 /* MAC in the layout of the switch's MAC registers: bytes 2-5, then 0-1 */
@@ -1132,6 +1365,9 @@ enum zx_ffe_verdict {
 	ZX_FFE_V_FALLBACK,	/* 命中但按判据回栈（同口/NAT 缺字段/帧长/出口 MTU） */
 	ZX_FFE_V_QFULL,		/* 命中但发送环满：回栈让 qdisc 背压 */
 	ZX_FFE_V_RX_DROP,	/* 已改写但提交失败，只能丢帧（不可达） */
+	ZX_FFE_V_QFULL_DROP,	/* P2：环满且 ffe_qfull_drop=1 —— 直接丢帧、不回栈；
+				 * 帧还没改写，bp 由调用方按 DROPPED 还回 BMU
+				 */
 };
 
 /*

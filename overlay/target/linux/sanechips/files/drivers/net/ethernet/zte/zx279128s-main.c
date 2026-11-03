@@ -20,6 +20,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/bitops.h>	/* DIAG: fls()/rol32() */
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -147,9 +148,547 @@ static bool timing;
 module_param(timing, bool, 0644);
 MODULE_PARM_DESC(timing, "Per-packet stage timing (default: off)");
 
+/*
+ * P1（tx-lock-scope）：发送环深度限值（原 zx279128s-eth.h 的
+ * 默认 1024 是**实测/经验取值 + 环长上限**，不是“对齐原厂”：原厂
+ * txq_max=0x400 是 per-CPU 软件 backlog 的 b->qlen，不是 DMA 环占用
+ * （PIPELINE.md Q3），量纲不同（它满了就丢帧；我方 1024 是整环无余量），
+ * 所以只作参考、不作依据。本板实测 tx_pending 峰值 64（限 256 时），
+ * 首次上机建议先 256 跑一轮、再切 1024 做 A/B。
+ *
+ * 为什么用 module_param_cb 而不是裸 module_param：环长只有 ZX_NUM_TX_DESC
+ * (1024)，写进一个更大的值会让 tx_pending 越过环长、描述符在飞时被覆盖，
+ * 所以写入口直接拒掉 [ZX_TX_QUEUE_MIN, ZX_NUM_TX_DESC] 以外的值（-EINVAL）。
+ * sysfs 名字仍是 txq_limit：
+ *   echo {64,128,256,512,1024} > /sys/module/zx279128s_eth/parameters/txq_limit
+ * 变量名带 zx_ 前缀，免得给 vmlinux 添一个可能撞名的全局 txq_limit。
+ * 模块是内置的，但 __param 段照样让 param_sysfs_builtin() 建出这个 sysfs 项。
+ */
+unsigned int zx_txq_limit = ZX_TX_QUEUE_DEFAULT;
+
+static int zx_txq_limit_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int v;
+	int ret = kstrtouint(val, 0, &v);
+
+	if (ret)
+		return ret;
+	if (v < ZX_TX_QUEUE_MIN || v > ZX_NUM_TX_DESC)
+		return -EINVAL;
+	WRITE_ONCE(zx_txq_limit, v);
+	return 0;
+}
+
+static const struct kernel_param_ops zx_txq_limit_ops = {
+	.set	= zx_txq_limit_set,
+	.get	= param_get_uint,
+};
+
+module_param_cb(txq_limit, &zx_txq_limit_ops, &zx_txq_limit, 0644);
+MODULE_PARM_DESC(txq_limit, "TX ring depth limit, 64..1024 (default: 1024, ring length; A/B knob)");
+
+/* ---- 剂量-响应对照：纯延迟注入（delay-instr，2026-11-03） --------------
+ *
+ * 诊断镜像里唯一把单流从 ~740 抬到 ~863 Mbit/s 的开关是 diag_seq，但它同时
+ * 带来两样东西：(A) 每帧固定的额外耗时（改变投递节奏）；(B) 读包头 + 写
+ * 1024 槽哈希表带来的缓存/内存流量。这两个参数把 (A) 单独拿出来做成可调
+ * 剂量：非 0 时在热路径上**只**延迟，不碰帧、不查表、不写任何诊断状态。
+ *
+ * 两个插入点**互相独立**（RX 与 TX 是两种机制：TX 那次在 tx_lock + RCU 临界
+ * 区里，延长它会把下一帧的提交与 flow 记账一起推后），可以只开一侧。
+ *
+ * 单位纳秒（u32）。延迟用内核校准过的 udelay()/ndelay()，**不再每圈取时间**：
+ *   - 1 <= ns < 1000：ndelay(ns)。本树（ARM）没有架构自己的 ndelay，
+ *     linux/delay.h 的通用实现是 udelay(DIV_ROUND_UP(ns,1000))，
+ *     所以实际最小非 0 延迟 = 1 us，请求值在 (0,1000] 都落到 1 us；
+ *   - ns >= 1000：udelay(DIV_ROUND_UP(ns,1000))，粒度 1 us、向上取整。
+ * 默认 0 = 只多一次 unlikely 分支（RX 每帧、TX 每次提交），行为不变。
+ * 运行期可写，不需要重启：
+ *   echo 2000 > /sys/module/zx279128s_eth/parameters/zxdly_rx_ns
+ *   echo 2000 > /sys/module/zx279128s_eth/parameters/zxdly_tx_ns
+ * 剂量按 us 排（1000/2000/4000/8000），**不要按 echo 的 ns 线性外推**：
+ * 实际每帧延迟要用 softirq % 与 pps 反推（见 DESIGN.md §4）。TX 侧在
+ * tx_lock 里延迟，单次别写 >100 us（会把提交侧整个卡住）。
+ */
+static unsigned int zxdly_rx_ns;
+module_param(zxdly_rx_ns, uint, 0644);
+MODULE_PARM_DESC(zxdly_rx_ns, "Fixed delay (ns, us granularity) in the RX hot path after the cache invalidate (default: 0)");
+
+static unsigned int zxdly_tx_ns;
+module_param(zxdly_tx_ns, uint, 0644);
+MODULE_PARM_DESC(zxdly_tx_ns, "Fixed delay (ns, us granularity) after a successful TX submit, under tx_lock (default: 0)");
+
 #define ZX_TS()	(unlikely(timing) ? ktime_get_ns() : 0)
 
-/* ---- Packet processor engine (package kmod-e2631-ppe) --------------- */
+/* ---- DIAG：诊断插桩（2026-11-03） ------------------------------------
+ *
+ * 任务：同拓扑、同 cubic、单流下原厂 921.8 vs 我们 740.3 Mbit/s，而我们在
+ * 740 时每包只花 5.9 us（原厂 921.8 时 11.2 us）——算力不是瓶颈，所以差距
+ * 只可能在"单流的包在盒内被怎么延迟、怎么乱序、怎么丢，以及为什么 -P16
+ * 能补齐而单流不能"。本组插桩只回答这三个问题，**不改任何转发判据**。
+ *
+ * 开关（每项一个 module_param，默认 0）：
+ *   diag_residence  1. 盒内停留：RX 快路入口 -> TX 提交成功，按出口口分桶
+ *   diag_seq        2. TCP seq 反演：RX 入口与 TX 提交各一张 1024 槽表
+ *   diag_poll       3. 每 NAPI poll 处理/转发帧数
+ *   diag_txq        4. TX 环占用 + txq_limit 挡回
+ *   diag_txlat      5. TX 完成延迟：writel(TX_START) -> reclaim 见到完成
+ *   diag_drop       6. 丢点逐项计数（新增 rx_drop_nondev / rx_drop_down / skb_nomem）
+ *   diag_burst      8. 每出口的突发段长与段间空档（diag_burst_us 定义"同一段"的阈值）
+ *
+ * 关掉时热路径只多一次 "ldr zx_diag_mask; tst; beq"——分支方向、顺序、结果
+ * 都不变（任务书硬要求）。打开后按桶累加，桶宽是对数，单条插桩 10~30 条指令。
+ */
+unsigned int zx_diag_mask;	/* 位图，见 eth.h 的 ZX_DIAG_B_* */
+
+/*
+ * 一个开关 = 一个 bool 状态 + 它在 zx_diag_mask 里的那一位。写 sysfs
+ * （/sys/module/zx279128s_eth/parameters/diag_*）立刻生效，不需要重启。
+ */
+struct zx_diag_sw {
+	unsigned int	bit;
+	bool		on;
+};
+
+static int zx_diag_sw_set(const char *val, const struct kernel_param *kp)
+{
+	struct zx_diag_sw *sw = (struct zx_diag_sw *)(uintptr_t)kp->arg;
+	bool on;
+	int ret;
+
+	if (!sw)
+		return -EINVAL;
+	ret = kstrtobool(val, &on);
+	if (ret)
+		return ret;
+	WRITE_ONCE(sw->on, on);
+	if (on)
+		WRITE_ONCE(zx_diag_mask, READ_ONCE(zx_diag_mask) | sw->bit);
+	else
+		WRITE_ONCE(zx_diag_mask, READ_ONCE(zx_diag_mask) & ~sw->bit);
+	return 0;
+}
+
+static int zx_diag_sw_get(char *buf, const struct kernel_param *kp)
+{
+	const struct zx_diag_sw *sw = (const struct zx_diag_sw *)kp->arg;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 (sw && READ_ONCE(sw->on)) ? 1 : 0);
+}
+
+static const struct kernel_param_ops zx_diag_sw_ops = {
+	.set	= zx_diag_sw_set,
+	.get	= zx_diag_sw_get,
+};
+
+static struct zx_diag_sw zx_diag_sw_residence = { ZX_DIAG_B_RESIDENCE, false };
+static struct zx_diag_sw zx_diag_sw_seq       = { ZX_DIAG_B_SEQ, false };
+static struct zx_diag_sw zx_diag_sw_poll      = { ZX_DIAG_B_POLL, false };
+static struct zx_diag_sw zx_diag_sw_txq       = { ZX_DIAG_B_TXQ, false };
+static struct zx_diag_sw zx_diag_sw_txlat     = { ZX_DIAG_B_TXLAT, false };
+static struct zx_diag_sw zx_diag_sw_drop      = { ZX_DIAG_B_DROP, false };
+static struct zx_diag_sw zx_diag_sw_burst     = { ZX_DIAG_B_BURST, false };
+
+module_param_cb(diag_residence, &zx_diag_sw_ops, &zx_diag_sw_residence, 0644);
+MODULE_PARM_DESC(diag_residence, "DIAG 1: in-box residence histogram RX fastpath -> TX submit, per egress port (default: off)");
+module_param_cb(diag_seq, &zx_diag_sw_ops, &zx_diag_sw_seq, 0644);
+MODULE_PARM_DESC(diag_seq, "DIAG 2: TCP seq inversion counters at RX entry and before TX submit (default: off)");
+module_param_cb(diag_poll, &zx_diag_sw_ops, &zx_diag_sw_poll, 0644);
+MODULE_PARM_DESC(diag_poll, "DIAG 3: frames handled/forwarded per NAPI poll histogram (default: off)");
+module_param_cb(diag_txq, &zx_diag_sw_ops, &zx_diag_sw_txq, 0644);
+MODULE_PARM_DESC(diag_txq, "DIAG 4: TX ring occupancy histogram and txq_limit blocks (default: off)");
+module_param_cb(diag_txlat, &zx_diag_sw_ops, &zx_diag_sw_txlat, 0644);
+MODULE_PARM_DESC(diag_txlat, "DIAG 5: TX completion latency TX_START -> reclaim (default: off)");
+module_param_cb(diag_drop, &zx_diag_sw_ops, &zx_diag_sw_drop, 0644);
+MODULE_PARM_DESC(diag_drop, "DIAG 6: per-reason drop counters (default: off)");
+module_param_cb(diag_burst, &zx_diag_sw_ops, &zx_diag_sw_burst, 0644);
+MODULE_PARM_DESC(diag_burst, "DIAG 8: per-egress burst length and inter-burst gap histograms (default: off)");
+
+/*
+ * "同一段突发"的判定阈值：相邻两次提交到**同一出口**的间隔 <= 这个值就算
+ * 还在同一段里。默认 2 us —— 1500 B 线速连续两个包是 12 us，所以 2 us 只
+ * 会把"背靠背的一串"算成一段，不会把正常流量的间隔并进来。
+ */
+static unsigned int zx_diag_burst_us = 2;
+module_param_named(diag_burst_us, zx_diag_burst_us, uint, 0644);
+MODULE_PARM_DESC(diag_burst_us, "DIAG 8: consecutive submits to one egress closer than this are one burst (us, default: 2)");
+
+/*
+ * 时间直方图分桶：<1us，[1,2) [2,4) … [512,1024) us，[1024us,1ms)，>=1ms
+ *
+ * 入参故意是 **u32 纳秒**（差值本来就 < 4.29 s），除法因此是 32 位：
+ * ARMv7 的 GCC 会把 u64/1000 编成 __aeabi_uldivmod，而 vmlinux 不导出
+ * 那个符号 —— 第一版就是这么链失败的（build.log 里 2026-11-03 20:37 那轮
+ * `undefined reference to __aeabi_uldivmod`）。32 位除法走 __aeabi_uidiv，
+ * 内核自带。
+ */
+static inline unsigned int zx_diag_tbucket(u32 ns)
+{
+	u32 us;
+
+	if (ns < 1000)
+		return 0;
+	us = ns / 1000;
+	if (us < 1024)
+		return (unsigned int)fls(us);	/* 1..10 */
+	if (us < 1000000)
+		return 11;
+	return 12;
+}
+
+/* TX 环占用分桶：0-1、2-3、4-7 … 512+ */
+static inline unsigned int zx_diag_qbucket(unsigned int pending)
+{
+	if (!pending)
+		return 0;
+	return min_t(unsigned int, (unsigned int)fls(pending) - 1,
+		     ZX_DIAG_QBUCKETS - 1);
+}
+
+/* 突发段长分桶：0..15 逐值，16..31，32+ */
+static inline unsigned int zx_diag_bbucket(u64 n)
+{
+	if (n < 16)
+		return (unsigned int)n;
+	if (n < 32)
+		return 16;
+	return 17;
+}
+
+/*
+ * 从池槽位里的帧（以太头起，len 不含 FCS）抽 TCP 5 元组，压成 32 位 tag。
+ * 只认裸 IPv4/IPv6 + 下一个头就是 TCP；VLAN/PPPoE/带扩展头的 v6/分片一律
+ * 返回 false（不计数、不猜）——被测的那条单流是裸 v4/v6 TCP。
+ * 全部用 memcpy 取值：ARMv7 上 14+20 的偏移是 2 字节对齐，直接解引用会告警。
+ */
+static bool zx_diag_tcp_tag(const u8 *frame, u16 len, u32 *tagp, u32 *seqp)
+{
+	struct ethhdr eh;
+	__be16 proto;
+	u32 h = 0, seq = 0;
+
+	if (len < ETH_HLEN + 20)
+		return false;
+	memcpy(&eh, frame, ETH_HLEN);
+	proto = eh.h_proto;
+
+	if (proto == htons(ETH_P_IP)) {
+		struct iphdr ip;
+		struct tcphdr th;
+		unsigned int ihl;
+
+		memcpy(&ip, frame + ETH_HLEN, sizeof(ip));
+		if (ip.protocol != IPPROTO_TCP)
+			return false;
+		ihl = (unsigned int)ip.ihl * 4;
+		if (ihl < sizeof(ip) || len < ETH_HLEN + ihl + sizeof(th))
+			return false;
+		/* 0x1fff = 片偏移掩码（分片不看：只有首片带 TCP 头） */
+		if (ip.frag_off & htons(0x1fffu))
+			return false;
+		memcpy(&th, frame + ETH_HLEN + ihl, sizeof(th));
+		h = (u32)ntohl(ip.saddr) ^ 0x9e3779b9u;
+		h ^= rol32((u32)ntohl(ip.daddr), 13);
+		h ^= ((u32)ntohs(th.source) << 16) | (u32)ntohs(th.dest);
+		h ^= 0x01000000u;		/* v4 标记 */
+		seq = ntohl(th.seq);
+	} else if (proto == htons(ETH_P_IPV6)) {
+		struct ipv6hdr ip6;
+		struct tcphdr th;
+		u32 a[4];
+
+		if (len < ETH_HLEN + sizeof(ip6) + sizeof(th))
+			return false;
+		memcpy(&ip6, frame + ETH_HLEN, sizeof(ip6));
+		if (ip6.nexthdr != IPPROTO_TCP)
+			return false;
+		memcpy(&th, frame + ETH_HLEN + sizeof(ip6), sizeof(th));
+		memcpy(a, ip6.saddr.s6_addr, sizeof(a));
+		h = ntohl(a[0]) ^ rol32(ntohl(a[1]), 7) ^
+		    rol32(ntohl(a[2]), 13) ^ rol32(ntohl(a[3]), 19);
+		memcpy(a, ip6.daddr.s6_addr, sizeof(a));
+		h ^= rol32(ntohl(a[0]), 3) ^ rol32(ntohl(a[1]), 11) ^
+		     rol32(ntohl(a[2]), 17) ^ rol32(ntohl(a[3]), 23);
+		h ^= ((u32)ntohs(th.source) << 16) | (u32)ntohs(th.dest);
+		h ^= 0x02000000u;		/* v6 标记 */
+		seq = ntohl(th.seq);
+	} else {
+		return false;
+	}
+
+	/* 32 位混合：乘法散列，无查表，够把一条流的 5 元组摊到 1024 槽 */
+	h ^= h >> 16;
+	h *= 0x7feb352du;
+	h ^= h >> 15;
+	h *= 0x846ca68bu;
+	h ^= h >> 16;
+	*tagp = h & ~3u;	/* 低 2 位留空：tag==0 专门表示"空槽" */
+	*seqp = seq;
+	return true;
+}
+
+/*
+ * seq 反演：dir 0 = RX 入口（zx_eth_rx 解析完描述符之后），1 = TX 提交前
+ * （zx_tx_submit_bp 成功之后）。两向**各一张 1024 槽表**：共用一张的话，
+ * 同一帧先在 RX 写一次、再在 TX 写一次，两向互相覆盖，永远看不到"上次"。
+ *
+ * 判据只看 seq 是否回退（TCP 序列号按 32 位回绕比较）：回退一次说明这个
+ * 5 元组在盒子内部被换了顺序。表满/冲突只计 seq_coll，不做任何纠正——
+ * 冲突的结果是"当成新流"，只影响绝对数，不影响"有没有回退"的定性判断。
+ */
+static void zx_diag_seq_probe(struct zx_eth_adapter *adapter, const u8 *frame,
+			      u16 len, unsigned int dir, int port)
+{
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+	struct zx_diag_seq *e;
+	u32 tag, seq, idx;
+
+	if (!d || !d->seq)
+		return;
+	if (!zx_diag_tcp_tag(frame, len, &tag, &seq))
+		return;
+	d->seq_probe[dir]++;
+	idx = tag & (ZX_DIAG_SEQ_SLOTS - 1);
+	e = &d->seq[dir * ZX_DIAG_SEQ_SLOTS + idx];
+	if (e->tag == tag) {
+		bool roll = (s32)(seq - e->seq) < 0;
+
+		d->seq_hit[dir]++;
+		if (roll)
+			d->seq_roll[dir]++;
+		if (port >= 0 && port < ZX_NUM_PORTS) {
+			if (dir) {
+				d->seq_hit_out[port]++;
+				if (roll)
+					d->seq_roll_out[port]++;
+			} else {
+				d->seq_hit_in[port]++;
+				if (roll)
+					d->seq_roll_in[port]++;
+			}
+		}
+	} else if (e->tag) {
+		d->seq_coll++;
+	}
+	e->tag = tag;
+	e->seq = seq;
+}
+
+/* RX 入口（每帧一次，只做 seq 反演；residence 的戳在快路入口打） */
+static void zx_diag_rx_entry(struct zx_eth_adapter *adapter, u16 bp, u16 len,
+			     int port)
+{
+	if (bp >= ZX_NUM_BUFFERS)
+		return;
+	if (zx_diag_on(ZX_DIAG_B_SEQ))
+		zx_diag_seq_probe(adapter,
+				  adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE + 16,
+				  len, 0, port);
+}
+
+/*
+ * 1. 盒内停留的起点：快路入口（zx_ffe_rx()，accel.c）。只有真的进了快路的帧
+ * 才有戳——栈路径的帧没有，所以它们不会把停留分布稀释成噪声。
+ * 戳用 u32 低 32 位纳秒，|1 保证非 0（0 = 没有戳）。
+ */
+void zx_diag_res_stamp(struct zx_eth_adapter *adapter, u16 bp)
+{
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+
+	if (!d || bp >= ZX_NUM_BUFFERS)
+		return;
+	d->rx_ts[bp] = (u32)ktime_get_ns() | 1u;
+}
+
+/* 快路没转发（回栈/丢弃）时撤销戳，免得被同一 bp 上后面的栈帧误结算 */
+void zx_diag_res_clear(struct zx_eth_adapter *adapter, u16 bp)
+{
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+
+	if (d && bp < ZX_NUM_BUFFERS)
+		d->rx_ts[bp] = 0;
+}
+
+/* 6. 新增的丢点计数（既有计数仍在 adapter 上，见 diag 文件的第 6 段） */
+void zx_diag_drop(struct zx_eth_adapter *adapter, unsigned int why)
+{
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+
+	if (d && why < ZX_DIAG_DROP_N)
+		d->drop[why]++;
+}
+
+/* 4/6：提交被 txq_limit 挡回（栈路径与快路共用这一个入口） */
+static void zx_diag_txq_block(struct zx_eth_adapter *adapter, int eport)
+{
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+
+	if (!d || eport < 0 || eport >= ZX_NUM_PORTS)
+		return;
+	d->txq_block[eport]++;
+	d->drop[ZX_DIAG_DROP_TXQ_BLOCK]++;
+}
+
+/* 4：提交后把环打到上限 -> 停所有端口队列（这是"环满"的另一半证据） */
+static void zx_diag_txq_trip(struct zx_eth_adapter *adapter, int eport)
+{
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+
+	if (d && eport >= 0 && eport < ZX_NUM_PORTS)
+		d->txq_trip[eport]++;
+}
+
+/*
+ * TX 提交成功后一次结算（zx_tx_submit_bp 里，持 tx_lock）：
+ *   1 停留（rx_ts[bp] -> now，按出口口分桶）
+ *   4 环占用（提交前的 tx_pending）
+ *   5 完成延迟起点（tx_ts[tx_idx] = now）
+ *   2 TX 侧 seq 反演（读的是同一帧在池里的当前内容）
+ *   8 突发（同一出口的段长/空档）
+ * pending 传的是**自增之前**的 tx_pending，tx_idx 是本次描述符下标。
+ */
+static void zx_diag_tx_submit(struct zx_eth_adapter *adapter, int eport, u16 bp,
+			      unsigned int tx_idx, unsigned int pending, u16 len)
+{
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+	unsigned int mask = READ_ONCE(zx_diag_mask);
+	u32 now;
+
+	if (!d || bp >= ZX_NUM_BUFFERS || eport < 0 || eport >= ZX_NUM_PORTS)
+		return;
+	now = (u32)ktime_get_ns();
+
+	if (mask & ZX_DIAG_B_RESIDENCE) {
+		u32 ts = d->rx_ts[bp];
+
+		d->rx_ts[bp] = 0;
+		if (ts) {
+			u32 dns = now - ts;
+			unsigned int b = zx_diag_tbucket(dns);
+
+			d->res[eport][b]++;
+			d->res_n[eport]++;
+			if (dns > d->res_max_ns[eport])
+				d->res_max_ns[eport] = dns;
+		} else {
+			d->res_nostamp++;	/* 栈路径提交：本来就没有快路入口 */
+		}
+	}
+	if (mask & ZX_DIAG_B_TXQ) {
+		unsigned int b = zx_diag_qbucket(pending);
+
+		d->txq[b]++;
+		d->txq_port[eport][b]++;
+	}
+	if (mask & ZX_DIAG_B_TXLAT) {
+		d->tx_ts[tx_idx] = now | 1u;
+		d->tx_port[tx_idx] = (u8)eport;
+	}
+	if (mask & ZX_DIAG_B_SEQ)
+		zx_diag_seq_probe(adapter,
+				  adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE + 16,
+				  len, 1, eport);
+	if (mask & ZX_DIAG_B_BURST) {
+		u64 *cur = &d->burst_cur[eport];
+		u32 last = READ_ONCE(d->burst_last_ns[eport]);
+
+		d->burst_frames[eport]++;
+		if (!last) {
+			*cur = 1;
+		} else {
+			u32 gap = now - last;
+
+			if (gap <= (u64)READ_ONCE(zx_diag_burst_us) * 1000ull) {
+				(*cur)++;
+			} else {
+				/* 上一段到此为止：结算段长与空档 */
+				d->burst_len[eport][zx_diag_bbucket(*cur)]++;
+				d->burst_gap[eport][zx_diag_tbucket(gap)]++;
+				d->burst_seg[eport]++;
+				if (!d->burst_gap_min_ns[eport] ||
+				    gap < d->burst_gap_min_ns[eport])
+					d->burst_gap_min_ns[eport] = gap;
+				if (gap > d->burst_gap_max_ns[eport])
+					d->burst_gap_max_ns[eport] = gap;
+				*cur = 1;
+			}
+		}
+		d->burst_last_ns[eport] = now | 1u;
+	}
+}
+
+/*
+ * 5. TX 完成延迟的终点：zx_tx_reclaim() 结算 [tail, tail+n) 这批描述符。
+ *
+ * 口径注意：reclaim 只在"下一次提交 / NAPI poll / 250 us 定时器"里跑，所以
+ * 这里量到的是**上界**（真实完成时刻在这之前）。要精确到硬件完成时刻需要
+ * 每包中断，这颗 SoC 没有；作为"环里最长的一帧停了多久"的判据够用。
+ */
+static void zx_diag_tx_done(struct zx_eth_adapter *adapter, u32 tail, u32 n)
+{
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+	u32 now;
+
+	if (!d || !n)
+		return;
+	now = (u32)ktime_get_ns();
+	for (u32 i = 0; i < n; i++) {
+		u32 idx = (tail + i) % ZX_NUM_TX_DESC;
+		u32 ts = d->tx_ts[idx];
+
+		if (!ts)
+			continue;
+		{
+			u32 dns = now - ts;
+			unsigned int b = zx_diag_tbucket(dns);
+			u8 p = d->tx_port[idx];
+
+			d->tx_ts[idx] = 0;
+			d->txlat[b]++;
+			if (p < ZX_NUM_PORTS)
+				d->txlat_port[p][b]++;
+			d->txlat_n++;
+			if (dns > d->txlat_max_ns)
+				d->txlat_max_ns = dns;
+		}
+	}
+}
+
+/* 3. 每 poll 的帧数（work = 本轮处理总数，fwd = 其中快路转发数） */
+static void zx_diag_poll(struct zx_eth_adapter *adapter, int work, int fwd)
+{
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+	unsigned int wb, fb;
+
+	if (!d)
+		return;
+	wb = (unsigned int)clamp(work, 0, ZX_DIAG_PBUCKETS - 1);
+	fb = (unsigned int)clamp(fwd, 0, ZX_DIAG_PBUCKETS - 1);
+	d->poll_frames[wb]++;
+	d->poll_fwd[fb]++;
+	d->poll_n++;
+	d->poll_work += (u64)max(work, 0);
+	d->poll_ffeframes += (u64)max(fwd, 0);
+}
+
+/*
+ * ABI 断言（任务书硬要求）：这些立即数是 ppe.ko 里写死的偏移，也是 fix2
+ * 交付镜像的布局。**加字段只许追加在结构体末尾**，否则这里编译不过——
+ * 这是"不改既有字段"的机器可验证形式，不靠人记。
+ * 数值来源：.scratch/ffe-fastpath/fix2-abi/20261103-0200/offsetcheck/。
+ */
+static void zx_diag_abi_check(void)
+{
+	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, ppe_flows) != 0x4eec);
+	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, ppe_lock) != 0x4ed4);
+	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, ppe_active) != 0x4ee8);
+	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, accel) != 0x50e0);
+	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, tx_dup_reject) != 0x5790);
+	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, accel_qfull_drop) != 0x5808);
+	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, diag) != 0x5818);
+	BUILD_BUG_ON(sizeof(struct zx_eth_adapter) != 0x5820);
+}
 
 /*
  * Everything that programs the classifier, the packet modifier and the flow
@@ -381,6 +920,223 @@ void zx_eth_for_each_adapter(void (*fn)(struct zx_eth_adapter *adapter,
 }
 EXPORT_SYMBOL_GPL(zx_eth_for_each_adapter);
 
+/* ---- coal-knob：硬件 RX 中断合并 + NAPI 权重（运行期可改，2026-11-03） ----
+ *
+ * 一、硬件合并器
+ * DMA 块自带一对 RX 中断合并寄存器（zx279128s-eth.h:150-151）：
+ *   ZX_DMA_RX_IRQ_TIMER  = DMA + 0x30（0x350030）  时间阈值
+ *   ZX_DMA_RX_IRQ_FRAMES = DMA + 0x34（0x350034）  帧数阈值
+ * 硬件语义（eth.h:295-303 原文）："The RX interrupt comes after this many
+ * frames, or this long after the first one." —— 从第一帧起计时，时间或帧数
+ * 任一先到就抬 RX 中断。基线把这一对钉死在 500 µs / 64 帧（main.c:1713-1714）。
+ *
+ * **编码：0x30 的单位是 20 ns，不是 µs**（eth.h:150 原文 "in 20 ns ticks"）。
+ * 1 µs = 50 ticks；基线写的是 ZX_RX_IRQ_USECS * 50 = 500 * 50 = 25000 ticks，
+ * 25000 × 20 ns = 500 µs，与上面注释自洽。纯线性、无移位/对数/档位编码，
+ * 任何整数 µs 都能精确写入（×50 不截断）。0x34 是帧数原值，基线 = 64。
+ *
+ * 默认值 = 本板实测最优（eth.h:300-301 的常量，2026-11-04 起；基线 500/64）：
+ *   zxcoal_us     = ZX_RX_IRQ_USECS  = 250 -> 写 12500（250 µs × 50 ticks）
+ *   zxcoal_frames = ZX_RX_IRQ_FRAMES = 16  -> 写 16
+ * 没人碰参数时 zx_hw_init()（只在 probe 调一次，main.c:5042）就写这两个值；
+ * 开机后 /etc/init.d/zx_ffe_coalesce 按 /etc/config/zx_ffe 覆盖（同一个写入口）。
+ *
+ * 运行期是否生效：驱动里除 zx_hw_init() 外**没有任何路径**碰这两个寄存器
+ * （ISR 只读 TM 中断状态/掩码，合并计数与重装全在 DMA 硬件里，没有软件
+ * rearm），ndo_stop()/ndo_open() 也不重写它们（回到复位态只发生在
+ * zx_hw_reset() 的 master reset，而它只在 probe 失败路径和 reboot 前调用）。
+ * ⇒ 运行期直接写 + readl 读回自证；若某台片子只在 DMA 使能时锁存，回退办法
+ *   是重载驱动（down/up 不够）。
+ *
+ * 二、NAPI 权重
+ * 基线 probe 用 3 参 netif_napi_add（main.c:5159）⇒ 编译期 NAPI_POLL_WEIGHT
+ * (64)。这里换成 4 参 netif_napi_add_weight(..., zxnapi_weight)，默认仍 64。
+ * net/core/dev.c 的 napi_poll() 每次调用开头 `weight = n->weight;` 重读该字段
+ * ⇒ 运行期改它在下一次 poll 生效。风险（照做、写清）：改的那一瞬间若正好有
+ * 一轮 poll 在跑，那一轮的 budget 与 work<weight 判据可能来自不同次读取，
+ * 最多多/少服务一帧；zx_eth_rx() 严格按 budget 截断、环长 1024 远大于允许的
+ * weight，所以不影响正确性。weight>64 时 netif_napi_add_weight() 会
+ * netdev_err_once 抱怨一次（本驱动的 poll 是 budget 截断的，功能上无害）。
+ */
+static unsigned int zxcoal_us = ZX_RX_IRQ_USECS;		/* µs */
+static unsigned int zxcoal_frames = ZX_RX_IRQ_FRAMES;	/* 帧 */
+static unsigned int zxnapi_weight = NAPI_POLL_WEIGHT;	/* 帧/轮 */
+
+#define ZXCOAL_TICKS_PER_US	50U	/* 0x30 的 LSB = 20 ns ⇒ 1 µs = 50 ticks */
+#define ZXCOAL_US_MAX		1000000U	/* 1 s = 50e6 ticks，u32 装得下 */
+#define ZXCOAL_FRAMES_MAX	4096U
+#define ZXNAPI_WEIGHT_MAX	1024U
+
+/* 一次寄存器写：读旧 → 写新 → 读回自证；读回不符就把旧值写回去并报错。 */
+struct zx_coal_apply {
+	const char	*param;		/* "zxcoal_us" / "zxcoal_frames" */
+	unsigned int	shown;		/* 打在日志里的参数值（µs 或帧） */
+	u32		reg;		/* ZX_DMA_RX_IRQ_TIMER / _FRAMES */
+	u32		raw;		/* 真正写进寄存器的原始值 */
+	bool		quiet;		/* 值没变就不打印（probe 尾部同步用） */
+	unsigned int	adapters;
+	unsigned int	failed;
+};
+
+static void zx_coal_apply_one(struct zx_eth_adapter *adapter, void *data)
+{
+	struct zx_coal_apply *a = data;
+	void __iomem *reg = adapter->base + a->reg;
+	u32 old = readl(reg);
+	u32 back;
+
+	a->adapters++;
+	writel(a->raw, reg);
+	back = readl(reg);	/* 读回：这次读把 posted write 冲出去 */
+	if (back == a->raw) {
+		if (!a->quiet || old != a->raw)
+			dev_info(adapter->dev,
+				 "%s=%u: reg 0x%05x raw %u -> %u (readback %u)\n",
+				 a->param, a->shown, a->reg, old, a->raw, back);
+		return;
+	}
+
+	/* 值被硬件截断/忽略：写回旧值，别把寄存器留在半截状态 */
+	a->failed++;
+	writel(old, reg);
+	dev_err(adapter->dev,
+		"%s: reg 0x%05x write %u (param %u), read back %u — field too narrow? restored %u\n",
+		a->param, a->reg, a->raw, a->shown, back, readl(reg));
+}
+
+static int zx_coal_write(const char *param, u32 reg, u32 raw,
+			 unsigned int shown, bool quiet)
+{
+	struct zx_coal_apply a = {
+		.param = param, .shown = shown, .reg = reg, .raw = raw,
+		.quiet = quiet,
+	};
+
+	zx_eth_for_each_adapter(zx_coal_apply_one, &a);
+	if (!a.adapters) {
+		/* probe 之前（cmdline 或早到的 sysfs 写）：值先存着，probe 落一次 */
+		pr_info("zx279128s: %s=%u staged (raw %u), no adapter yet\n",
+			param, shown, raw);
+		return 0;
+	}
+	return a.failed ? -EIO : 0;
+}
+
+static int zxcoal_us_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int v;
+	int ret = kstrtouint(val, 0, &v);
+
+	if (ret)
+		return ret;
+	if (v > ZXCOAL_US_MAX)
+		return -EINVAL;
+	ret = zx_coal_write("zxcoal_us", ZX_DMA_RX_IRQ_TIMER,
+			    v * ZXCOAL_TICKS_PER_US, v, false);
+	if (ret)
+		return ret;	/* 硬件没吃下：变量保持旧值，get 读到的=生效值 */
+	WRITE_ONCE(zxcoal_us, v);
+	return 0;
+}
+
+static const struct kernel_param_ops zxcoal_us_ops = {
+	.set	= zxcoal_us_set,
+	.get	= param_get_uint,
+};
+
+module_param_cb(zxcoal_us, &zxcoal_us_ops, &zxcoal_us, 0644);
+MODULE_PARM_DESC(zxcoal_us, "RX IRQ coalescing timer in us (register counts 20 ns ticks, x50; 0..1000000, default: 250)");
+
+static int zxcoal_frames_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int v;
+	int ret = kstrtouint(val, 0, &v);
+
+	if (ret)
+		return ret;
+	if (v > ZXCOAL_FRAMES_MAX)
+		return -EINVAL;
+	ret = zx_coal_write("zxcoal_frames", ZX_DMA_RX_IRQ_FRAMES, v, v, false);
+	if (ret)
+		return ret;
+	WRITE_ONCE(zxcoal_frames, v);
+	return 0;
+}
+
+static const struct kernel_param_ops zxcoal_frames_ops = {
+	.set	= zxcoal_frames_set,
+	.get	= param_get_uint,
+};
+
+module_param_cb(zxcoal_frames, &zxcoal_frames_ops, &zxcoal_frames, 0644);
+MODULE_PARM_DESC(zxcoal_frames, "RX IRQ coalescing frame count (0..4096, default: 16)");
+
+/* NAPI 权重：一个 adapter 一个 napi，运行期直接改字段。 */
+struct zx_napi_weight_apply {
+	unsigned int	weight;
+	bool		quiet;
+	unsigned int	adapters;
+};
+
+static void zx_napi_weight_one(struct zx_eth_adapter *adapter, void *data)
+{
+	struct zx_napi_weight_apply *a = data;
+	unsigned int old = READ_ONCE(adapter->napi.weight);
+
+	a->adapters++;
+	WRITE_ONCE(adapter->napi.weight, (int)a->weight);
+	if (!a->quiet || old != a->weight)
+		dev_info(adapter->dev,
+			 "zxnapi_weight=%u: napi.weight %u -> %u (readback %d)\n",
+			 a->weight, old, a->weight,
+			 READ_ONCE(adapter->napi.weight));
+}
+
+static int zxnapi_weight_set(const char *val, const struct kernel_param *kp)
+{
+	struct zx_napi_weight_apply a = { .quiet = false };
+	unsigned int v;
+	int ret = kstrtouint(val, 0, &v);
+
+	if (ret)
+		return ret;
+	/* 0 会让 napi_poll() 的 work<weight 判据恒假（budget 0），直接拒掉 */
+	if (v < 1 || v > ZXNAPI_WEIGHT_MAX)
+		return -EINVAL;
+	a.weight = v;
+	zx_eth_for_each_adapter(zx_napi_weight_one, &a);
+	if (!a.adapters)
+		pr_info("zx279128s: zxnapi_weight=%u staged, no adapter yet\n", v);
+	WRITE_ONCE(zxnapi_weight, v);
+	return 0;
+}
+
+static const struct kernel_param_ops zxnapi_weight_ops = {
+	.set	= zxnapi_weight_set,
+	.get	= param_get_uint,
+};
+
+module_param_cb(zxnapi_weight, &zxnapi_weight_ops, &zxnapi_weight, 0644);
+MODULE_PARM_DESC(zxnapi_weight, "NAPI poll weight, frames per poll (1..1024, default: 64 = NAPI_POLL_WEIGHT)");
+
+/*
+ * probe 尾部（adapter 已进链表）把三个参数值再落一次硬件：覆盖 "cmdline 设过"
+ * 与 "sysfs 写在 list_add 之前" 两个窗口。默认值时三个都 silent（quiet）。
+ */
+static void zx_coal_sync_probe(void)
+{
+	struct zx_napi_weight_apply wa = {
+		.weight = READ_ONCE(zxnapi_weight), .quiet = true,
+	};
+
+	zx_coal_write("zxcoal_us", ZX_DMA_RX_IRQ_TIMER,
+		      READ_ONCE(zxcoal_us) * ZXCOAL_TICKS_PER_US,
+		      READ_ONCE(zxcoal_us), true);
+	zx_coal_write("zxcoal_frames", ZX_DMA_RX_IRQ_FRAMES,
+		      READ_ONCE(zxcoal_frames), READ_ONCE(zxcoal_frames), true);
+	zx_eth_for_each_adapter(zx_napi_weight_one, &wa);
+}
+
 /* zc 槽位状态（zx_bmu_free_bp 里就要用，所以定义放前面） */
 #define ZX_ZC_BS_FREE	0	/* 在 BMU 空闲表里 */
 #define ZX_ZC_BS_SKB	1	/* 在协议栈手里，还没人 orphan 过 */
@@ -416,45 +1172,107 @@ EXPORT_SYMBOL_GPL(zx_eth_for_each_adapter);
 static void zx_zc_ev(struct zx_eth_adapter *adapter, u16 bp, u8 type, u8 aux);
 
 /*
- * Allocate a buffer from the BMU (caller holds tx_lock).  A request that
- * does not complete in time stays with the BMU, which hands out its
- * buffer later: keep it pending and collect that buffer on the next call,
- * as the vendor driver does.  Starting a new request instead lost one
- * buffer for good with every timeout.
+ * Allocate a buffer from the BMU.  A request that does not complete in time
+ * stays with the BMU, which hands out its buffer later: keep it pending and
+ * collect that buffer on the next call, as the vendor driver does.  Starting a
+ * new request instead lost one buffer for good with every timeout.
+ *
+ * **P0（tx-lock-scope）：本函数不再"等"，也从不在 tx_lock 里轮询。**
+ * 它只做一次有界探活——最多 ZX_BMU_ALLOC_PROBES 次 readl（≈ 几百 ns），
+ * 没有 udelay、没有 readl_poll_timeout_atomic、不睡。原因是旧版在
+ * readl_poll_timeout_atomic(1, 1000) 里可以持 tx_lock 整整 1 ms，而 tx_lock 是
+ * 五个端口共享的发送环锁：那 1 ms 里快路（zx279128s-accel.c）也提交不进去。
+ * 现在它自己的锁 bmu_alloc_lock 只包这几拍 MMIO，所以调用点可以在 tx_lock
+ * 外（正常路径），也可以在 tx_lock 里（rare 的补申请）——后者持锁时长与一次
+ * MMIO 读同量级，不是"长等"。
+ *
+ * 返回 <0 表示这次没拿到（-EBUSY：上一次请求还挂在 BMU 上；-EAGAIN：这次
+ * 请求没在探测预算内完成；-ENOSPC：完成但缓冲号无效）。这时 bmu_alloc_pending
+ * 已经置位，下一次调用会先把它收回来——调用方（zx_eth_xmit）据此把帧交回
+ * qdisc 重排队，不丢帧。
  */
-static int zx_bmu_alloc_bp(struct zx_eth_adapter *adapter)
+#define ZX_BMU_ALLOC_PROBES	8
+
+static int zx_bmu_alloc_bp_nb(struct zx_eth_adapter *adapter)
 {
 	void __iomem *base = adapter->base;
 	u32 val;
-	int ret;
+	int i;
 
+	spin_lock_bh(&adapter->bmu_alloc_lock);
 	if (adapter->bmu_alloc_pending) {
 		if (readl(base + ZX_BMU_BUF_ALLOC) & ZX_BMU_BUF_ALLOC_REQ) {
 			adapter->bmu_alloc_fail++;
+			spin_unlock_bh(&adapter->bmu_alloc_lock);
 			return -EBUSY;
 		}
 		adapter->bmu_alloc_pending = false;
 		val = readl(base + ZX_BMU_BUF_ID);
 		if (val & ZX_BMU_BUF_ID_VALID) {
 			adapter->bmu_alloc_late++;
-			return FIELD_GET(ZX_BMU_BUF_ID_BP, val);
+			val = FIELD_GET(ZX_BMU_BUF_ID_BP, val);
+			spin_unlock_bh(&adapter->bmu_alloc_lock);
+			return val;
 		}
 	}
 
 	val = readl(base + ZX_BMU_BUF_ALLOC);
 	writel(val | ZX_BMU_BUF_ALLOC_REQ, base + ZX_BMU_BUF_ALLOC);
-	ret = readl_poll_timeout_atomic(base + ZX_BMU_BUF_ALLOC, val,
-					!(val & ZX_BMU_BUF_ALLOC_BUSY), 1, 1000);
-	if (!ret) {
+	/*
+	 * 有界探活：只读寄存器，不插延时。ZX_BMU_ALLOC_PROBES = 8 的依据是
+	 * **预算**，不是"实测 8 拍够用"（复审 §3 指出上一版把推断写成了结论）：
+	 *  - 旧代码 1 µs 一步 × 最多 1000 步；外场 450 万包上 bmu_alloc_fail /
+	 *    bmu_alloc_late 全 0（.scratch/ffe-fastpath/tx-path-probe/
+	 *    20261103-0030/RESULT.md §2.1）。这只证明"1 ms 内能完成"，**不能**
+	 *    证明"8 拍内能完成"；
+	 *  - 8 拍的推导：Cortex-A9 一次设备读按 30–100 ns 估（含 AXI 往返），
+	 *    8 拍 ≈ 0.25–0.8 µs，比 1 Gbit/s、1500 B 帧的到达间隔（≈12 µs）
+	 *    小一个数量级，所以"每帧最多花 0.8 µs"是固定可接受成本；
+	 *  - 落在预算外时不再靠"重排队一次"收回：调用方 zx_tx_alloc_bp() 会按
+	 *    环空位再探 1~2 次，仍失败就停口 + 丢帧（FIX1，见那里长注释）。
+	 * 上机判据：dma_state 的 tx_bp_alloc_fail 随 pps 线性上涨 = 预算太短，
+	 * 调大这个常量重编即可。
+	 */
+	for (i = 0; i < ZX_BMU_ALLOC_PROBES; i++) {
+		val = readl(base + ZX_BMU_BUF_ALLOC);
+		if (!(val & ZX_BMU_BUF_ALLOC_BUSY))
+			break;
+	}
+	if (!(val & ZX_BMU_BUF_ALLOC_BUSY)) {
 		val = readl(base + ZX_BMU_BUF_ID);
-		if (val & ZX_BMU_BUF_ID_VALID)
-			return FIELD_GET(ZX_BMU_BUF_ID_BP, val);
-		ret = -ENOSPC;
+		if (val & ZX_BMU_BUF_ID_VALID) {
+			val = FIELD_GET(ZX_BMU_BUF_ID_BP, val);
+			spin_unlock_bh(&adapter->bmu_alloc_lock);
+			return val;
+		}
+		adapter->bmu_alloc_pending = true;
+		adapter->bmu_alloc_fail++;
+		spin_unlock_bh(&adapter->bmu_alloc_lock);
+		return -ENOSPC;
 	}
 
 	adapter->bmu_alloc_pending = true;
 	adapter->bmu_alloc_fail++;
-	return ret;
+	spin_unlock_bh(&adapter->bmu_alloc_lock);
+	return -EAGAIN;
+}
+
+/*
+ * 阻塞版：**只给进程上下文**（debugfs 的 txtest）。内部是 nb + usleep_range，
+ * 总预算与原 readl_poll_timeout_atomic(1, 1000) 相同（≈1 ms）。
+ * **调用者不得持 tx_lock**：锁里等硬件正是 P0 要去掉的东西。
+ */
+static int zx_bmu_alloc_bp_wait(struct zx_eth_adapter *adapter)
+{
+	int i, bp = -EAGAIN;
+
+	for (i = 0; i < 10; i++) {
+		bp = zx_bmu_alloc_bp_nb(adapter);
+		if (bp >= 0)
+			break;
+		usleep_range(50, 100);
+	}
+	return bp;
 }
 
 /*
@@ -521,7 +1339,16 @@ static bool zx_bp_poisoned(struct zx_eth_adapter *adapter, u16 bp)
 	return m2 == ZX_BP_POISON_TAIL;
 }
 
-static int zx_bmu_free_bp(struct zx_eth_adapter *adapter, u16 bp)
+/*
+ * FIX1（复审需修②）：空闲表一时回不来时**不再吞掉 bp**。
+ *
+ * may_wait = true  ：进程/非发送路径（RX 归还、txtest、accel_set 排空），保留
+ *                   原来的 5 ms 忙等；
+ * may_wait = false ：发送路径（ndo_start_xmit 栈内）用，空闲表满就立刻把 bp
+ *                   放进待归还队列，由 NAPI poll 排水（zx_bmu_defer_drain），
+ *                   不让一次 5 ms 忙等压在发送路径上（复审 §4 的相邻风险）。
+ */
+static int zx_bmu_free_bp_flags(struct zx_eth_adapter *adapter, u16 bp, bool may_wait)
 {
 	u32 val;
 	int ret = 0;
@@ -542,10 +1369,31 @@ static int zx_bmu_free_bp(struct zx_eth_adapter *adapter, u16 bp)
 
 	spin_lock_bh(&adapter->bmu_free_lock);
 	if (!adapter->bmu_free_slots) {
-		ret = readl_poll_timeout_atomic(adapter->base + ZX_BMU_FREE_STATUS,
-						val, val & ZX_BMU_FREE_SLOTS, 1, 5000);
+		if (may_wait)
+			ret = readl_poll_timeout_atomic(adapter->base + ZX_BMU_FREE_STATUS,
+							val, val & ZX_BMU_FREE_SLOTS,
+							1, 5000);
+		else
+			ret = -EAGAIN;		/* 发送路径：不忙等，转待归还队列 */
 		if (ret) {
 			adapter->bmu_free_fail++;
+			/*
+			 * 把 bp 放进待归还队列（不是丢掉）。队列满 32 说明 BMU
+			 * 长时间不接空闲表：这时才真的放弃，并告警一次（每
+			 * 32 个丢一个的静默比告警更坏）。
+			 */
+			if ((u16)(adapter->bmu_defer_head -
+				  adapter->bmu_defer_tail) < ZX_BMU_DEFER_MAX) {
+				adapter->bmu_defer[adapter->bmu_defer_head++ %
+						   ZX_BMU_DEFER_MAX] = bp;
+				adapter->bmu_free_defer++;
+			} else {
+				adapter->bmu_free_defer_drop++;
+				WARN_ONCE(1,
+					  "zx279128s: BMU free list stuck, bp %u abandoned (%u so far)\n",
+					  bp, adapter->bmu_free_defer_drop);
+			}
+			ret = -EAGAIN;
 			goto out;
 		}
 		adapter->bmu_free_slots = FIELD_GET(ZX_BMU_FREE_SLOTS, val);
@@ -574,6 +1422,17 @@ static int zx_bmu_free_bp(struct zx_eth_adapter *adapter, u16 bp)
 out:
 	spin_unlock_bh(&adapter->bmu_free_lock);
 	return ret;
+}
+
+static int zx_bmu_free_bp(struct zx_eth_adapter *adapter, u16 bp)
+{
+	return zx_bmu_free_bp_flags(adapter, bp, true);
+}
+
+/* FIX1：发送路径专用 —— 空闲表满时不忙等，直接进待归还队列。 */
+static int zx_bmu_free_bp_nowait(struct zx_eth_adapter *adapter, u16 bp)
+{
+	return zx_bmu_free_bp_flags(adapter, bp, false);
 }
 
 /*
@@ -1068,8 +1927,10 @@ static int zx_hw_init(struct zx_eth_adapter *adapter)
 	 */
 	writel(1,      base + ZX_DMA_BASE + 0x28);
 	writel(1,      base + ZX_DMA_BASE + 0x2c);
-	writel(ZX_RX_IRQ_USECS * 50, base + ZX_DMA_RX_IRQ_TIMER);
-	writel(ZX_RX_IRQ_FRAMES, base + ZX_DMA_RX_IRQ_FRAMES);
+	/* coal-knob：默认 250 µs / 16 帧 ⇒ 12500 ticks / 16（本板实测最优；基线 500/64） */
+	writel(READ_ONCE(zxcoal_us) * ZXCOAL_TICKS_PER_US,
+	       base + ZX_DMA_RX_IRQ_TIMER);
+	writel(READ_ONCE(zxcoal_frames), base + ZX_DMA_RX_IRQ_FRAMES);
 	writel(0x7f,   base + ZX_DMA_BASE + 0x04);
 	writel(32,     base + ZX_DMA_BASE + 0x20);
 	writel(32,     base + ZX_DMA_BASE + 0x24);
@@ -1236,10 +2097,18 @@ void zx_tx_reclaim(struct zx_eth_adapter *adapter)
 		}
 	}
 	/*
+	 * DIAG 5：这批描述符从"TX_START 那一刻"到"现在被 reclaim 看到"的
+	 * 时间分布。必须在 bp_state 的循环之后（那里会动 tail 附近的表项，
+	 * 但 tx_ts[] 是独立数组，顺序无关），也不能提前 return：n == 0 时
+	 * zx_diag_tx_done() 自己直接返回。
+	 */
+	if (unlikely(zx_diag_on(ZX_DIAG_B_TXLAT)))
+		zx_diag_tx_done(adapter, tail, n);
+	/*
 	 * 加速模式切换期间不动队列：切换自己会 netif_tx_disable() 所有端口，
 	 * 这里再把队列叫醒就等于开着门切换（设计 §1.4 S2/S6）。
 	 */
-	if (adapter->tx_pending < ZX_TX_QUEUE_LIMIT &&
+	if (adapter->tx_pending < READ_ONCE(zx_txq_limit) &&
 	    !READ_ONCE(adapter->accel.quiesce)) {
 		int p;
 
@@ -1247,6 +2116,131 @@ void zx_tx_reclaim(struct zx_eth_adapter *adapter)
 			if (adapter->ports[p] && netif_queue_stopped(adapter->ports[p]))
 				netif_wake_queue(adapter->ports[p]);
 	}
+}
+
+/* ---- FIX1：BMU 申请失败的处置与恢复（复审 BLOCKER） ----------------- */
+
+/*
+ * 重试次数与"环里还剩多少空位"挂钩：空位宽裕（≥ 环长一半）时多探一次，
+ * 用一次 ~0.5 µs 的 MMIO 换掉一帧；空位紧张时立刻给背压，因为这时再探
+ * 只会挤在别人的 reclaim 后面。上限 2，单帧 MMIO 预算保持 ≤ 2 × 8 拍。
+ */
+static unsigned int zx_tx_alloc_retry_cnt(struct zx_eth_adapter *adapter)
+{
+	u32 limit = READ_ONCE(zx_txq_limit);
+	u32 pending = READ_ONCE(adapter->tx_pending);
+	u32 free_slots = limit > pending ? limit - pending : 0;
+
+	return free_slots >= limit / 2 ? ZX_TX_BP_RETRY_MAX : ZX_TX_BP_RETRY_MIN;
+}
+
+/* 有界重试版申请：最多 retry_cnt 次 zx_bmu_alloc_bp_nb()，中间不插延时。 */
+static int zx_tx_alloc_bp(struct zx_eth_adapter *adapter)
+{
+	unsigned int tries = zx_tx_alloc_retry_cnt(adapter);
+	unsigned int i;
+	int bp = -EAGAIN;
+
+	for (i = 0; i < tries; i++) {
+		bp = zx_bmu_alloc_bp_nb(adapter);
+		if (bp >= 0 && bp < ZX_NUM_BUFFERS)
+			return bp;
+		if (i + 1 < tries)
+			adapter->tx_bp_alloc_retry++;
+	}
+	return bp;
+}
+
+/*
+ * 申请失败的统一处置（FIX1）：**不返回 NETDEV_TX_BUSY**。
+ *
+ *  1. 只停**入口口**（netdev 就是那个口），不碰其余四个；
+ *  2. tx_lock 下挂 kick：250 µs 后必定来一次 NAPI poll
+ *     （zx_eth_poll → zx_tx_starve_recover），队列不会"停着没人管"；
+ *  3. 丢这一帧并计数：dev_dstats_tx_dropped() 让 /proc/net/dev 也看得见。
+ *
+ * 为什么不用"停口 + NETDEV_TX_BUSY 重排队"：帧确实不丢，但一旦恢复探测
+ * 失灵，这个口就永久卡在 head-of-line；丢帧版本即使恢复机制全挂，也只是
+ * 持续丢帧（每帧 ≤ 2 × 8 拍 MMIO），不会静默变砖。
+ */
+static void zx_tx_alloc_fail_drop(struct zx_eth_adapter *adapter,
+				  struct net_device *netdev, struct sk_buff *skb)
+{
+	adapter->tx_bp_alloc_drop++;
+	if (!netif_queue_stopped(netdev)) {
+		adapter->tx_starve_stop++;
+		adapter->tx_starve_polls = 0;
+		WRITE_ONCE(adapter->tx_bmu_starved, true);
+		netif_stop_queue(netdev);
+	}
+	spin_lock_bh(&adapter->tx_lock);
+	zx_tx_kick(adapter);
+	spin_unlock_bh(&adapter->tx_lock);
+	dev_dstats_tx_dropped(netdev);
+	dev_kfree_skb_any(skb);
+}
+
+/*
+ * 停口后的恢复（在 zx_eth_poll 里、**不持 tx_lock** 调用）：
+ *
+ *  A. 锁外探一次 zx_bmu_alloc_bp_nb()（8 拍 MMIO，无延时）。成功说明 BMU
+ *     又有缓冲：把探针拿到的 bp 立刻还回去，不占池子（还失败也有待归还
+ *     队列兜着）。这一句就是"有配对唤醒"的探针来源。
+ *  B. 锁内只做"清标志 + 唤醒"（与停口侧对称，都在 tx_lock 里）。
+ *  C. 兜底：探测满 ZX_TX_STARVE_MAX_POLLS 轮（64 × 250 µs ≈ 16 ms）仍没好，
+ *     也把队列放开 —— 之后每帧走"申请失败 → 丢帧"，口绝不会永久停住。
+ */
+static void zx_tx_starve_recover(struct zx_eth_adapter *adapter)
+{
+	int probe;
+	bool ok;
+
+	if (!READ_ONCE(adapter->tx_bmu_starved))
+		return;
+
+	probe = zx_bmu_alloc_bp_nb(adapter);
+	ok = probe >= 0 && probe < ZX_NUM_BUFFERS;
+	if (ok) {
+		zx_bmu_free_bp(adapter, (u16)probe);
+		adapter->tx_starve_polls = 0;
+	}
+
+	spin_lock_bh(&adapter->tx_lock);
+	if (ok || ++adapter->tx_starve_polls >= ZX_TX_STARVE_MAX_POLLS) {
+		int p;
+
+		WRITE_ONCE(adapter->tx_bmu_starved, false);
+		adapter->tx_starve_polls = 0;
+		if (!READ_ONCE(adapter->accel.quiesce))
+			for (p = 0; p < ZX_NUM_PORTS; p++)
+				if (adapter->ports[p] &&
+				    netif_queue_stopped(adapter->ports[p]))
+					netif_wake_queue(adapter->ports[p]);
+	}
+	spin_unlock_bh(&adapter->tx_lock);
+}
+
+/*
+ * FIX1：待归还队列的排水。每轮 NAPI 最多还 4 个，避免"归还失败→再排队"
+ * 自我放大；空闲表还是满就立刻停手（不在 NAPI 里做 5 ms 忙等）。
+ */
+static void zx_bmu_defer_drain(struct zx_eth_adapter *adapter, unsigned int max)
+{
+	unsigned int i;
+
+	spin_lock_bh(&adapter->bmu_free_lock);
+	for (i = 0; i < max && adapter->bmu_defer_tail != adapter->bmu_defer_head; i++) {
+		u16 bp;
+
+		if (!adapter->bmu_free_slots)
+			break;
+		bp = adapter->bmu_defer[adapter->bmu_defer_tail % ZX_BMU_DEFER_MAX];
+		adapter->bmu_free_slots--;
+		writel(bp, adapter->base + ZX_BMU_BUF_FREE);
+		adapter->bmu_defer_tail++;
+		adapter->bmu_free_defer_ok++;
+	}
+	spin_unlock_bh(&adapter->bmu_free_lock);
 }
 
 /* ---- 零拷贝收发（zc）----------------------------------------------- */
@@ -1685,6 +2679,32 @@ static void zx_zc_destructor(struct sk_buff *skb)
 }
 
 /*
+ * 锁外预判（P0）：这一帧**可能**走零拷贝发送吗？只读 skb 与池指针，不取锁、
+ * 不改任何状态，可以在 tx_lock 之外随便调。
+ *
+ * 它必须与 zx_zc_tx_take() 的前段判据**同一份**（take 现在直接调它）：返回
+ * false 时 take 一定不会成功，所以 zx_eth_xmit() 可以据此决定"要不要在锁外
+ * 先申请一个 BMU 缓冲"。计数口径也没变：head/data/len/shared 不符时照旧记
+ * zc_fallback，每帧仍然只记一次。
+ */
+static bool zx_zc_tx_candidate(struct zx_eth_adapter *adapter,
+			       struct sk_buff *skb)
+{
+	const u8 *slot;
+	u16 bp;
+
+	if (!adapter->zc_rx || !zx_zc_tag_get(skb, &bp) || bp >= ZX_NUM_BUFFERS)
+		return false;
+	slot = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE;
+	if (!skb->head_frag || skb->head != slot || skb->data != slot + 16 ||
+	    skb_headlen(skb) != skb->len || skb_shared(skb)) {
+		adapter->zc_fallback++;
+		return false;
+	}
+	return true;
+}
+
+/*
  * 发送侧：能从槽位直接发就返回 true 并给出 bp。
  * 判断"数据只有这一个 skb 在用"靠 dataref：state==SKB 时只有 skb 自带的那份
  * （=1），state==SHADOW 时还有我们那份（=2）。多于这个数说明还有克隆体共享
@@ -1696,18 +2716,11 @@ static bool zx_zc_tx_take(struct zx_eth_adapter *adapter, struct sk_buff *skb,
 {
 	struct skb_shared_info *sp;
 	u16 bp;
-	u8 *slot;
 	u8 st;
 	u32 mine;
 
-	if (!adapter->zc_rx || !zx_zc_tag_get(skb, &bp) || bp >= ZX_NUM_BUFFERS)
+	if (!zx_zc_tx_candidate(adapter, skb) || !zx_zc_tag_get(skb, &bp))
 		return false;
-	slot = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE;
-	if (!skb->head_frag || skb->head != slot || skb->data != slot + 16 ||
-	    skb_headlen(skb) != skb->len || skb_shared(skb)) {
-		adapter->zc_fallback++;
-		return false;
-	}
 
 	spin_lock_bh(&adapter->zc_lock);
 	st = adapter->zc_state[bp];
@@ -1812,7 +2825,7 @@ void zx_zc_set(struct zx_eth_adapter *adapter, bool on)
  * 调用方还必须拥有 bp：描述符一写，硬件就会去读这个槽位，之后再"还回去/改写
  * 内容"都是二次所有权。
  *
- * 返回 false 表示环满（tx_pending >= ZX_TX_QUEUE_LIMIT）：这时**一个字节都没
+ * 返回 false 表示环满（tx_pending >= txq_limit，见 zx_txq_limit）：这时**一个字节都没
  * 写**，bp 与帧内容保持调用前的样子，调用方可以安全地把这一帧交给协议栈。
  * tx_lock 在手里时这个判断不会被别人改变——tx_pending 只在 tx_lock 下增长。
  */
@@ -1823,8 +2836,12 @@ bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
 	__le32 *desc;
 	u32 tx_idx;
 
-	if (unlikely(adapter->tx_pending >= ZX_TX_QUEUE_LIMIT))
+	if (unlikely(adapter->tx_pending >= READ_ONCE(zx_txq_limit))) {
+		/* DIAG 4/6：这是"提交被 txq_limit 挡回"的唯一入口（栈与快路共用） */
+		if (unlikely(zx_diag_on(ZX_DIAG_B_TXQ | ZX_DIAG_B_DROP)))
+			zx_diag_txq_block(adapter, eport);
 		return false;
+	}
 	/* C1：bp 已在发送环就拒（调用方持 tx_lock）：否则 tx_bp[] 两格同 bp、reclaim 两次 FREE */
 	if (unlikely(adapter->bp_state && bp < ZX_NUM_BUFFERS &&
 		     READ_ONCE(adapter->bp_state[bp]) == ZX_BP_TX)) {
@@ -1865,13 +2882,37 @@ bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
 	/* 快路与栈共用一个环，dma_state 的 qlen_peak 记整环占用峰值 */
 	if (adapter->tx_pending > READ_ONCE(adapter->accel.cnt[0].qlen_peak))
 		WRITE_ONCE(adapter->accel.cnt[0].qlen_peak, adapter->tx_pending);
-	if (adapter->tx_pending >= ZX_TX_QUEUE_LIMIT) {
+	/*
+	 * DIAG：一次结算 1/4/5/2/8 五项（内部按 zx_diag_mask 分派，
+	 * 关掉时外层这一个位测试就是全部代价）。pending 传**自增之前**的值，
+	 * 所以是 tx_pending - 1。
+	 */
+	if (unlikely(READ_ONCE(zx_diag_mask)))
+		zx_diag_tx_submit(adapter, eport, bp, tx_idx,
+				  adapter->tx_pending - 1, (u16)len);
+	/*
+	 * zxdly_tx_ns：纯延迟，与 diag_seq 的 TX 侧同处（提交成功、tx_lock +
+	 * RCU 临界区里）。它只消耗时间：不读帧、不查表、不写共享状态。
+	 * 这是一条**独立**的剂量臂（TX-only），不要和 RX 侧合并看。
+	 * 默认 0 ⇒ 只多这一次 unlikely 分支，行为不变。
+	 */
+	if (unlikely(READ_ONCE(zxdly_tx_ns))) {
+		unsigned int zxdly_ns = READ_ONCE(zxdly_tx_ns);
+
+		if (zxdly_ns < 1000)
+			ndelay(zxdly_ns);
+		else
+			udelay(DIV_ROUND_UP(zxdly_ns, 1000));
+	}
+	if (adapter->tx_pending >= READ_ONCE(zx_txq_limit)) {
 		int p;
 
 		for (p = 0; p < ZX_NUM_PORTS; p++)
 			if (adapter->ports[p])
 				netif_stop_queue(adapter->ports[p]);
 		zx_tx_kick(adapter);
+		if (unlikely(zx_diag_on(ZX_DIAG_B_TXQ)))
+			zx_diag_txq_trip(adapter, eport);
 	}
 	return true;
 }
@@ -1887,8 +2928,9 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 	struct zx_eth_adapter *adapter = priv->adapter;
 	unsigned int len = skb->len;
 	u8 *buf_ptr;
-	int bp;
+	int bp = -1;
 	u16 zcbp = 0;
+	bool pre_bp = false;
 	u64 t_entry, t_reclaim, t_alloc, t_copy, t_start;
 
 	t_entry = ZX_TS();
@@ -1899,6 +2941,55 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 		return NETDEV_TX_OK;
 	}
 
+	/*
+	 * P0（tx-lock-scope）：环**可能**满时先不申请 BMU 缓冲。旧代码在锁里
+	 * 先判容量再申请，"环满"这条路上一次申请都不做；申请挪到锁外以后若
+	 * 仍然无条件申请，环满时每帧都要多做一次申请+归还（归还侧空闲表空时
+	 * zx_bmu_free_bp 自己还要等硬件，预算是 5 ms）。这里是**无锁提示**：
+	 * tx_pending 只在 tx_lock 下变，读到的可能是旧值，所以锁里还会再判
+	 * 一次；提示为假时（绝大多数）直接走下面的正常路径。
+	 */
+	if (unlikely(READ_ONCE(adapter->tx_pending) >= READ_ONCE(zx_txq_limit))) {
+		spin_lock_bh(&adapter->tx_lock);
+		zx_tx_reclaim(adapter);
+		if (adapter->tx_pending >= READ_ONCE(zx_txq_limit)) {
+			netif_stop_queue(netdev);
+			zx_tx_kick(adapter);
+			spin_unlock_bh(&adapter->tx_lock);
+			/* DIAG 6：栈路径环满 -> 交回 qdisc 重排（这是"回栈"的一半） */
+			if (unlikely(zx_diag_on(ZX_DIAG_B_DROP)))
+				zx_diag_drop(adapter, ZX_DIAG_DROP_TXQ_BUSY);
+			return NETDEV_TX_BUSY;
+		}
+		spin_unlock_bh(&adapter->tx_lock);
+		/* 提示是旧的（别的端口刚 reclaim 过）：按正常路径重来一次 */
+	}
+
+	/*
+	 * 零拷贝候选为真时不预申请（take 成功就一个缓冲都不用）；其余情况
+	 * 在**锁外**把缓冲拿到手：BMU 可能要等，而 tx_lock 里绝不许等
+	 * （旧版 readl_poll_timeout_atomic(1, 1000) 可以在这里持锁 1 ms）。
+	 *
+	 * FIX1（复审 BLOCKER）：拿不到**不能**返回 NETDEV_TX_BUSY。6.18 的
+	 * dev_requeue_skb() → __netif_schedule() → qdisc_run() 会立刻重排队
+	 * （net/sched/sch_generic.c:144-176、:357-370；net/core/dev.c:5778），
+	 * 只要队列开着就是**无界重试**；BMU 空闲表干涸时（REQ 位不撤，
+	 * nb 永远 -EBUSY）结果就是"数据面 0 包 + 一个 CPU 的 sirq 顶满"。
+	 * 处置改为：有界重试（次数按环空位裁）→ 只停**入口口** → 丢这一帧
+	 * 并计数 → 返回 OK。唤醒在 zx_eth_poll() 的 zx_tx_starve_recover()，
+	 * 里面有 16 ms 无条件放开的兜底。
+	 */
+	if (!zx_zc_tx_candidate(adapter, skb)) {
+		bp = zx_tx_alloc_bp(adapter);
+		if (unlikely(bp < 0 || bp >= ZX_NUM_BUFFERS)) {
+			adapter->tx_bp_alloc_fail++;
+			zx_tx_alloc_fail_drop(adapter, netdev, skb);
+			return NETDEV_TX_OK;
+		}
+		pre_bp = true;
+	}
+	t_alloc = ZX_TS();
+
 	spin_lock_bh(&adapter->tx_lock);
 	zx_tx_reclaim(adapter);
 	t_reclaim = ZX_TS();
@@ -1907,35 +2998,51 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 	 * full, but another port's transmit may already be waiting for the
 	 * lock: give its frame back to the stack.
 	 */
-	if (adapter->tx_pending >= ZX_TX_QUEUE_LIMIT) {
+	if (unlikely(adapter->tx_pending >= READ_ONCE(zx_txq_limit))) {
 		netif_stop_queue(netdev);
 		zx_tx_kick(adapter);
 		spin_unlock_bh(&adapter->tx_lock);
+		if (pre_bp)
+			zx_bmu_free_bp_nowait(adapter, (u16)bp);
 		return NETDEV_TX_BUSY;
 	}
+	/*
+	 * skb_put_padto() 失败时**已经释放了 skb**（__skb_put_padto 的
+	 * free_on_error=true，include/linux/skbuff.h:3949），这里只差把预申请的
+	 * bp 还回去，绝不能再 kfree 一次。
+	 */
 	if (skb_put_padto(skb, ETH_ZLEN)) {
 		spin_unlock_bh(&adapter->tx_lock);
+		if (pre_bp)
+			zx_bmu_free_bp_nowait(adapter, (u16)bp);
 		dev_dstats_tx_dropped(netdev);
 		return NETDEV_TX_OK;
 	}
 	len = skb->len;
-	if (zx_zc_tx_take(adapter, skb, &zcbp)) {
-		/*
-		 * 零拷贝：帧本来就在这个槽位里，既不申请缓冲也不搬家，
-		 * 硬件发完自己把 bp 还回 BMU。
-		 */
-		bp = zcbp;
-		t_alloc = ZX_TS();
-	} else {
-		bp = zx_bmu_alloc_bp(adapter);
-		if (bp < 0 || bp >= ZX_NUM_BUFFERS) {
-			spin_unlock_bh(&adapter->tx_lock);
-			dev_dstats_tx_dropped(netdev);
-			dev_kfree_skb_any(skb);
-			return NETDEV_TX_OK;
+	if (!pre_bp) {
+		if (zx_zc_tx_take(adapter, skb, &zcbp)) {
+			/*
+			 * 零拷贝：帧本来就在这个槽位里，既不申请缓冲也不搬家，
+			 * 硬件发完自己把 bp 还回 BMU。
+			 */
+			bp = zcbp;
+		} else {
+			/*
+			 * 罕见：候选为真但 take 拒了（引用计数 > 1、陈旧 tag、
+			 * 环项缺失）。锁内补一次有界探活（8 拍 MMIO，不等）；
+			 * FIX1：拿不到也走同一条处置（停口 + 丢帧 + OK），
+			 * 不再返回 NETDEV_TX_BUSY。
+			 */
+			bp = zx_bmu_alloc_bp_nb(adapter);
+			if (unlikely(bp < 0 || bp >= ZX_NUM_BUFFERS)) {
+				spin_unlock_bh(&adapter->tx_lock);
+				adapter->tx_bp_alloc_fail++;
+				zx_tx_alloc_fail_drop(adapter, netdev, skb);
+				return NETDEV_TX_OK;
+			}
 		}
-
-		t_alloc = ZX_TS();
+	}
+	if (!zcbp) {
 		if (unlikely(adapter->zc_state[bp] == ZX_ZC_BS_SHADOW))
 			adapter->zc_tx_dup++;	/* 调试：BMU 把还挂着影子的 bp 给了发送 */
 		zx_zc_ev(adapter, (u16)bp, 4, adapter->zc_state[bp]);
@@ -1944,8 +3051,8 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 		if (skb_headlen(skb) >= len) {
 			memcpy(buf_ptr, skb->data, len);
 		} else if (skb_copy_bits(skb, 0, buf_ptr, len)) {
-			zx_bmu_free_bp(adapter, bp);
 			spin_unlock_bh(&adapter->tx_lock);
+			zx_bmu_free_bp_nowait(adapter, (u16)bp);
 			dev_dstats_tx_dropped(netdev);
 			dev_kfree_skb_any(skb);
 			return NETDEV_TX_OK;
@@ -1971,19 +3078,24 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 	 * zc 的那份 bp 由 skb 的 destructor 收回去），绝不发半成品。
 	 */
 	if (unlikely(!zx_tx_submit_bp(adapter, priv->port, (u16)bp, len))) {
-		if (!zcbp)
-			zx_bmu_free_bp(adapter, bp);
 		spin_unlock_bh(&adapter->tx_lock);
+		if (!zcbp)
+			zx_bmu_free_bp_nowait(adapter, (u16)bp);
 		dev_dstats_tx_dropped(netdev);
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
 	t_start = ZX_TS();
 
+	/*
+	 * P0 起四段的含义（申请已经不在锁里）：[0] 锁外申请/零拷贝预判，
+	 * [1] 取锁 + 回收，[2] 拷贝 + 同步（含锁内那次罕见的补申请），
+	 * [3] 提交。dma_state 的标签同步改过。
+	 */
 	if (unlikely(timing)) {
-		adapter->tx_stage_ns[0] += t_reclaim - t_entry;
-		adapter->tx_stage_ns[1] += t_alloc - t_reclaim;
-		adapter->tx_stage_ns[2] += t_copy - t_alloc;
+		adapter->tx_stage_ns[0] += t_alloc - t_entry;
+		adapter->tx_stage_ns[1] += t_reclaim - t_alloc;
+		adapter->tx_stage_ns[2] += t_copy - t_reclaim;
 		adapter->tx_stage_ns[3] += t_start - t_copy;
 		adapter->tx_stage_n++;
 	}
@@ -2088,6 +3200,8 @@ static void zx_alias_snapshot(struct zx_eth_adapter *adapter,
 static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 {
 	int work_done = 0, q;
+	/* DIAG 3：本轮快路转发帧数（只在 diag_poll 打开时才累加） */
+	int diag_fwd = 0;
 
 	if (unlikely(adapter->zc_q_head != READ_ONCE(adapter->zc_q_tail)))
 		zx_zc_reap(adapter);
@@ -2229,6 +3343,34 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 							16 + len,
 							DMA_FROM_DEVICE);
 			t2 = ZX_TS();
+			/*
+			 * zxdly_rx_ns：纯延迟，位置在这里 —— 紧接着
+			 * dma_sync_single_for_cpu()（上面那次 invalidate）、在快路
+			 * 判据之前，与 diag_seq 的 RX 入口同一个槽位。它只消耗
+			 * 时间：不读帧、不查表、不写任何共享状态。
+			 * 这是一条**独立**的剂量臂（RX-only），不要和 TX 侧合并看。
+			 * 默认 0 ⇒ 只多这一次 unlikely 分支，行为不变。
+			 * 注意：开它时不要再开 timing=1 —— 这段会算进 rx_stage_ns[2]。
+			 */
+			if (unlikely(READ_ONCE(zxdly_rx_ns))) {
+				unsigned int zxdly_ns = READ_ONCE(zxdly_rx_ns);
+
+				if (zxdly_ns < 1000)
+					ndelay(zxdly_ns);
+				else
+					udelay(DIV_ROUND_UP(zxdly_ns, 1000));
+			}
+
+			/*
+			 * DIAG 2（RX 侧）：**必须放在上面那次 invalidate 之后**
+			 * ——池默认是可缓存的，先读会拿到上一个帧在这个槽位
+			 * 留下的缓存行，seq 就成了假的（会凭空多出"回退"）。
+			 * 这里 bp/len 已校验、缓存已同步，是"RX 入口"最准的一点：
+			 * 它记的回退只可能是交换机/DMA 侧的乱序，与 TX 侧的
+			 * 回退（zx_tx_submit_bp 里记的那一格）能分开归属。
+			 */
+			if (unlikely(zx_diag_on(ZX_DIAG_B_SEQ)))
+				zx_diag_rx_entry(adapter, bp, len, port);
 
 			/*
 			 * P10.5 A4：帧首还是我们归还时写的毒值 ⇒ 这个槽位回到
@@ -2367,6 +3509,18 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 					ffe = zx_ffe_rx(adapter, bp, len,
 							port, nfam);
 			}
+			/*
+			 * DIAG 1：快路入口打的戳只属于"真的被快路转发"的帧。
+			 * 回栈/丢弃的帧把戳撤掉，否则同一个 bp 之后被栈路径
+			 * 拿去发送时会被误结算成一次超长停留。
+			 * FORWARDED 的戳已经在 zx_tx_submit_bp() 里结算掉了。
+			 */
+			if (unlikely(zx_diag_on(ZX_DIAG_B_RESIDENCE)) &&
+			    ffe != ZX_FFE_RX_FORWARDED)
+				zx_diag_res_clear(adapter, bp);
+			if (ffe == ZX_FFE_RX_FORWARDED &&
+			    unlikely(zx_diag_on(ZX_DIAG_B_POLL)))
+				diag_fwd++;
 			if (ffe != ZX_FFE_RX_STACK)
 				goto ffe_done;
 accel_slow:
@@ -2572,6 +3726,18 @@ zc_skip:
 				t4 = ZX_TS();
 				dev_dstats_rx_add(dest_dev, len);
 			} else {
+				/*
+				 * DIAG 6：投递失败的三条**互斥**原因。既有代码
+				 * 只对 dest_dev 非空的那一种记 dev_dstats，这里把
+				 * "dest_dev == NULL"（端口越界/未 probe）单独
+				 * 计成 rx_drop_nondev —— 这是任务书点名新加的。
+				 */
+				if (unlikely(zx_diag_on(ZX_DIAG_B_DROP)))
+					zx_diag_drop(adapter, !dest_dev ?
+						ZX_DIAG_DROP_RX_NONDEV :
+						(!(dest_dev->flags & IFF_UP) ?
+						 ZX_DIAG_DROP_RX_DOWN :
+						 ZX_DIAG_DROP_SKB_NOMEM));
 				if (skb)
 					dev_kfree_skb_any(skb);
 				if (dest_dev)
@@ -2619,8 +3785,10 @@ ffe_done:
 			 *   timing 统计 —— 快路不加样本（它是另一条路径，加了会把
 			 *     慢路的每段均值稀释成没有意义的数）。
 			 *
-			 * DROPPED 是"改写之后提交失败"的兜底（理论上不可达）：帧已
-			 * 经改过，不能回栈，但槽位也没交给硬件，所以必须还 bp。
+			 * DROPPED 是"不能回栈、槽位也没交给硬件"的那一类：默认是
+			 * "改写之后提交失败"的兜底（理论上不可达）；P2 起多一个来源
+			 * —— ffe_qfull_drop=1 时环满直接丢（帧还没改写，bp 同样没
+			 * 交给硬件）。两种都必须还一次 bp。
 			 */
 			zx_rx_consume(desc, rel);
 			adapter->rx_cur_idx[q]++;
@@ -2638,6 +3806,9 @@ ffe_done:
 		if (rel[1] && zx_rx_release(adapter, q, 1, rel[1]))
 			adapter->rx_rel_fail++;
 	}
+	/* DIAG 3：本轮的"处理帧数 / 其中快路转发数"各进一个桶（0..64） */
+	if (unlikely(zx_diag_on(ZX_DIAG_B_POLL)))
+		zx_diag_poll(adapter, work_done, diag_fwd);
 	return work_done;
 }
 
@@ -2663,9 +3834,19 @@ static int zx_eth_poll(struct napi_struct *napi, int budget)
 
 	spin_lock_bh(&adapter->tx_lock);
 	zx_tx_reclaim(adapter);
-	if (adapter->tx_pending >= ZX_TX_QUEUE_LIMIT)
+	/*
+	 * FIX1：环满要 kick（等 reclaim 把 tx_pending 降下来）；BMU 申请失败
+	 * 停过口也一样要 kick —— 否则“队列停着 → 没人申请 → 永远拿不到缓冲”
+	 * 就成死结（复审 §1.1 点名的变砖路径）。
+	 */
+	if (adapter->tx_pending >= READ_ONCE(zx_txq_limit) ||
+	    READ_ONCE(adapter->tx_bmu_starved))
 		zx_tx_kick(adapter);
 	spin_unlock_bh(&adapter->tx_lock);
+
+	/* FIX1：先排待归还队列，再探“停口是否该唤醒” */
+	zx_bmu_defer_drain(adapter, 4);
+	zx_tx_starve_recover(adapter);
 	work_done = budget ? zx_eth_rx(adapter, budget) : 0;
 
 	if (work_done < budget && napi_complete_done(napi, work_done))
@@ -3039,7 +4220,7 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 		u32 n = adapter->tx_stage_n;
 		int j;
 
-		seq_printf(s, "tx阶段(ns/包) 回收 %llu 申请BMU %llu 拷贝+同步 %llu 启动 %llu 合计 %llu n=%u\n",
+		seq_printf(s, "tx阶段(ns/包) 申请BMU(锁外) %llu 取锁+回收 %llu 拷贝+同步 %llu 启动 %llu 合计 %llu n=%u\n",
 			   div_u64(adapter->tx_stage_ns[0], n),
 			   div_u64(adapter->tx_stage_ns[1], n),
 			   div_u64(adapter->tx_stage_ns[2], n),
@@ -3053,13 +4234,30 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 	seq_printf(s, "sw_members=%#x sw_fdb_deleted=%u\n",
 		   adapter->sw_members,
 		   adapter->sw_fdb_deleted);
-	seq_printf(s, "bmu_alloc_fail=%u bmu_alloc_late=%u bmu_free_fail=%u bmu_free_slots=%u\n",
+	seq_printf(s, "bmu_alloc_fail=%u bmu_alloc_late=%u bmu_free_fail=%u bmu_free_slots=%u tx_bp_alloc_fail=%u\n",
 		   adapter->bmu_alloc_fail, adapter->bmu_alloc_late,
-		   adapter->bmu_free_fail, adapter->bmu_free_slots);
-	seq_printf(s, "accel v4=%s v6=%s q=%u\n",
+		   adapter->bmu_free_fail, adapter->bmu_free_slots,
+		   READ_ONCE(adapter->tx_bp_alloc_fail));
+	seq_printf(s, "tx_bp_alloc_drop=%u tx_bp_alloc_retry=%u tx_starve_stop=%u starved=%u starve_polls=%u\n",
+		   READ_ONCE(adapter->tx_bp_alloc_drop),
+		   READ_ONCE(adapter->tx_bp_alloc_retry),
+		   adapter->tx_starve_stop,
+		   READ_ONCE(adapter->tx_bmu_starved) ? 1 : 0,
+		   READ_ONCE(adapter->tx_starve_polls));
+	seq_printf(s, "bmu_free_defer=%u bmu_free_defer_ok=%u bmu_free_defer_drop=%u\n",
+		   adapter->bmu_free_defer, adapter->bmu_free_defer_ok,
+		   adapter->bmu_free_defer_drop);
+	/*
+	 * P2：qfull_drop 是"环满时按 ffe_qfull_drop=1 直接丢掉"的帧数（v4+v6
+	 * 两族之和）。默认 0 时它恒 0、fallback_qfull 才是证据；切到 1 以后
+	 * 这两个数一起看就能分清"回栈背压"还是"真丢"。
+	 */
+	seq_printf(s, "accel v4=%s v6=%s q=%u qfull_drop=%llu\n",
 		   zx_accel_mode_name(READ_ONCE(adapter->accel.v4_mode)),
 		   zx_accel_mode_name(READ_ONCE(adapter->accel.v6_mode)),
-		   READ_ONCE(adapter->tx_pending));
+		   READ_ONCE(adapter->tx_pending),
+		   READ_ONCE(adapter->accel_qfull_drop[0]) +
+		   READ_ONCE(adapter->accel_qfull_drop[1]));
 	seq_printf(s, "zc_rx=%d rx_ok=%llu tx_ok=%llu free_ok=%llu out=%lld fallback=%llu q_ovf=%llu capped=%llu off=%llu\n",
 		   READ_ONCE(adapter->zc_rx), adapter->zc_rx_ok,
 		   adapter->zc_tx_ok, adapter->zc_free_ok,
@@ -3310,107 +4508,140 @@ static ssize_t zx_eth_txtest_write(struct file *file, const char __user *ubuf,
 			 readl(mb + ZX_MAC_TX_FRAMES));
 	}
 
-	spin_lock_bh(&adapter->tx_lock);
-	zx_tx_reclaim(adapter);
-	for (p = 0; p < ZX_NUM_PORTS; p++) {
-		struct net_device *nd = adapter->ports[p];
-		struct zx_eth_priv *priv;
-		unsigned int ndesc, nslots, seg[2], cut;
-		u16 bp[9] = { 0 };
-		int k, ok = 1;
+	/*
+	 * P0（tx-lock-scope）：BMU 申请必须在 tx_lock 之外。这里一次要为每个
+	 * 端口拿 1~9 个缓冲，旧版在锁里调 zx_bmu_alloc_bp()（当时是 1 ms 轮询/次）：
+	 * 5 个端口 × 每口最多 9 个 bp × 1 ms = 最坏约 45 ms 持锁（复审 §10.2 指出
+	 * 之前写“9 ms”只算了单口）。debugfs 写是进程上下文，用会睡的
+	 * zx_bmu_alloc_bp_wait()；锁里只剩容量检查、拷贝、写描述符。
+	 * 锁里发现容量不够或槽位不相邻时，把还没交出去的 bp 记进 tofree[]，
+	 * 解锁后统一归还（zx_bmu_free_bp 自己也要等硬件，不能进锁）。
+	 */
+	{
+		struct zx_eth_priv *apriv[ZX_NUM_PORTS];
+		unsigned int andesc[ZX_NUM_PORTS], anslots[ZX_NUM_PORTS];
+		int abp[ZX_NUM_PORTS][9];
+		u16 tofree[ZX_NUM_PORTS * 9];
+		int nfree = 0, f, k2;
 
-		if (!nd || !netif_running(nd))
-			continue;
-		if (dev[0] && strcmp(nd->name, dev))
-			continue;
-		priv = netdev_priv(nd);
-		ndesc = (which & 0x3) ? 2 : 1;
-		/* 一个描述符要读出槽位时，后面的槽位得是相邻的才有意义 */
-		nslots = (len + 16 + ZX_BUF_SIZE - 1) / ZX_BUF_SIZE;
-		if (ndesc == 2)
-			nslots = 2;
-		if (adapter->tx_pending + ndesc > ZX_TX_QUEUE_LIMIT)
-			break;
+		memset(apriv, 0, sizeof(apriv));
+		memset(andesc, 0, sizeof(andesc));
+		memset(anslots, 0, sizeof(anslots));
 
-		for (k = 0; k < (int)nslots; k++) {
-			bp[k] = zx_bmu_alloc_bp(adapter);
-			if (bp[k] < 0 || bp[k] >= ZX_NUM_BUFFERS) {
-				ok = 0;
-				break;
+		/* 锁外：算每个端口的 ndesc/nslots 并申请槽位 */
+		for (p = 0; p < ZX_NUM_PORTS; p++) {
+			struct net_device *nd = adapter->ports[p];
+
+			if (!nd || !netif_running(nd))
+				continue;
+			if (dev[0] && strcmp(nd->name, dev))
+				continue;
+			apriv[p] = netdev_priv(nd);
+			andesc[p] = (which & 0x3) ? 2 : 1;
+			anslots[p] = (len + 16 + ZX_BUF_SIZE - 1) / ZX_BUF_SIZE;
+			if (andesc[p] == 2)
+				anslots[p] = 2;
+			for (k2 = 0; k2 < (int)anslots[p]; k2++) {
+				abp[p][k2] = zx_bmu_alloc_bp_wait(adapter);
+				if (abp[p][k2] < 0 || abp[p][k2] >= ZX_NUM_BUFFERS)
+					break;
+			}
+			if (k2 < (int)anslots[p]) {
+				while (k2-- > 0)
+					zx_bmu_free_bp(adapter, (u16)abp[p][k2]);
+				apriv[p] = NULL;
 			}
 		}
-		if (!ok) {
-			while (k-- > 0)
-				zx_bmu_free_bp(adapter, bp[k]);
-			break;
-		}
-		if (ndesc == 1) {
-			for (k = 1; k < (int)nslots; k++)
-				if (bp[k] != bp[0] + k) {
-					dev_warn(adapter->dev,
-						 "txtest: 槽位不相邻 bp=%u %u\n",
-						 bp[0], bp[k]);
-					ok = 0;
-				}
-			if (!ok) {
+
+		spin_lock_bh(&adapter->tx_lock);
+		zx_tx_reclaim(adapter);
+		for (p = 0; p < ZX_NUM_PORTS; p++) {
+			struct zx_eth_priv *pv = apriv[p];
+			unsigned int ndesc, nslots, seg[2], cut;
+			u16 bp[9];
+			int k, ok = 1;
+
+			if (!pv)
+				continue;
+			ndesc = andesc[p];
+			nslots = anslots[p];
+			for (k = 0; k < (int)nslots; k++)
+				bp[k] = (u16)abp[p][k];
+			if (adapter->tx_pending + ndesc > READ_ONCE(zx_txq_limit)) {
 				for (k = 0; k < (int)nslots; k++)
-					zx_bmu_free_bp(adapter, bp[k]);
-				break;
+					tofree[nfree++] = bp[k];
+				continue;
 			}
-		}
+			if (ndesc == 1) {
+				for (k = 1; k < (int)nslots; k++)
+					if (bp[k] != bp[0] + k) {
+						dev_warn(adapter->dev,
+							 "txtest: 槽位不相邻 bp=%u %u\n",
+							 bp[0], bp[k]);
+						ok = 0;
+					}
+				if (!ok) {
+					for (k = 0; k < (int)nslots; k++)
+						tofree[nfree++] = bp[k];
+					continue;
+				}
+			}
 
-		cut = len / 2;
-		if (ndesc == 1) {
-			memcpy((u8 *)adapter->pkt_pool +
-			       (u32)bp[0] * ZX_BUF_SIZE + 16, frame, len);
-			seg[0] = len;
-		} else {
-			/* 第二段放 +off2，之后靠 tcpdump 看硬件从哪里开始读 */
-			memcpy((u8 *)adapter->pkt_pool +
-			       (u32)bp[0] * ZX_BUF_SIZE + 16, frame, cut);
-			memcpy((u8 *)adapter->pkt_pool +
-			       (u32)bp[1] * ZX_BUF_SIZE + off2, frame + cut,
-			       len - cut);
-			seg[0] = seglen ? len : cut;
-			seg[1] = seglen ? len : len - cut;
-		}
-		if (adapter->pkt_pool_cacheable)
-			dma_sync_single_for_device(adapter->dev,
-						   adapter->pkt_pool_dma +
-						   (u32)bp[0] * ZX_BUF_SIZE,
-						   16 + len, DMA_TO_DEVICE);
+			cut = len / 2;
+			if (ndesc == 1) {
+				memcpy((u8 *)adapter->pkt_pool +
+				       (u32)bp[0] * ZX_BUF_SIZE + 16, frame, len);
+				seg[0] = len;
+			} else {
+				/* 第二段放 +off2，之后靠 tcpdump 看硬件从哪里开始读 */
+				memcpy((u8 *)adapter->pkt_pool +
+				       (u32)bp[0] * ZX_BUF_SIZE + 16, frame, cut);
+				memcpy((u8 *)adapter->pkt_pool +
+				       (u32)bp[1] * ZX_BUF_SIZE + off2, frame + cut,
+				       len - cut);
+				seg[0] = seglen ? len : cut;
+				seg[1] = seglen ? len : len - cut;
+			}
+			if (adapter->pkt_pool_cacheable)
+				dma_sync_single_for_device(adapter->dev,
+							   adapter->pkt_pool_dma +
+							   (u32)bp[0] * ZX_BUF_SIZE,
+							   16 + len, DMA_TO_DEVICE);
 
-		for (k = 0; k < (int)ndesc; k++) {
-			u32 idx = (adapter->tx_cur_idx + k) % ZX_NUM_TX_DESC;
-			__le32 *d = (__le32 *)adapter->tx_ring +
-				    idx * (ZX_DESC_SIZE / sizeof(*d));
+			for (k = 0; k < (int)ndesc; k++) {
+				u32 idx = (adapter->tx_cur_idx + k) % ZX_NUM_TX_DESC;
+				__le32 *d = (__le32 *)adapter->tx_ring +
+					    idx * (ZX_DESC_SIZE / sizeof(*d));
 
-			d[0] = cpu_to_le32(0x80 |
-					   (ZX_PORT_TX_QUEUE(priv->port) << 20));
-			d[3] = cpu_to_le32(0x3 | ((seg[k] & 0x3fff) << 2));
-			d[1] = cpu_to_le32(0x10000);
-			d[2] = cpu_to_le32(0x21000000 |
-					   ((seg[k] & 0x3fff) << 9));
-			((u8 *)d)[7] = (u8)((bp[k] & 0x7f) << 1) |
-				       ((which & (1u << k)) ? 1 : 0);
-			((u8 *)d)[8] = (u8)(bp[k] >> 7);
-			/*
-			 * 一次门铃只启动一个描述符：正常发送也是这么写的。
-			 * 上一轮把 4 个描述符攒起来只敲一次门铃，硬件只吃掉一个，
-			 * 其余卡在 ring 里，整条发送路径随后慢到 3 秒一个包
-			 * （tx_pending 留了 3，重启才清）。
-			 */
-			dma_wmb();
-			writel(1, adapter->base + ZX_DMA_TX_START);
+				d[0] = cpu_to_le32(0x80 |
+						   (ZX_PORT_TX_QUEUE(pv->port) << 20));
+				d[3] = cpu_to_le32(0x3 | ((seg[k] & 0x3fff) << 2));
+				d[1] = cpu_to_le32(0x10000);
+				d[2] = cpu_to_le32(0x21000000 |
+						   ((seg[k] & 0x3fff) << 9));
+				((u8 *)d)[7] = (u8)((bp[k] & 0x7f) << 1) |
+					       ((which & (1u << k)) ? 1 : 0);
+				((u8 *)d)[8] = (u8)(bp[k] >> 7);
+				/*
+				 * 一次门铃只启动一个描述符：正常发送也是这么写的。
+				 * 上一轮把 4 个描述符攒起来只敲一次门铃，硬件只吃掉一个，
+				 * 其余卡在 ring 里，整条发送路径随后慢到 3 秒一个包
+				 * （tx_pending 留了 3，重启才清）。
+				 */
+				dma_wmb();
+				writel(1, adapter->base + ZX_DMA_TX_START);
+			}
+			adapter->tx_cur_idx += ndesc;
+			adapter->tx_pending += ndesc;
+			if (!sent)
+				first_bp = bp[0];
+			last_bp = bp[ndesc - 1];
+			sent++;
 		}
-		adapter->tx_cur_idx += ndesc;
-		adapter->tx_pending += ndesc;
-		if (!sent)
-			first_bp = bp[0];
-		last_bp = bp[ndesc - 1];
-		sent++;
+		spin_unlock_bh(&adapter->tx_lock);
+		for (f = 0; f < nfree; f++)
+			zx_bmu_free_bp(adapter, tofree[f]);
 	}
-	spin_unlock_bh(&adapter->tx_lock);
 	kfree(frame);
 	if (!sent)
 		return -EAGAIN;
@@ -3532,12 +4763,215 @@ static const struct file_operations zx_eth_alias_dump_fops = {
 	.release	= single_release,
 };
 
+/*
+ * DIAG（2026-11-03）：诊断插桩的回读口，**只读 0444**，不写任何寄存器、
+ * 不改任何行为。每一项对应一个 module_param（默认全关），关着的那一段
+ * 打印出来恒为 0 —— 读的人拿"开关状态那一行 diag: mask=" 对照即可。
+ *
+ * s->private 就是 debugfs_create_file(..., adapter, ...) 传进来的
+ * `struct zx_eth_adapter *`（与 alias_dump/zc/zc_ev 同一写法），**不是**
+ * struct device *，绝不能调 dev_get_drvdata()。
+ */
+static const char * const zx_diag_tlabel[ZX_DIAG_TBUCKETS] = {
+	"<1us", "<2us", "<4us", "<8us", "<16us", "<32us", "<64us",
+	"<128us", "<256us", "<512us", "<1024us", "<1ms", ">=1ms",
+};
+
+static const char * const zx_diag_qlabel[ZX_DIAG_QBUCKETS] = {
+	"0-1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-127",
+	"128-255", "256-511", "512+",
+};
+
+/* 任务书第 6 项要求的"一项一格"，顺序与枚举一致 */
+static const char * const zx_diag_dlabel[ZX_DIAG_DROP_N] = {
+	"rx_drop_nondev", "rx_drop_down", "skb_nomem", "ffe_rx_drop",
+	"ffe_qfull", "ffe_qfull_drop", "txq_block", "txq_xmit_busy",
+};
+
+static void zx_diag_show_hist(struct seq_file *s, const u64 *h, int n,
+			      const char * const *label)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		seq_printf(s, " %s=%llu", label[i], h[i]);
+	seq_putc(s, '\n');
+}
+
+static int zx_eth_diag_show(struct seq_file *s, void *data)
+{
+	struct zx_eth_adapter *adapter = s->private;
+	struct zx_diag *d = READ_ONCE(adapter->diag);
+	int p, f;
+
+	seq_printf(s, "diag: mask=0x%x burst_gap_us=%u (1=residence 2=seq 4=poll 8=txq 16=txlat 32=drop 64=burst)\n",
+		   READ_ONCE(zx_diag_mask), READ_ONCE(zx_diag_burst_us));
+	seq_printf(s, "abi: sizeof_adapter=%zu ppe_flows=%zu accel=%zu diag=%zu (ppe.ko 必须与这些偏移同源)\n",
+		   sizeof(struct zx_eth_adapter),
+		   offsetof(struct zx_eth_adapter, ppe_flows),
+		   offsetof(struct zx_eth_adapter, accel),
+		   offsetof(struct zx_eth_adapter, diag));
+	if (!d) {
+		seq_puts(s, "diag: state=NOT-ALLOCATED (probe 的 devm_kzalloc 失败，插桩全部静默)\n");
+		return 0;
+	}
+
+	/* ---- 1. 盒内停留 ---- */
+	seq_puts(s, "-- 1. in-box residence: RX fastpath entry -> TX submit ok (per egress) --\n");
+	for (p = 0; p < ZX_NUM_PORTS; p++) {
+		seq_printf(s, "egress port%d(%s): n=%llu max=%lluns nostamp_all=%llu",
+			   p, adapter->ports[p] ? adapter->ports[p]->name : "-",
+			   d->res_n[p], d->res_max_ns[p], d->res_nostamp);
+		seq_putc(s, '\n');
+		seq_puts(s, "  ");
+		zx_diag_show_hist(s, d->res[p], ZX_DIAG_TBUCKETS, zx_diag_tlabel);
+	}
+
+	/* ---- 5. TX 完成延迟 ---- */
+	seq_puts(s, "-- 5. TX completion latency: writel(TX_START) -> zx_tx_reclaim sees done --\n");
+	seq_printf(s, "txlat: n=%llu max=%lluns older-than-reclaim(upper bound)\n  ",
+		   d->txlat_n, d->txlat_max_ns);
+	zx_diag_show_hist(s, d->txlat, ZX_DIAG_TBUCKETS, zx_diag_tlabel);
+	/* 按出口分开：单流"盒子->宿主"看 egress=lan1 这一行 */
+	for (p = 0; p < ZX_NUM_PORTS; p++) {
+		seq_printf(s, "txlat egress port%d(%s):\n  ", p,
+			   adapter->ports[p] ? adapter->ports[p]->name : "-");
+		zx_diag_show_hist(s, d->txlat_port[p], ZX_DIAG_TBUCKETS,
+				  zx_diag_tlabel);
+	}
+
+	/* ---- 2. seq 反演 ---- */
+	seq_puts(s, "-- 2. TCP seq inversion (5-tuple hash, 1024 slots per direction) --\n");
+	for (f = 0; f < 2; f++)
+		seq_printf(s, "%s: probe=%llu hit=%llu rollback=%llu\n",
+			   f ? "tx-submit" : "rx-entry  ",
+			   d->seq_probe[f], d->seq_hit[f], d->seq_roll[f]);
+	seq_printf(s, "collisions=%llu (槽位被别的 5 元组占用，只计数不纠正)\n",
+		   d->seq_coll);
+	/* 按端口：in = RX 入口的入端口，out = TX 提交的出口端口 */
+	for (p = 0; p < ZX_NUM_PORTS; p++)
+		seq_printf(s, "port%d(%s): rx_entry hit=%llu rollback=%llu | tx_submit hit=%llu rollback=%llu\n",
+			   p, adapter->ports[p] ? adapter->ports[p]->name : "-",
+			   d->seq_hit_in[p], d->seq_roll_in[p],
+			   d->seq_hit_out[p], d->seq_roll_out[p]);
+
+	/* ---- 3. 每 poll ---- */
+	seq_puts(s, "-- 3. frames per NAPI poll --\n");
+	seq_printf(s, "polls=%llu sum_handled=%llu sum_fwd=%llu\n",
+		   d->poll_n, d->poll_work, d->poll_ffeframes);
+	seq_puts(s, "handled:");
+	for (f = 0; f < ZX_DIAG_PBUCKETS; f++)
+		if (d->poll_frames[f] || f == ZX_DIAG_PBUCKETS - 1)
+			seq_printf(s, " %s%d=%llu", f == ZX_DIAG_PBUCKETS - 1 ? "" : "",
+				   f, d->poll_frames[f]);
+	seq_putc(s, '\n');
+	seq_puts(s, "fwd    :");
+	for (f = 0; f < ZX_DIAG_PBUCKETS; f++)
+		if (d->poll_fwd[f] || f == ZX_DIAG_PBUCKETS - 1)
+			seq_printf(s, " %d=%llu", f, d->poll_fwd[f]);
+	seq_putc(s, '\n');
+
+	/* ---- 4. TX 环占用 ---- */
+	seq_puts(s, "-- 4. TX ring occupancy at submit (tx_pending before ++) --\n");
+	seq_puts(s, "all: ");
+	zx_diag_show_hist(s, d->txq, ZX_DIAG_QBUCKETS, zx_diag_qlabel);
+	for (p = 0; p < ZX_NUM_PORTS; p++) {
+		seq_printf(s, "egress port%d(%s): txq_block=%llu ring_full_stop=%llu\n",
+			   p, adapter->ports[p] ? adapter->ports[p]->name : "-",
+			   d->txq_block[p], d->txq_trip[p]);
+		seq_puts(s, "  ");
+		zx_diag_show_hist(s, d->txq_port[p], ZX_DIAG_QBUCKETS,
+				  zx_diag_qlabel);
+	}
+
+	/* ---- 8. 突发 ---- */
+	seq_puts(s, "-- 8. bursts per egress (segment length / gap between segments) --\n");
+	for (p = 0; p < ZX_NUM_PORTS; p++) {
+		int i;
+
+		seq_printf(s, "egress port%d(%s): frames=%llu segments=%llu cur=%llu gap_min=%lluns gap_max=%lluns\n",
+			   p, adapter->ports[p] ? adapter->ports[p]->name : "-",
+			   d->burst_frames[p], d->burst_seg[p], d->burst_cur[p],
+			   d->burst_gap_min_ns[p], d->burst_gap_max_ns[p]);
+		seq_puts(s, "  len:");
+		for (i = 0; i < ZX_DIAG_BBUCKETS; i++) {
+			if (!d->burst_len[p][i])
+				continue;
+			if (i < 16)
+				seq_printf(s, " %d=%llu", i, d->burst_len[p][i]);
+			else if (i == 16)
+				seq_printf(s, " 16-31=%llu", d->burst_len[p][i]);
+			else
+				seq_printf(s, " 32+=%llu", d->burst_len[p][i]);
+		}
+		seq_putc(s, '\n');
+		seq_puts(s, "  gap:");
+		zx_diag_show_hist(s, d->burst_gap[p], ZX_DIAG_TBUCKETS,
+				  zx_diag_tlabel);
+	}
+
+	/*
+	 * ---- 6. 丢点 ----
+	 * 既有计数（adapter 上）**始终有效**，与 diag_drop 开关无关；新增的三格
+	 * 只在 diag_drop=1 时累加。一项一格，不合并。
+	 */
+	seq_puts(s, "-- 6. drop reasons, one per line (source in brackets) --\n");
+	seq_printf(s, "rx_bad=%u [main.c desc bp/len invalid]\n", adapter->rx_bad_cnt);
+	seq_printf(s, "rx_resync=%u [main.c index resync]\n", adapter->rx_resync_cnt);
+	seq_printf(s, "rx_nobuf=%u [main.c bp==0]\n", adapter->rx_nobuf_cnt);
+	seq_printf(s, "ffe_dup=%llu [main.c bp still in TX ring]\n", adapter->ffe_dup);
+	seq_printf(s, "rx_alias=%u [main.c src MAC is ours]\n", adapter->rx_alias_cnt);
+	seq_printf(s, "rx_len_short=%llu [main.c claimed>avail]\n",
+		   READ_ONCE(adapter->rx_len_short_cnt));
+	seq_printf(s, "rx_len_long=%llu [main.c padding>MAX_PAD]\n",
+		   READ_ONCE(adapter->rx_len_long_cnt));
+	seq_printf(s, "rx_drop_nondev=%llu [main.c dest_dev==NULL]\n",
+		   d->drop[ZX_DIAG_DROP_RX_NONDEV]);
+	seq_printf(s, "rx_drop_down=%llu [main.c dest_dev !IFF_UP]\n",
+		   d->drop[ZX_DIAG_DROP_RX_DOWN]);
+	seq_printf(s, "skb_nomem=%llu [main.c napi_alloc_skb failed]\n",
+		   d->drop[ZX_DIAG_DROP_SKB_NOMEM]);
+	seq_printf(s, "ffe_rx_drop=%llu [accel.c #19 submit failed after rewrite, v4=%llu v6=%llu]\n",
+		   d->drop[ZX_DIAG_DROP_FFE_RX_DROP],
+		   READ_ONCE(adapter->accel.cnt[0].rx_drop),
+		   READ_ONCE(adapter->accel.cnt[1].rx_drop));
+	seq_printf(s, "ffe_qfull=%llu [accel.c #19 ring full, back to stack]\n",
+		   d->drop[ZX_DIAG_DROP_QFULL]);
+	seq_printf(s, "ffe_qfull_drop=%llu [accel.c #19 ring full, dropped, v4=%llu v6=%llu]\n",
+		   d->drop[ZX_DIAG_DROP_QFULL_DROP],
+		   READ_ONCE(adapter->accel_qfull_drop[0]),
+		   READ_ONCE(adapter->accel_qfull_drop[1]));
+	seq_printf(s, "fallback_qfull_total=%llu(v4)/%llu(v6) [accel.c cnt[].fallback_qfull = qfull + qfull_drop]\n",
+		   READ_ONCE(adapter->accel.cnt[0].fallback_qfull),
+		   READ_ONCE(adapter->accel.cnt[1].fallback_qfull));
+	seq_printf(s, "txq_block=%llu [main.c zx_tx_submit_bp hit txq_limit]\n",
+		   d->drop[ZX_DIAG_DROP_TXQ_BLOCK]);
+	seq_printf(s, "txq_xmit_busy=%llu [main.c xmit -> NETDEV_TX_BUSY, back to qdisc]\n",
+		   d->drop[ZX_DIAG_DROP_TXQ_BUSY]);
+	return 0;
+}
+
+static int zx_eth_diag_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_eth_diag_show, inode->i_private);
+}
+
+static const struct file_operations zx_eth_diag_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_eth_diag_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 {
 	struct dentry *dir = debugfs_create_dir(dev_name(adapter->dev), NULL);
 
 	debugfs_create_devm_seqfile(adapter->dev, "dma_state", dir,
 				    zx_eth_dma_state_show);
+	/* DIAG（2026-11-03）：只读诊断口，见 zx_eth_diag_show() 的分段注释 */
+	debugfs_create_file("diag", 0444, dir, adapter, &zx_eth_diag_fops);
 	/* P10.2 F6：alias 丢弃点的环形取证快照（只读） */
 	debugfs_create_file("alias_dump", 0444, dir, adapter,
 			    &zx_eth_alias_dump_fops);
@@ -3630,6 +5064,27 @@ static int zx_eth_probe(struct platform_device *pdev)
 	if (!adapter)
 		return -ENOMEM;
 
+	/*
+	 * DIAG 状态：**独立分配**，不进 adapter，所以既有字段偏移不受影响
+	 * （见 eth.h 的注释与下面的 BUILD_BUG_ON）。默认全关时它只是一块
+	 * 零初始化的内存，任何插桩点都不会碰它。
+	 *
+	 * 分配失败**不让 probe 失败**：诊断是可选件，拿不到就让 diag 保持
+	 * NULL，所有插桩点静默跳过（数据面照常）。seq 表单独再分一次，避免
+	 * 一个 ~40 KB 的大块分配受碎片影响。
+	 */
+	zx_diag_abi_check();
+	adapter->diag = devm_kzalloc(dev, sizeof(*adapter->diag), GFP_KERNEL);
+	if (adapter->diag) {
+		adapter->diag->seq = devm_kzalloc(dev,
+			sizeof(*adapter->diag->seq) * 2 * ZX_DIAG_SEQ_SLOTS,
+			GFP_KERNEL);
+		if (!adapter->diag->seq)
+			dev_warn(dev, "diag: seq table allocation failed, diag_seq disabled\n");
+	} else {
+		dev_warn(dev, "diag: state allocation failed, all diag_* disabled\n");
+	}
+
 	adapter->irq = platform_get_irq(pdev, 0);
 	if (adapter->irq < 0)
 		return adapter->irq;
@@ -3637,6 +5092,7 @@ static int zx_eth_probe(struct platform_device *pdev)
 	adapter->dev = dev;
 	spin_lock_init(&adapter->tx_lock);
 	spin_lock_init(&adapter->bmu_free_lock);
+	spin_lock_init(&adapter->bmu_alloc_lock);
 	mutex_init(&adapter->ppe_lock);
 	spin_lock_init(&adapter->trap_lock);
 	mutex_init(&adapter->sw_lock);
@@ -3919,7 +5375,8 @@ static int zx_eth_probe(struct platform_device *pdev)
 	mutex_unlock(&adapter->ppe_lock);
 
 	/* One NAPI context serves all ports */
-	netif_napi_add(adapter->ports[i], &adapter->napi, zx_eth_poll);
+	netif_napi_add_weight(adapter->ports[i], &adapter->napi, zx_eth_poll,
+			      (int)READ_ONCE(zxnapi_weight));
 	hrtimer_setup(&adapter->tx_timer, zx_eth_tx_timer,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
@@ -3955,6 +5412,9 @@ static int zx_eth_probe(struct platform_device *pdev)
 	mutex_lock(&zx_adapter_list_lock);
 	list_add_tail(&adapter->list, &zx_adapter_list);
 	mutex_unlock(&zx_adapter_list_lock);
+
+	/* coal-knob：把三个参数值落一次（默认值时无日志、行为与基线相同） */
+	zx_coal_sync_probe();
 	return 0;
 
 err_irq:

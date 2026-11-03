@@ -263,6 +263,22 @@ module_param(learn_delay_ms, uint, 0444);
 MODULE_PARM_DESC(learn_delay_ms, "Delay before ffe_learn auto-enables after probe, in ms (default: 120000, 0 = at probe)");
 
 /*
+ * P2（tx-lock-scope）：快路 QFULL（#19 环满）的处理方式。
+ *   0/N（默认）= 回栈，让 qdisc 背压 —— 现状，帧一字节没动；
+ *   1/Y         = 直接丢帧并计 cnt[].qfull_drop —— 对齐原厂"qlen > 0x400
+ *                 直接丢"（vendor 0xc0439d38~0xc0439dd0，证据
+ *                 .scratch/ffe-fastpath/vendor-sw-pipeline/20261103-0100/PIPELINE.md）。
+ * 只影响"命中条目但发送环满"这一条判据；丢的时候帧还没改写、bp 也没交给
+ * 硬件，所以 bp 由 complete() 出口返回 DROPPED、zx_eth_rx() 用 zx_bp_return()
+ * 还一次 BMU（不泄漏、不双重归还，A2 的 bp_state 闸照旧兜底）。
+ * 运行期切换（模块内置，参数仍在 /sys/module/zx279128s_eth/parameters/）：
+ *   echo Y > /sys/module/zx279128s_eth/parameters/ffe_qfull_drop
+ */
+static bool ffe_qfull_drop;
+module_param(ffe_qfull_drop, bool, 0644);
+MODULE_PARM_DESC(ffe_qfull_drop, "Fast path drops frames when the TX ring is full instead of falling back to the stack (default: off)");
+
+/*
  * 自动降级的阈值：drop > 0.1% 或 fallback > 50%，持续 10 s 就回 stack
  * （设计 §9-4）。
  *
@@ -2980,9 +2996,11 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 		return ZX_FFE_V_FALLBACK;
 	}
 
-	/* #19 环容量（设计 §2.2 #15）：满就回栈，让 qdisc 背压 */
+	/* #19 环容量（设计 §2.2 #15）：满就回栈，让 qdisc 背压；
+	 * ffe_qfull_drop=1 时改成直接丢（P2，对齐原厂 qlen>0x400 丢）。
+	 */
 	spin_lock_bh(&adapter->tx_lock);
-	if (adapter->tx_pending >= ZX_TX_QUEUE_LIMIT) {
+	if (adapter->tx_pending >= READ_ONCE(zx_txq_limit)) {
 		/*
 		 * 活跃流：刷新 lastuse，否则老化会把这条件正在用的条目删掉。
 		 * P10.2 F4：写的还是查表拿到的那条（可能是正被换下的旧节点，
@@ -2992,7 +3010,15 @@ zx_ffe_forward(struct zx_eth_adapter *adapter, struct net_device *nd_in,
 		flow->lastuse = jiffies;
 		spin_unlock_bh(&adapter->tx_lock);
 		rcu_read_unlock();
-		return ZX_FFE_V_QFULL;
+		/*
+		 * P2（tx-lock-scope）：默认 0 = 回栈、让 qdisc 背压（现状）。
+		 * 1 = 直接丢，对齐原厂"qlen > 0x400 直接丢"。这个点帧**还没
+		 * 改写**（容量判据在改写之前）、bp 也没写进任何描述符，所以
+		 * complete() 出口按 DROPPED 返回、zx_eth_rx() 的 ffe_done 用
+		 * zx_bp_return() 恰好还一次 BMU —— 不泄漏、不双重归还。
+		 */
+		return READ_ONCE(ffe_qfull_drop) ? ZX_FFE_V_QFULL_DROP :
+						   ZX_FFE_V_QFULL;
 	}
 
 	/* 改写与提交都在 tx_lock 里，帧内容不会裸露在锁外（P2-TASK §1 顺序） */
@@ -3187,6 +3213,9 @@ zx_ffe_ingress_switch_complete(struct zx_eth_adapter *adapter,
 		return ZX_FFE_RX_FORWARDED;
 	case ZX_FFE_V_RX_DROP:
 		c->rx_drop++;
+		/* DIAG 6：改写后提交失败（dest 口在提交前一刻 down）才走这里 */
+		if (unlikely(zx_diag_on(ZX_DIAG_B_DROP)))
+			zx_diag_drop(adapter, ZX_DIAG_DROP_FFE_RX_DROP);
 		break;
 	case ZX_FFE_V_CSUM_ERR:
 		c->csum_err++;
@@ -3203,6 +3232,22 @@ zx_ffe_ingress_switch_complete(struct zx_eth_adapter *adapter,
 	case ZX_FFE_V_QFULL:
 		c->fallback_qfull++;
 		c->fallback++;
+		/*
+		 * DIAG 6：fallback_qfull 的**准确来源**就在这一行和下面
+		 * QFULL_DROP 那一行 —— 都是 accel.c 的 #19 环容量判据
+		 * （zx_ffe_forward()），不是慢路径的任何分支。
+		 */
+		if (unlikely(zx_diag_on(ZX_DIAG_B_DROP)))
+			zx_diag_drop(adapter, ZX_DIAG_DROP_QFULL);
+		break;
+	case ZX_FFE_V_QFULL_DROP:
+		/* P2：环满、按参数直接丢。fallback_qfull 照记（同一事件的分子），
+		 * 但不进 fallback（它没回栈），单独记 qfull_drop。
+		 */
+		c->fallback_qfull++;
+		adapter->accel_qfull_drop[pkt->family]++;
+		if (unlikely(zx_diag_on(ZX_DIAG_B_DROP)))
+			zx_diag_drop(adapter, ZX_DIAG_DROP_QFULL_DROP);
 		break;
 	case ZX_FFE_V_FALLBACK:
 		c->fallback++;
@@ -3213,7 +3258,8 @@ zx_ffe_ingress_switch_complete(struct zx_eth_adapter *adapter,
 		break;
 	}
 	c->miss++;
-	return v == ZX_FFE_V_RX_DROP ? ZX_FFE_RX_DROPPED : ZX_FFE_RX_STACK;
+	return (v == ZX_FFE_V_RX_DROP || v == ZX_FFE_V_QFULL_DROP) ?
+		ZX_FFE_RX_DROPPED : ZX_FFE_RX_STACK;
 }
 
 /*
@@ -3265,6 +3311,15 @@ enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
 	ops = READ_ONCE(accel->ingress);
 	if (!ops)	/* 数据面在 probe 之后才跑；NULL 只防御，回栈不崩 */
 		return ZX_FFE_RX_STACK;
+
+	/*
+	 * DIAG 1（起点）：快路入口。这是"帧还在池里、还没建 skb"的那一刻，
+	 * 与 zx_tx_submit_bp() 成功提交的那一点配对，差值就是**盒内停留**。
+	 * 只有进了快路的帧才有戳：栈路径的帧没有，所以它们不会把分布稀释。
+	 * 回栈/丢弃时由 zx279128s-main.c 的 accel_slow/ffe_done 前一句撤销。
+	 */
+	if (unlikely(zx_diag_on(ZX_DIAG_B_RESIDENCE)))
+		zx_diag_res_stamp(adapter, bp);
 
 	pkt.data = adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE + 16;
 	pkt.len = len;
@@ -4190,11 +4245,11 @@ static void zx_accel_show(struct seq_file *s, int family)
 
 	seq_printf(s, "%s\n",
 		   zx_accel_mode_name(zx_accel_cur_mode(accel, family)));
-	seq_printf(s, "lookup=%llu hit=%llu miss=%llu fwd=%llu fallback=%llu fallback_qfull=%llu drop_noport=%llu drop_local=%llu csum_err=%llu ttl_err=%llu bytes=%llu qlen_peak=%u rx_drop=%llu len_short=%llu len_long=%llu\n",
+	seq_printf(s, "lookup=%llu hit=%llu miss=%llu fwd=%llu fallback=%llu fallback_qfull=%llu drop_noport=%llu drop_local=%llu csum_err=%llu ttl_err=%llu bytes=%llu qlen_peak=%u rx_drop=%llu len_short=%llu len_long=%llu qfull_drop=%llu\n",
 		   c->lookup, c->hit, c->miss, c->fwd, c->fallback,
 		   c->fallback_qfull, c->drop_noport, c->drop_local,
 		   c->csum_err, c->ttl_err, c->bytes, qlen_peak,
-		   c->rx_drop, c->len_short, c->len_long);
+		   c->rx_drop, c->len_short, c->len_long, adapter->accel_qfull_drop[family]);
 	/*
 	 * 第 3 行是给人和脚本看的状态行。hint 是"下一步该做什么"的机器可读
 	 * 提示：PPE 绑着 flowtable 时切 ffe/zc 会被 S1 拒绝，用户态得先关掉
