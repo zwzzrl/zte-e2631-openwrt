@@ -1,0 +1,26 @@
+# RX 中断合并窗口 / NAPI 权重（IPv6 快路调优，2026-11-04）
+#
+# 这三个值在开机时由 /etc/init.d/zx_ffe_coalesce 写进驱动的 sysfs 参数，写进去
+# 立刻生效（不需要 disable/enable）。**内核不读这个文件**：驱动只提供
+# module_param 写入口，配置一律由 init 脚本在用户态应用。
+#
+#   /sys/module/zx279128s_eth/parameters/zxcoal_us      合并时间阈值（µs）
+#   /sys/module/zx279128s_eth/parameters/zxcoal_frames  合并帧数阈值（帧）
+#   /sys/module/zx279128s_eth/parameters/zxnapi_weight  NAPI 每轮帧数上限
+#
+# 默认值就是本板实测最优（单流 924.4 Mbit/s，1 GbE 线速 941.5）：250 / 16 / 64。
+# 驱动编译期默认值（zx279128s-eth.h 的 ZX_RX_IRQ_USECS / ZX_RX_IRQ_FRAMES）与这里
+# 一致，所以"删掉某个 option"或"整份文件缺失"都只是保持驱动当前值：脚本不写。
+#
+# 合法性（= 驱动范围，或比驱动更严）：us 1..1000000（驱动 0..1000000，main.c:1032）、
+# frames 1..4096（驱动 0..4096，main.c:1057）、weight 1..1024（驱动 1..1024，与驱动
+# 完全相同，main.c:1104）。超出范围或不是十进制整数时脚本不写，并往 syslog 记一行
+# 错误（logger -t zx_ffe_coalesce）。
+#
+# 改完不用重启：把新值写进这里，然后 /etc/init.d/zx_ffe_coalesce reload。
+# （/sbin/reload_config 会经 procd 的 config.change 触发器调用同一条 reload。）
+
+config settings 'settings'
+	option rx_coalesce_us '250'
+	option rx_coalesce_frames '16'
+	option napi_weight '64'

@@ -1,0 +1,52 @@
+#!/bin/sh
+# 63_e2631_mgmt_ra_defaults -- 整槽刷机（overlay 全新）后必丢的两处配置，首次启动重建。
+#
+# 为什么需要：factory .bin 写满整个 slot，/etc/config 由 config_generate 重新生成，
+# 刷机前用 "uci set" 配出来的东西一律归零；本仓 /etc/uci-defaults 里没有任何一项会
+# 重建管理网。2026-11-03 实测：刷完 fix2 后 192.168.5.1 不可达，只能走串口（.scratch/ffe-fastpath/flash-fix2/20261103-1245/logs/09-serial-probe.txt）。
+#
+# 固化两项：
+#   A) 管理网：lan1 从 br-lan 摘出，当静态 192.168.5.1/24 的 WAN 口用；
+#      wan 区 input=REJECT（出厂 firewall 的默认），所以再补一条只放行
+#      192.168.5.0/24 -> tcp/22 的规则，否则 ssh 会被 REJECT 挡掉。
+#   B) dhcp.lan.ra_default=1：odhcpd 的 RA 才会带非 0 的 router lifetime，
+#      下游 Windows 才拿得到 IPv6 默认网关（回程路由靠它）。
+#
+# 动作逐条照抄 2026-11-03 12:50 在盒子上验证通过的序列
+# （.scratch/ffe-fastpath/flash-fix2/20261103-1245/logs/09-serial-probe.txt:143）。
+# 唯一有意的差别：firewall 规则用具名段 firewall.mgmt_22，而不是当时那条匿名
+# @rule[9]（09-serial-probe.txt:303 用的是 "uci add firewall rule"），
+# 这样本文件重复执行也不会堆出第二条同名规则；规则五个字段与当时完全相同。
+#
+# 时机：/etc/init.d/boot 的 uci_apply_defaults() 在 S10boot 把它 source 一次；
+# 而 /bin/config_generate 更早，在 preinit（/lib/preinit/82_config_generate）里就跑完了，
+# 所以此刻 /etc/config/network 一定存在，br-lan/lan/wan/wan6 都是生成好的。
+# 结尾 exit 0 => boot 认为施加成功并 rm 掉本文件 => 只在首次启动跑。
+# 全程只写 overlay 里的 uci 配置：不碰 flash / mtd / 内核，不重启任何服务
+# （network/firewall/dnsmasq/odhcpd 都在 S10boot 之后才启动，读到的就是新配置）。
+
+# 段存在性兜底。正常首次启动时三段都已存在（wan/wan6 由 config_generate 生成，
+# dhcp.lan 由 15_odhcpd 生成）；这里只是防"别人改过默认值"时不留半条配置。
+uci -q get network.wan >/dev/null 2>&1 || uci -q set network.wan=interface
+uci -q get dhcp.lan >/dev/null 2>&1 || uci -q set dhcp.lan=dhcp
+uci -q get firewall.mgmt_22 >/dev/null 2>&1 || uci -q set firewall.mgmt_22=rule
+
+uci -q batch <<'EOF'
+del_list network.@device[0].ports=lan1
+set network.wan.device=lan1
+set network.wan.proto=static
+set network.wan.ipaddr=192.168.5.1
+set network.wan.netmask=255.255.255.0
+set firewall.mgmt_22.name=mgmt-22
+set firewall.mgmt_22.src=wan
+set firewall.mgmt_22.src_ip=192.168.5.0/24
+set firewall.mgmt_22.proto=tcp
+set firewall.mgmt_22.dest_port=22
+set firewall.mgmt_22.target=ACCEPT
+set dhcp.lan.ra_default=1
+commit network
+commit firewall
+commit dhcp
+EOF
+
+exit 0

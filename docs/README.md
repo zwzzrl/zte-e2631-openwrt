@@ -21,6 +21,7 @@ evidence: docs/architecture.md, docs/known-issues.md, docs/v1.3-progress.md
 | 它现在哪里坏着 / 哪些是已知坑 | [known-issues.md](known-issues.md) | 机器可读的问题块 + 每条一则"现象/根因/证据" |
 | 它整体是怎么搭起来的 | [architecture.md](architecture.md) | 三个仓库、镜像几何、驱动结构、验证栈 |
 | 要动驱动/寄存器/刷机 | [reference/](reference/) → [features/](features/) | 先查常量与表，再看功能线为什么这么写 |
+| 要调 FFE 运行期参数（合并窗口/NAPI 权重/延迟剂量） | [ffe-tuning-parameters.md](reference/ffe-tuning-parameters.md) | 每个旋钮的作用点、实测影响、代价与未测项 |
 | 要复现某个结论 | [reverse/](reverse/) | 每条都给测法与判据，不给"当时日志在哪" |
 | 想知道某个结论是怎么被推翻的 | [history/](history/) | 带日期的文档，标 `historical` / `superseded` |
 
@@ -29,6 +30,9 @@ evidence: docs/architecture.md, docs/known-issues.md, docs/v1.3-progress.md
 **`reference/` —— 可以照着核对的常量与表。**
 放槽几何、分区落点、升级包格式、CLA 寄存器位定义、哈希算法、原厂调试面清单。
 判断标准：**这里的东西抄错了，代码就会写错**；所以每条都要给偏移、宽度、来源类别。
+[ffe-packet-path.md](reference/ffe-packet-path.md) 是例外中的"流程级"参考：它把 FFE 快路
+从一个 RX 描述符到一次 TX 门铃的每一跳、每一处 miss/drop 都按 `文件:行` 列全。
+[ffe-tuning-parameters.md](reference/ffe-tuning-parameters.md) 是"参数级"参考：每个旋钮的 sysfs/debugfs 路径、寄存器编码、实测影响、代价与未测项。
 
 **`reverse/` —— 硬件逆向的结论与测法。**
 放"原厂到底怎么做的、我们试到哪一步"。每条结论必须带：怎么测的、什么数算过、四分类标注
@@ -52,6 +56,8 @@ evidence: docs/architecture.md, docs/known-issues.md, docs/v1.3-progress.md
 | 刷完起不来 / 怎么退回原厂 | [recovery.md](operations/recovery.md) 与 [flashing.md](operations/flashing.md) |
 | 某个数字（吞吐/延迟/计数）是多少、怎么量的 | `features/`（功能线）与 `reverse/`（原厂对照） |
 | 这个寄存器位是什么意思 | [cla-registers.md](reference/cla-registers.md) |
+| 一个包在 FFE 快路里走了哪几跳 / 为什么没走快路 | [ffe-packet-path.md](reference/ffe-packet-path.md) |
+| 合并窗口 / NAPI 权重该设多少、怎么量 | [ffe-tuning-parameters.md](reference/ffe-tuning-parameters.md) |
 | 升级包怎么组成、自己打的包为什么被拒 | [package-format.md](reference/package-format.md) |
 | 换 WAN 口 / 为什么不做盲插 | [wanport.md](features/wanport.md) |
 | 我这次踩的坑是不是老坑 | [troubleshooting.md](operations/troubleshooting.md) |

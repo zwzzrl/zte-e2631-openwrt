@@ -1,0 +1,182 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/zx_ffe_coalesce —— 把 /etc/config/zx_ffe 里的 RX 中断合并窗口与
+# NAPI 权重写进驱动，每次启动应用一次（2026-11-04）。
+#
+# 为什么是 init 脚本而不是驱动自己读文件：内核不读 /etc/config。驱动只提供三个
+# module_param 写入口（0644，写进去立刻生效）：
+#
+#   /sys/module/zx279128s_eth/parameters/zxcoal_us      时间阈值，µs（×50 写 0x350030）
+#   /sys/module/zx279128s_eth/parameters/zxcoal_frames  帧数阈值，帧（写 0x350034）
+#   /sys/module/zx279128s_eth/parameters/zxnapi_weight  NAPI 每轮帧数上限
+#
+# 应用顺序：先 us（时间阈值）再 frames（帧数阈值），最后 weight。理由：硬件语义是
+# "帧数到 F，或从第一帧起过了 T，谁先到谁抬中断"，所以只改了一个寄存器的瞬态里
+# IRQ 率 = max(1/T, pps/F)。实测链路 941.5 Mbit/s / 1500 B ⇒ 78 kpps：
+#
+#   先写 us：瞬态 (T=250 µs, 旧 F=64) ⇒ max(4000/s, 78k/64=1220/s) = 4000/s；
+#            两个都落完是 max(4000/s, 78k/16=4900/s) = 4900/s ⇒ 瞬态不超过终态。
+#   先写 frames：瞬态 (旧 T=500 µs, F=16) ⇒ max(2000/s, 4900/s) = 4900/s，
+#            等于终态，而且要多撑一个写周期。
+#
+# 一般情形同理：T 是与流量无关的绝对上限（最多 1/T 次中断/秒），F 是与流量成正比
+# 的那一项；先把绝对上限落好、再放开按流量计的项，中间态不会比终态更差。probe 里
+# 的 zx_hw_init() 也是先 0x30 后 0x34（zx279128s-main.c:1931-1933），顺序一致。
+#
+# 不 sleep：这块板子禁 sleep，而且三个 sysfs 写都是同步的，写完立刻读回自证，没有
+# 需要等的东西。
+#
+# 四条入口，全部落到同一个 apply()：
+#   /etc/rc.d/S99zx_ffe_coalesce boot  rc.common 的 boot() → start()（USE_PROCD=1 下
+#                                      是 rc_procd）→ start_service() → apply()
+#   /etc/init.d/zx_ffe_coalesce start  同上（手工来一次）
+#   /etc/init.d/zx_ffe_coalesce reload procd 分支的 reload() → reload_service() → apply()
+#   改 /etc/config/zx_ffe 后 /sbin/reload_config
+#                                      procd 收 config.change，按下面的
+#                                      procd_add_reload_trigger 执行
+#                                      "/etc/init.d/zx_ffe_coalesce reload" ⇒ apply()
+#
+# 失败口径：
+#   - 驱动没加载（参数目录不存在）⇒ 记一行 skip 日志，return 0，不算失败；
+#   - 值非法 / 读回不一致 ⇒ 那一项不写（或写失败的那项保持旧值），记一行错误，
+#     但仍然 return 0：开机不能因为一个调优参数起不来，错误在 syslog 里可见：
+#       logread | grep zx_ffe_coalesce
+
+START=99
+USE_PROCD=1
+
+PARAM_DIR=/sys/module/zx279128s_eth/parameters
+CONFIG=zx_ffe
+SECTION=$CONFIG.settings
+
+log_info() { logger -t zx_ffe_coalesce "$*"; }
+log_err() { logger -t zx_ffe_coalesce -p user.err "$*"; }
+
+# 读一个 module_param 的当前值；读不到就是空串
+param_get() {
+	cat "$PARAM_DIR/$1" 2>/dev/null
+}
+
+# 写一个 module_param 并立刻读回。非零 = 没写进去（含驱动拒绝：读回与写值不同）
+param_set() {
+	local name=$1 value=$2 back
+
+	printf '%s\n' "$value" >"$PARAM_DIR/$name" 2>/dev/null || {
+		log_err "$name: write '$value' failed"
+		return 1
+	}
+	back=$(param_get "$name")
+	if [ "$back" != "$value" ]; then
+		log_err "$name: wrote '$value', read back '$back'"
+		return 1
+	fi
+	return 0
+}
+
+# 取一个 uci 值；没配 / 为空 = 空串
+cfg_get() {
+	uci -q get "$SECTION.$1" 2>/dev/null
+}
+
+# plan NAME OPTION MIN MAX
+#   P_VALUE = 最终值（没配时是驱动当前值）
+#   P_WRITE = 1 要写，0 不写
+# 非法值返回 1（错误日志已经记过），调用方把该轮标成有错。
+plan() {
+	local name=$1 option=$2 min=$3 max=$4 cur want
+
+	P_WRITE=0
+	cur=$(param_get "$name")
+	want=$(cfg_get "$option")
+
+	if [ -z "$want" ]; then
+		# 没配就是"不动"：用驱动当前值，不写
+		P_VALUE=$cur
+		return 0
+	fi
+
+	case "$want" in
+	*[!0-9]*)
+		log_err "$option='$want' is not a decimal integer; not writing (range $min..$max)"
+		P_VALUE=$cur
+		return 1
+		;;
+	esac
+	# 用 test 的十进制比较，不用 $(( ))：'08' 在算术里会被当非法八进制
+	if [ "$want" -lt "$min" ] || [ "$want" -gt "$max" ]; then
+		log_err "$option=$want out of range $min..$max; not writing"
+		P_VALUE=$cur
+		return 1
+	fi
+
+	P_VALUE=$want
+	P_WRITE=1
+	return 0
+}
+
+apply() {
+	local ok=1 us frames weight us_write frames_write weight_write
+
+	if [ ! -d "$PARAM_DIR" ] || [ ! -e "$PARAM_DIR/zxcoal_us" ]; then
+		log_info "skip: $PARAM_DIR/zxcoal_us is not there (zx279128s_eth not loaded); nothing applied"
+		return 0
+	fi
+
+	# 1. 定值 + 区间校验（非法值不写，记一行错误，其余项照常应用）
+	# 区间口径：与驱动范围相同或更严（驱动原文见 main.c:1032/1057/1104）：
+	#   us     1..1000000（驱动 0..1000000，ZXCOAL_US_MAX      @ main.c:966）
+	#   frames 1..4096   （驱动 0..4096，    ZXCOAL_FRAMES_MAX  @ main.c:967）
+	#   weight 1..1024   （驱动 1..1024，    ZXNAPI_WEIGHT_MAX  @ main.c:968）
+	plan zxcoal_us rx_coalesce_us 1 1000000
+	[ $? = 0 ] || ok=0
+	us=$P_VALUE
+	us_write=$P_WRITE
+
+	plan zxcoal_frames rx_coalesce_frames 1 4096
+	[ $? = 0 ] || ok=0
+	frames=$P_VALUE
+	frames_write=$P_WRITE
+
+	plan zxnapi_weight napi_weight 1 1024
+	[ $? = 0 ] || ok=0
+	weight=$P_VALUE
+	weight_write=$P_WRITE
+
+	# 2. 落硬件：先 us 再 frames（顺序理由见文件头），最后 weight
+	if [ "$us_write" = 1 ]; then
+		param_set zxcoal_us "$us" || ok=0
+	fi
+	if [ "$frames_write" = 1 ]; then
+		param_set zxcoal_frames "$frames" || ok=0
+	fi
+	if [ "$weight_write" = 1 ]; then
+		param_set zxnapi_weight "$weight" || ok=0
+	fi
+
+	# 3. 读回自证：没写的项读到的就是驱动当前值，一起打出来
+	us=$(param_get zxcoal_us)
+	frames=$(param_get zxcoal_frames)
+	weight=$(param_get zxnapi_weight)
+
+	if [ "$ok" = 1 ]; then
+		log_info "us=$us frames=$frames weight=$weight applied+readback ok"
+	else
+		log_err "us=$us frames=$frames weight=$weight applied with errors (see above)"
+	fi
+	return 0
+}
+
+# procd 的两个口子都只调 apply
+start_service() { apply; }
+
+reload_service() { apply; }
+
+stop_service() { :; }
+
+service_triggers() {
+	procd_add_reload_trigger "$CONFIG"
+}
+
+# 显式写出 boot()（rc.common 的默认 boot() 就是 start()）：USE_PROCD=1 下 start()
+# 是 rc_procd start_service，所以这条路也是 apply()。**不能**直接写成
+# "boot() { apply; }"：那样服务不会注册进 procd，config.change 触发器永远不会触发。
+boot() { start; }
