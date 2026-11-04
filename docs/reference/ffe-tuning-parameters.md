@@ -42,7 +42,7 @@ supersedes:
 
 - 〔本板实测〕= 有落盘日志/TSV，按 §14 口径量出来的；〔代码事实〕= 当前工作树 grep 得到；
   〔上游注释〕= 上游驱动注释，不等于硬件事实；〔推断，未测〕= 我方解释，没有物证。
-- 行号基准：**本仓工作树 2026-11-04 01:50 前后**。驱动目录简写 `SRC/` =
+- 行号基准：**本仓工作树 2026-11-04 21:40 前后（含未提交 `rx_split`/`napi1` 补丁）**。驱动目录简写 `SRC/` =
   `overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/`；文中不写目录的
   `zx279128s-main.c` / `zx279128s-accel.c` / `zx279128s-eth.h` 都在 `SRC/` 下。
   工作树里这三个文件有未提交改动，**行号会漂，照抄前重 grep**。
@@ -63,17 +63,19 @@ supersedes:
 
 | 参数 | 用户态路径（盒上） | 底层位置 / 编码 | 当前默认 | 范围（驱动校验） | 生效方式 | 作用点（`文件:行`） | 本板实测最优 |
 |---|---|---|---|---|---|---|---|
-| `zxcoal_us` | `.../parameters/zxcoal_us` | DMA 块 `+0x30`（绝对 `0x350030`）；**1 LSB = 20 ns，写值 = µs × 50** | **250**（旧镜像 500） | 0..1,000,000（>上限 `-EINVAL`） | 直接写寄存器，`readl` 读回自证；下一个合并窗口生效，无需 disable/enable | `zx279128s-eth.h:150`（宏）、`:301`（默认）、`zx279128s-main.c:1025`（setter）、`:1047`（module_param_cb）、`:1931-1933`（编程点） | 250（配 `frames=16`），单流 924.4 |
-| `zxcoal_frames` | `.../parameters/zxcoal_frames` | DMA 块 `+0x34`（绝对 `0x350034`）；**帧数原值**，无乘数 | **16**（旧镜像 64） | 0..4096 | 同上 | `zx279128s-eth.h:151`、`:300`（默认）、`zx279128s-main.c:1050`（setter）、`:1071`（module_param_cb）、`:1933`（编程点） | 16（`us=250`）924.4；32 也 921–923 |
-| `zxnapi_weight` | `.../parameters/zxnapi_weight` | 软件字段 `napi->weight`，**不写寄存器** | 64 | 1..1024（0 与越界 `-EINVAL`） | 写 `napi->weight`，下一次 poll 生效（`napi_poll()` 每轮重读） | `zx279128s-main.c:963`（变量）、`:1095`（setter）、`:1119`（module_param_cb）、`:5379-5380`（`netif_napi_add_weight`） | 64（128 未观察到独立效应：仅 1 格、在散布内，§5） |
-| `zxdly_rx_ns` | `.../parameters/zxdly_rx_ns` | 纯 `ndelay/udelay`，不读帧、不查表、不写共享状态 | 0 | `uint`；实际粒度 1 µs（1..999 ns 落成 1 µs） | 下一帧生效 | `zx279128s-main.c:213-215`、`:3356-3360`（RX 热路径注入点） | 交付 0；诊断用 4000 = 4 µs/帧 |
-| `zxdly_tx_ns` | `.../parameters/zxdly_tx_ns` | 同上，位置在 `tx_lock` + RCU 临界区内 | 0 | 同上 | 同上 | `zx279128s-main.c:217-219`、`:2900-2905`（TX 提交成功后） | 交付 0；TX-only 全更慢（§6） |
-| `accel_ipv4` / `accel_ipv6` | `/sys/kernel/debug/92000000.ethernet/accel_ipv4`、`.../accel_ipv6` | 族级模式，写 `stack\|ffe\|hw\|zc`；**`hw` 只有 v4** | v4=hw、v6=ffe | 四值枚举；v6 写 `hw` 会被改成 `stack`；同族 `hw↔ffe/zc` 在 PPE 绑定时返 `-EBUSY` | 同步切换：先排空 TX，返回时已是新模式或什么都没变 | `zx279128s-eth.h:333-336`（枚举）、`zx279128s-main.c:4982-4985`（debugfs）、`zx279128s-accel.c:3486`（hw 仅 v4）、`:3527-3533`（PPE 占用返 EBUSY）、`zx279128s-main.c:3500`/`:3508`（数据面只处理 `mode==ffe` 的族） | v4=hw、v6=ffe（交付） |
-| `diag_residence` `diag_seq` `diag_poll` `diag_txq` `diag_txlat` `diag_drop` `diag_burst`（+`diag_burst_us`） | `.../parameters/diag_*` | 各置 `zx_diag_mask` 的 `BIT(0..6)`；只读计数，不参与转发判据 | 全 0 | `kstrtobool`（0/1/Y/N） | 立即；下一帧生效 | `zx279128s-main.c:250-282`（读写口）、`:293-305`（7 个 module_param_cb）、`zx279128s-eth.h:793-799`（位定义）、debugfs `diag` 只读口 `zx279128s-main.c:4974` | 全关（会污染测量，§8） |
-| `timing` | `.../parameters/timing` | 每包 6 次 `ktime_get_ns()` + 11 次累加（我方注释估 ~100 ns/包） | 0 | `bool` | 立即 | `zx279128s-main.c:148`、`:221`（`ZX_TS()`） | 关（§8） |
-| `txq_limit` | `.../parameters/txq_limit` | TX 环占用上限（软件阈值，不写寄存器） | 1024 | 64..1024（越界 `-EINVAL`） | 立即，读侧一律 `READ_ONCE` | `zx279128s-main.c:167`（变量）、`:169`（setter）、`:187`（module_param_cb）、`:2839`（提交硬闸）、`:2907`（停车）、`zx279128s-accel.c:3003`（快路 #19） | 未做 A/B（§9） |
-| `ffe_aging` | `.../parameters/ffe_aging` | 流表老化秒数（软件，0 = 不老化） | 300 | `uint` | 立即 | `zx279128s-accel.c:232-234`、`:1286-1295`（老化 work） | 未测（§15） |
-| `learn_delay_ms` | `.../parameters/learn_delay_ms` | 开机后学习门延时（软件） | 120000 | 0..600000（超限钳位） | **只能开机参数（0444）**，运行期不可写 | `zx279128s-accel.c:262`、`:3967` | 120000（即测量门，§14） |
+| `zxcoal_us` | `.../parameters/zxcoal_us` | DMA 块 `+0x30`（绝对 `0x350030`）；**1 LSB = 20 ns，写值 = µs × 50** | **250**（旧镜像 500） | 0..1,000,000（>上限 `-EINVAL`） | 直接写寄存器，`readl` 读回自证；下一个合并窗口生效，无需 disable/enable | `zx279128s-eth.h:150`（宏）、`:301`（默认）、`zx279128s-main.c:1479`（setter）、`:1501`（module_param_cb）、`:2421-2423`（编程点） | 250（配 `frames=16`），单流 924.4 |
+| `zxcoal_frames` | `.../parameters/zxcoal_frames` | DMA 块 `+0x34`（绝对 `0x350034`）；**帧数原值**，无乘数 | **16**（旧镜像 64） | 0..4096 | 同上 | `zx279128s-eth.h:151`、`:300`（默认）、`zx279128s-main.c:1504`（setter）、`:1525`（module_param_cb）、`:2423`（编程点） | 16（`us=250`）924.4；32 也 921–923 |
+| `zxnapi_weight` | `.../parameters/zxnapi_weight` | 软件字段，**napi0 与 napi1 各一份** `weight`（napi1 仅 `rx_split=1` 时存在），**不写寄存器** | 64 | 1..1024（0 与越界 `-EINVAL`） | **同时**写 `adapter->napi.weight`（napi0，每个 adapter 一份）与 `zx_rxs.napi1.weight`（napi1，仅 `rx_split=1` 时），两份各自下一次 poll 生效（`napi_poll()` 每轮重读） | `zx279128s-main.c:967`（变量）、`:1553`（setter 入口；两份写点在 `zx_napi_weight_one()` 里 `:1541`/`:1544-1545`）、`:1577`（module_param_cb）、`:6240-6241`（napi0 的 `netif_napi_add_weight(adapter->ports[i], &adapter->napi, ...)`）、`:1126-1127`（`zx_rx_split_setup()` 里 napi1 的 `netif_napi_add_weight(..., &zx_rxs.napi1, ...)`，仅 `rx_split=1` 时建）；**两个创建点**的 weight 均取 `(int)READ_ONCE(zxnapi_weight)`（默认 64） | 64（128 未观察到独立效应：仅 1 格、在散布内，§5） |
+| `zxdly_rx_ns` | `.../parameters/zxdly_rx_ns` | 纯 `ndelay/udelay`，不读帧、不查表、不写共享状态 | 0 | `uint`；实际粒度 1 µs（1..999 ns 落成 1 µs） | 下一帧生效 | `zx279128s-main.c:217-219`、`:4023-4027`（RX 热路径注入点） | 交付 0；诊断用 4000 = 4 µs/帧 |
+| `zxdly_tx_ns` | `.../parameters/zxdly_tx_ns` | 同上，位置在 `tx_lock` + RCU 临界区内 | 0 | 同上 | 同上 | `zx279128s-main.c:221-223`、`:3401-3406`（单帧 `zx_tx_submit_bp()`，TX 提交成功后）、`:3504-3510`（**批量** `zx_tx_submit_batch()` 的逐帧循环里同一段延时，同样在 `tx_lock` 内——锁由调用方 `zx_ffe_tx_batch_flush()` 持，`zx279128s-accel.c:2994`） | 交付 0；TX-only 全更慢（§6） |
+| `accel_ipv4` / `accel_ipv6` | `/sys/kernel/debug/92000000.ethernet/accel_ipv4`、`.../accel_ipv6` | 族级模式，写 `stack\|ffe\|hw\|zc`；**`hw` 只有 v4** | v4=hw、v6=ffe | 四值枚举；v6 写 `hw` 会被改成 `stack`；同族 `hw↔ffe/zc` 在 PPE 绑定时返 `-EBUSY` | 同步切换：先排空 TX，返回时已是新模式或什么都没变 | `zx279128s-eth.h:333-336`（枚举）、`zx279128s-main.c:5837-5840`（debugfs）、`zx279128s-accel.c:3831`（hw 仅 v4）、`:3872-3878`（PPE 占用返 EBUSY）、`zx279128s-main.c:4167`/`:4175`（数据面只处理 `mode==ffe` 的族） | v4=hw、v6=ffe（交付） |
+| `diag_residence` `diag_seq` `diag_poll` `diag_txq` `diag_txlat` `diag_drop` `diag_burst`（+`diag_burst_us`） | `.../parameters/diag_*` | 各置 `zx_diag_mask` 的 `BIT(0..6)`；只读计数，不参与转发判据 | 全 0 | `kstrtobool`（0/1/Y/N） | 立即；下一帧生效 | `zx279128s-main.c:254-286`（读写口）、`:297-309`（7 个 module_param_cb）、`zx279128s-eth.h:822-828`（位定义）、debugfs `diag` 只读口 `zx279128s-main.c:5829` | 全关（会污染测量，§8） |
+| `timing` | `.../parameters/timing` | 每包 6 次 `ktime_get_ns()` + 11 次累加（我方注释估 ~100 ns/包） | 0 | `bool` | 立即 | `zx279128s-main.c:152`、`:225`（`ZX_TS()`） | 关（§8） |
+| `txq_limit` | `.../parameters/txq_limit` | TX 环占用上限（软件阈值，不写寄存器） | 1024 | 64..1024（越界 `-EINVAL`） | 立即，读侧一律 `READ_ONCE` | `zx279128s-main.c:171`（变量）、`:173`（setter）、`:191`（module_param_cb）、`:3352`（提交硬闸）、`:3408`（停车）、`zx279128s-accel.c:3312`（快路 #19） | 未做 A/B（§9） |
+| `ffe_aging` | `.../parameters/ffe_aging` | 流表老化秒数（软件，0 = 不老化） | 300 | `uint` | 立即 | `zx279128s-accel.c:232-234`、`:1310-1319`（老化 work） | 未测（§15） |
+| `learn_delay_ms` | `.../parameters/learn_delay_ms` | 开机后学习门延时（软件） | 120000 | 0..600000（超限钳位） | **只能开机参数（0444）**，运行期不可写 | `zx279128s-accel.c:262`、`:4312` | 120000（即测量门，§14） |
+
+**行号基准（本表 `zx279128s-main.c` 编程点）**：两个合并窗口写点按 **2026-11-04 21:40 的工作树**核对为 `:2421-2423`（`zx_hw_init()` 起 `:2365`）；**含未提交的 `rx_split`/`napi1` 补丁**，补丁落地前的旧号是 `:1931-1933`。
 
 **注意默认值的时效**：上表"当前默认"是**工作树**的值；测量时那两颗镜像的编译期默认仍是
 `500/64/64`（`zx279128s-eth.h` 在 2026-11-03 23:15 时还是 `ZX_RX_IRQ_FRAMES 64` /
@@ -99,12 +101,12 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 ```
 
 若硬件把字段截断、读回不等于写入值，驱动会把旧值写回去并打 `field too narrow? restored …`、
-返回 `-EIO`（`zx279128s-main.c:981-1006`）——这时 `cat` 出来的是**实际生效值**。
+返回 `-EIO`（`zx279128s-main.c:1453-1476`）——这时 `cat` 出来的是**实际生效值**。
 
 ## §3 `zxcoal_us` —— RX 中断合并时间阈值
 
 **它是什么**：DMA 引擎 RX 中断合并器的"从窗口第一帧起最多等多久"。寄存器 `0x350030`，
-1 LSB = 20 ns，驱动把 µs × 50 写进去（`zx279128s-main.c:1035`、`:1931-1933`）。
+1 LSB = 20 ns，驱动把 µs × 50 写进去（`zx279128s-main.c:1489`、`:2421-2423`）。
 500 µs → 25000 = `0x61A8`；250 µs → 12500 = `0x30D4`。
 
 **测量条件（下表全部同一轮）**〔本板实测〕：
@@ -149,7 +151,7 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 ## §4 `zxcoal_frames` —— RX 中断合并帧数阈值
 
 **它是什么**：同一合并窗口里"攒到多少帧就提前抬中断"。寄存器 `0x350034`，写原始帧数
-（`zx279128s-main.c:1059`、`:1933`），默认 16。硬件语义按上游注释是"帧数或时间，谁先到谁抬"
+（`zx279128s-main.c:1513`、`:2423`），默认 16。硬件语义按上游注释是"帧数或时间，谁先到谁抬"
 （`zx279128s-eth.h:295-299`，〔上游注释〕）。
 
 **测量条件**：同 §3（同一轮、同一台架、单流 v6 cubic 30 s、门满足）。
@@ -178,8 +180,8 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 
 ## §5 `zxnapi_weight` —— NAPI 每轮预算
 
-**它是什么**：`zx_eth_poll()` 每轮最多处理多少帧（`napi->weight`）。运行期写的是
-`napi->weight` 字段，不碰硬件（`zx279128s-main.c:1095`、`:5379-5380`）。
+**它是什么**：`zx_eth_poll()`（`rx_split=1` 时另加 `zx_eth_poll_ring1()`）每轮最多处理多少帧，即 **napi0 与 napi1 两份** `weight`（napi1 仅 `rx_split=1` 时存在）。运行期写的是
+`napi0` 与 `napi1` **两份** `weight` 字段（setter `zx279128s-main.c:1553` 入口；两份写点在 `zx_napi_weight_one()` 里：`:1541` 写 napi0、`:1544-1545` 写 napi1，后者在 `if (zx_rxs.added)` 内），不碰硬件（`:6240-6241`、`:1126-1127`）。
 
 **测量条件**：同 §3。只测了一格 weight=128（`us=250, frames=64`）。
 
@@ -250,29 +252,35 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 ## §7 `accel_ipv4` / `accel_ipv6` —— 族级模式开关
 
 **它是什么**：每个协议族单独选 `stack / ffe / hw / zc`，写 debugfs
-`/sys/kernel/debug/92000000.ethernet/accel_ipv{4,6}`（`zx279128s-main.c:4982-4985`）。交付默认
-**v4=hw、v6=ffe**（`zx279128s-eth.h:333-336` 枚举、`zx279128s-main.c:5126-5133` 初值）。
+`/sys/kernel/debug/92000000.ethernet/accel_ipv{4,6}`（`zx279128s-main.c:5837-5840`）。交付默认
+**v4=hw、v6=ffe**（`zx279128s-eth.h:333-336` 枚举、`zx279128s-main.c:5980-5987` 初值）。
 
 **要点**〔代码事实 + 本板实测〕：
 
-1. **`hw` 只有 IPv4 有**（`zx279128s-accel.c:3486`）；v6 写 `hw` 会被驱动改成 `stack` 并打
-   warning（`zx279128s-main.c:5130-5133`）。
-2. **数据面只处理"该族当前模式 == ffe"的帧**（`zx279128s-main.c:3500`、`:3508`）。
+1. **`hw` 只有 IPv4 有**（`zx279128s-accel.c:3831`）；v6 写 `hw` 会被驱动改成 `stack` 并打
+   warning（`zx279128s-main.c:5984-5987`）。
+2. **数据面只处理"该族当前模式 == ffe"的帧**（`zx279128s-main.c:4167`、`:4175`）。
    ⇒ 交付态下真正走我方 FFE 的**只有 IPv6**；v4 的帧由 PPE 接走，v6 上 CPU 后由 FFE 接住，
    这是设计上的并存，不是"v4 被 FFE 加速了"。
 3. **v4 从 hw 切 ffe 要先让 PPE 释放**：同族 `hw` 与 `ffe` 互斥，PPE 绑着 flowtable 时
-   `echo ffe > accel_ipv4` 返回 `-EBUSY`（`zx279128s-accel.c:3527-3533`）。做法是先
+   `echo ffe > accel_ipv4` 返回 `-EBUSY`（`zx279128s-accel.c:3872-3878`）。做法是先
    `uci set firewall.@defaults[0].flow_offloading_hw=0` + reload（或移除 flowtable），确认
    `ppe_bound=0` 再切。**该切换后的 v4 吞吐未测**（§15-11）。
 4. **v4 走 `hw` 时不经 RX 合并器**：同一轮把 `zxcoal_us` 从 500 改到 62（`zxcoal_frames`
    保持 64），v4 吞吐 **933.3 → 934.8 Mbit/s（+0.2 %）**，IRQ/s 只有 **7.9 → 10.8**，
    softirq 0.0009（F0/F1 → `cells.tsv:18,19`）。对比同轮 v6 单流 735.5 → 927.1、IRQ
    1166.5 → 7213.7 ⇒ **v4 的 hw 路径几乎不上 CPU，合并窗口对它的吞吐没有杠杆**。
+5. **多 WAN / 策略路由时这个开关会被自动写 `stack`**：硬件条目没有 WAN 存活概念，
+   路由切走后旧条目仍按旧出口转发（静态黑洞，等到 300 s 老化）。交付镜像用
+   `sbin/e2631-ffe-multiwan` + `/etc/init.d/zx_ffe_multiwan` 检测"默认出口 ≥2 /
+   非基线 `ip rule` / mwan3 启用接口 ≥2"，命中就把 `accel_ipvN` 写成 `stack`。
+   判据、恢复/绕过与未验证项见 [../operations/multiwan-ffe-safety.md](../operations/multiwan-ffe-safety.md)。
+   单 WAN 基线下守卫一次 `accel_*` 都不写。
 
 ## §8 诊断埋点开关 —— 名字、用途、为什么必须先关
 
-7 个开关各占 `zx_diag_mask` 的一位（`zx279128s-eth.h:793-799`），写 `1/Y/0/N` 立刻生效，
-默认全 0；输出在 debugfs `diag`（0444，只读，`zx279128s-main.c:4974`）。
+7 个开关各占 `zx_diag_mask` 的一位（`zx279128s-eth.h:822-828`），写 `1/Y/0/N` 立刻生效，
+默认全 0；输出在 debugfs `diag`（0444，只读，`zx279128s-main.c:5829`）。
 
 | 名字 | 位 | 用途（源码注释口径） |
 |---|---|---|
@@ -291,7 +299,7 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
   另一轮甚至 **898.2 / 895.1**（delay-dose SEQ/SEQb）——这是探针副作用，不是参数效果。
 - `diag_poll=1`（`mask=0x04`）单开 741.1，与慢态同档；`mask=0x06`（seq+poll）857.5
   （`.scratch/ffe-fastpath/napi-knob/20261103-2200/RESULT.md` §1）。
-- `timing=1` 的我方注释估 ~100 ns/包、60 万包/s 时约 7 % 一个核（`zx279128s-main.c:141-147`，
+- `timing=1` 的我方注释估 ~100 ns/包、60 万包/s 时约 7 % 一个核（`zx279128s-main.c:145-151`，
   〔我方注释〕，本轮**未测**其吞吐影响）。
 - ⇒ **任何参数扫描都必须在 `mask=0`、`diag_*=0`、`zxdly_*=0`、`timing=0` 下做**；
   开任何一个，测到的就不是合并窗口本身。
@@ -299,9 +307,9 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 ## §9 `txq_limit` —— TX 环占用上限（本轮未做 A/B）
 
 **它是什么**：软件阈值，`tx_pending >= txq_limit` 就停车/挡回；范围 **64..1024**，默认 **1024**
-（= 环长 `ZX_NUM_TX_DESC`，再大就会覆盖在飞槽位）。作用点：`zx279128s-main.c:167/169/187`
-（变量/写入校验/module_param_cb）、`:2839`（提交硬闸）、`:2907`（满则停所有口）、
-`zx279128s-accel.c:3003`（快路 #19 命中后、改写前）。
+（= 环长 `ZX_NUM_TX_DESC`，再大就会覆盖在飞槽位）。作用点：`zx279128s-main.c:171/173/191`
+（变量/写入校验/module_param_cb）、`:3352`（提交硬闸）、`:3408`（满则停所有口）、
+`zx279128s-accel.c:3312`（快路 #19 命中后、改写前）。
 
 **本轮结论：未测试（未做满足本仓证据标准的 A/B）**。理由与边界：
 
@@ -324,7 +332,7 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 
 - `grep` 全驱动：**没有** `zxtx_poll_us` 这个 module_param，也没有对应的 sysfs 项。
 - 只有一个**编译期**常量 `ZX_TX_POLL_US = 250`（`zx279128s-eth.h:283`），用于"环满停车后
-  用 250 µs 定时器把 poll 叫起来"（`zx279128s-main.c:2051`、`zx_tx_kick()`）。
+  用 250 µs 定时器把 poll 叫起来"（`zx279128s-main.c:2537-2542`、`zx_tx_kick()`）。
 - 所以它**不是旋钮**。若有人要把它做成运行期参数，需要改代码 + 构建；那属于"新增参数"，
   本文不给值。**预期收益 ≈ 0**〔推断，未测〕：它只在环满停车时起作用，而环满已被 xmit 前
   回收与 poll 顶部回收两条路径覆盖（`.scratch/ffe-fastpath/tx-coalesce/20261104-0025/RESULT.md` §3/§5）。
@@ -404,7 +412,7 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 5. 日志：`logger -t zx_ffe_coalesce`，正常一行 `us=… frames=… weight=… applied+readback ok`；
    非法/失败走 `user.err`。驱动侧另有自己的 `dev_info` 读回行（§2.1）。
 6. **一处口径仍不一致、一处已对齐**（本文只指出，不改别人的在途实现）：
-   - 脚本 `napi_weight` 的区间已收紧为 **1..1024**，与驱动 `zx279128s-main.c:1104` 的上限 **1024**（常量 `:968`）
+   - 脚本 `napi_weight` 的区间已收紧为 **1..1024**，与驱动 `zx279128s-main.c:1562` 的上限 **1024**（常量 `:1422`）
      一致；超限值在脚本侧就被拒（不写进 sysfs），不再有"脚本放行、驱动 `-EINVAL`"的中间态；
    - 脚本要求 `us/frames ≥ 1`，驱动允许 **0**（0 的语义未测，§15-12）。想写 0 只能绕过脚本
      手写 sysfs。
@@ -446,7 +454,7 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 
 ### ④ 双向必须两向各记，且不能按 941×2 算效率
 
-- 两向**分别**记正向/反向（`iperf3` 两条连接，或 `--bidir`），不要只报合计。
+- 两向**分别**记正向/反向（`iperf3` **两条连接并发**：`-p 5201` 与 `-p 5202 -R`，即"方式 A"；**`--bidir` 已禁用**——它每向只到 ~470，属"跑不满"口径，2026-11-04 用户裁定全面停用），不要只报合计。
 - 本板实测双向合计 **876.7 Mbit/s** = 载荷上限 941.2 的 **93.1 %**（L2 口径 88.8 %）。
 - **不能**拿 1882.4（941×2）当分母：本盒没有兑现"每向 941"的全双工。但也**不是严格的字节额度**：
   双向时盒子处理的总帧率 **82 955 fps** 反而比同参数单向（81 868 fps）高 1.3 %，总字节低 4.2 %；
@@ -475,14 +483,14 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 | 2 | `0x350038` / `0x350040` / `0x350044` 三个无宏寄存器 | 全树无宏、驱动零访问；语义未知，盲写风险高（`.scratch/ffe-fastpath/tx-coalesce/20261104-0025/RESULT.md` §1–§2） | 先只读：`dma_state` 会原样打印 `dma+000..11c`（跳过 0x68）；在 idle/500 µs/250 µs 三种负载下各读两次，看是否随 pps 或环深变化；确认有相关性再设计写入与读回自证 |
 | 3 | `zxtx_poll_us` | **不存在**这个运行期参数，只有编译期 `ZX_TX_POLL_US=250`（§10） | 需改代码把它做成 module_param，再在**环满**场景（`txq_limit=64` + 单流）测；非环满预期无差异 |
 | 4 | `ffe_aging=300 s` 到期后同一五元组能否重学、重学代价 | 没做跨老化边界的流表观测 | 运行期 `echo 10 > .../ffe_aging`，单流跑 60 s，采样 `accel_ipv6` 的 `flows/hit/miss` 与 `ffe_flows`，看同一五元组是否重新 `add`、吞吐有无瞬时塌陷 |
-| 5 | 多队列/多环（8 条 RX 环共用 1 个 NAPI）拆分的收益 | 驱动现状是 1 个 NAPI 服务所有口（`zx279128s-main.c:3213`/`:5377-5380`），没做过拆分实验 | 构建 per-queue NAPI + 中断亲和/RPS 版本，比较单流/16 流的 IRQ/s、每核 softirq、吞吐；先确认 `frames/poll < weight` 是否仍成立 |
+| 5 | 多队列/多环（8 条 RX 环共用 1 个 NAPI）拆分的收益 —— **已结案：不采纳（2026-11-04 真机）** | 有害的是**分环 + `napi1` 组合态**（多一条 threaded NAPI）：`-R` 916.29→709.21 = −22.60 %（剔除异常点 −22.89 %）；**因果未分离**（无 A/B/A 交错、回退只 2 点、未测 `rx_split=Y`+trap 全 0）⇒ 不能说流量分环本身有害。代价是共享 RX 中断放大 6.4×；`--bidir` 那组只留档、不比较（口径已被裁定禁用） | 不必再测；`rx_split` **保持默认 `N`**。证据 `.scratch/ffe-fastpath/rx-split-onbox/20261104-2050/RESULT.md` §1；开关/回退/init 脚本缺陷见 `docs/operations/bench-and-build.md` §7.4 |
 | 6 | `frames<16` 在极小包下的中断风暴 | **本板推不出高 pps**：`-M 88` 四格全塌到 60.7–63.2 Mbit/s，TCP 侧先崩 ⇒ **未观测到**，不等于不存在 | 换 UDP 或 pktgen 产生高 pps；在 `frames=4/8`、`us=250/1000` 下记 IRQ/s、softirq、`rx_drop`/`qfull_drop`；先定 IRQ 红线（如 40k/s）再判 |
 | 7 | 双向下各参数的最优值 | 双向只测了 `500/64`、`250/16`、`62/64`；`250/32`、`125/64` 没进双向 | 双向矩阵补 `250/32`、`125/64`；两向分开记，同时记合计与 CPU1 softirq；别只看合计 |
 | 8 | `HZ` 变化的影响 | 本板构建 `HZ=100`；没有 HZ=250/1000 的镜像 | 换 HZ 重编，用同一公式重算每帧成本（量化粒度会变），并复核 softirq 记账是否仍按 tick 落上下文 |
 | 9 | `zxnapi_weight` 与 `zxcoal_frames` 的交互 | 只测了 1 个 weight 点（128）在 `250/64` 上，没有二维网格 | 2D 扫 `{16,32,64} × {64,128,256}`；先看 `frames/poll` 是否触顶，再比吞吐/IRQ；注意同档 10 % 散布 |
 | 10 | `us=500` 下 `frames` 的独立作用 | 没有 `500/16`、`500/32`、`500/128` 格；"定时器绑定 ⇒ frames 无关"未证 | 同一轮跑 500/16、500/32、500/64、500/128，各 30 s；与 250 档同表对比 IRQ/s 与 frames/IRQ |
 | 11 | v4 从 `hw` 切到 `ffe` 后的吞吐 | 切 ffe 需先让 PPE 释放（否则 `-EBUSY`），本轮没做；v4 只测了 hw（933.3/934.8） | 先 `flow_offloading_hw=0` + reload，确认 `ppe_bound=0`；`echo ffe > accel_ipv4` 后读回首行，再跑 v4 单流/小包 |
-| 12 | `us=0` / `frames=0` 的语义 | 驱动接受 0，脚本拒绝；源码对 `zxcoal_us`/`zxcoal_frames` **只校验上限**（`zx279128s-main.c:1032`/`:1057`），**0 不校验、源码也没有注释说明 0 的语义** ⇒ 写 0 的实际行为**本板未上机核实**（以上是对代码现状的静态核对，属我方描述）〔2026-11-04 02:00 更正，见文末 §更正〕 | 一次只写一个 0，观察 IRQ/s 上限、softirq、是否丢帧；两个都 0 = 每帧中断，别在同一格试 |
+| 12 | `us=0` / `frames=0` 的语义 | 驱动接受 0，脚本拒绝；源码对 `zxcoal_us`/`zxcoal_frames` **只校验上限**（`zx279128s-main.c:1486`/`:1511`），**0 不校验、源码也没有注释说明 0 的语义** ⇒ 写 0 的实际行为**本板未上机核实**（以上是对代码现状的静态核对，属我方描述）〔2026-11-04 02:00 更正，见文末 §更正〕 | 一次只写一个 0，观察 IRQ/s 上限、softirq、是否丢帧；两个都 0 = 每帧中断，别在同一格试 |
 | 13 | 31 µs 以下（15/8/4 µs） | 最小只到 31 µs；再低会撞 IRQ 率天花板 | 逐档测 15/8，记录 IRQ/s、softirq、吞吐；先设否决线（如 IRQ >40k/s 或 softirq >0.85） |
 | 14 | "仅 NET_RX"的每帧成本 | `/proc/softirqs` 只有次数、没有时间（§14-③） | 在内核 `net_rx_action`/NAPI poll 里夹 `ktime_get_ns()`，需要构建；否则只能给上界 |
 | 15 | 交付值的 >120 s 长稳与跨重启复现 | 只做了 120 s（四桶）与单 boot；换 boot 后的重复性没测 | 300 s × 3，跨两次重启各做一轮；记四桶吞吐、IRQ/s、softirq、`dmesg` 异常计数 |
@@ -526,8 +534,8 @@ zxcoal_frames=16: reg 0x350034 raw 64 -> 16 (readback 16)
 
 **被更正的原文**：§15 表第 12 行（`us=0` / `frames=0` 的语义）里「驱动接受 0，脚本拒绝；源码只写"0 的语义未上机核实"〔归属待核〕」。
 
-**错在哪**：① 该"源码引文"**不存在**——`grep -nE '未上机核实|未核实|未验证'` 在 `overlay/.../drivers/net/ethernet/zte/*.c *.h` **0 命中**（exit 1）；那是我方文档自己的措辞被误当成源码原文，故〔归属待核〕一并删除（这句本就是"我方对代码现状的描述"）。② 事实是：`zxcoal_us_set`（`zx279128s-main.c:1025`）与 `zxcoal_frames_set`（`:1050`）只做 `kstrtouint` + **上限**检查（`:1032` `v > ZXCOAL_US_MAX`、`:1057` `v > ZXCOAL_FRAMES_MAX`），**0 直接放行**，且没有任何注释说明 0 的语义；`MODULE_PARM_DESC` 只写区间（`:1048` `0..1000000`、`:1072` `0..4096`）。③ **不要混入 `:1103`**：那是 `zxnapi_weight_set` 的 `v < 1`（拒绝 0），属于另一个参数、另一种语义。
+**错在哪**：① 该"源码引文"**不存在**——`grep -nE '未上机核实|未核实|未验证'` 在 `overlay/.../drivers/net/ethernet/zte/*.c *.h` **0 命中**（exit 1）；那是我方文档自己的措辞被误当成源码原文，故〔归属待核〕一并删除（这句本就是"我方对代码现状的描述"）。② 事实是：`zxcoal_us_set`（`zx279128s-main.c:1479`）与 `zxcoal_frames_set`（`:1504`）只做 `kstrtouint` + **上限**检查（`:1486` `v > ZXCOAL_US_MAX`、`:1511` `v > ZXCOAL_FRAMES_MAX`），**0 直接放行**，且没有任何注释说明 0 的语义；`MODULE_PARM_DESC` 只写区间（`:1502` `0..1000000`、`:1526` `0..4096`）。③ **不要混入 `:1562`**：那是 `zxnapi_weight_set` 的 `v < 1`（拒绝 0），属于另一个参数、另一种语义。
 
-**现在能写什么**：源码对 `zxcoal_us` / `zxcoal_frames` **只校验上限**（`zx279128s-main.c:1032` / `:1057`），**0 不校验、源码也没有注释说明 0 的语义** ⇒ 写 0 的实际行为**本板未上机核实**。
+**现在能写什么**：源码对 `zxcoal_us` / `zxcoal_frames` **只校验上限**（`zx279128s-main.c:1486` / `:1511`），**0 不校验、源码也没有注释说明 0 的语义** ⇒ 写 0 的实际行为**本板未上机核实**。
 
-**口径来源**：本条与每帧成本无关，只来自对 overlay 源码的静态读码（`zx279128s-main.c:1025-1072`、`:1095-1103`）与 `grep` 结果；引用时只写"静态读码、未上机"。
+**口径来源**：本条与每帧成本无关，只来自对 overlay 源码的静态读码（`zx279128s-main.c:1479-1526`、`:1553-1562`）与 `grep` 结果；引用时只写"静态读码、未上机"。

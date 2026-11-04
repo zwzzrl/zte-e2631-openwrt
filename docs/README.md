@@ -21,7 +21,9 @@ evidence: docs/architecture.md, docs/known-issues.md, docs/v1.3-progress.md
 | 它现在哪里坏着 / 哪些是已知坑 | [known-issues.md](known-issues.md) | 机器可读的问题块 + 每条一则"现象/根因/证据" |
 | 它整体是怎么搭起来的 | [architecture.md](architecture.md) | 三个仓库、镜像几何、驱动结构、验证栈 |
 | 要动驱动/寄存器/刷机 | [reference/](reference/) → [features/](features/) | 先查常量与表，再看功能线为什么这么写 |
+| 要从空盒重建台架 / 出镜像 / 刷机 | [bench-and-build.md](operations/bench-and-build.md) | 台架 16 条放行与 v6 台子、两条构建路线（B 只对本机成立）、刷机与打流门禁 |
 | 要调 FFE 运行期参数（合并窗口/NAPI 权重/延迟剂量） | [ffe-tuning-parameters.md](reference/ffe-tuning-parameters.md) | 每个旋钮的作用点、实测影响、代价与未测项 |
+| 要多 WAN / 策略路由（或排查切 WAN 后流量消失） | [multiwan-ffe-safety.md](operations/multiwan-ffe-safety.md) | 硬件条目为什么会黑洞、守卫的三条判据、怎么恢复/绕过 |
 | 要复现某个结论 | [reverse/](reverse/) | 每条都给测法与判据，不给"当时日志在哪" |
 | 想知道某个结论是怎么被推翻的 | [history/](history/) | 带日期的文档，标 `historical` / `superseded` |
 

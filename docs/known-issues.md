@@ -19,6 +19,9 @@ Schema: `id` is stable, `severity` is `blocker | major | minor`, `status` is
 `open | mitigated | fixed | wontfix`, `surface` is what you are trying to do, `evidence`
 points at something in the repository or at a measurement.
 
+**结论**：这份清单按"现象 / 根因 / 证据 / 处置"逐条记；`status: open` 是现在还会咬人的
+坑，`mitigated` 表示已有兜底（兜底本身未上机验证时会写明），`fixed` 要能指到修复点。
+
 ```yaml
 - id: WIFI-ASSOC-HARD-HANG
   severity: major
@@ -1002,6 +1005,87 @@ points at something in the repository or at a measurement.
     single-stream 145 Mbit/s (window vs per-packet cost), the 0.3-0.5 % retransmits on a LAN
     path with softnet time_squeeze, and the driver per-packet cost if 700 Mbit/s+ is wanted.
     Numbers and harness: docs/features/v6-software-fastpath.md
+- id: MULTIWAN-FFE-BLACKHOLE
+  severity: major
+  status: mitigated
+  surface: multi-wan / ipv6 fast path
+  symptom: an FFE entry keeps forwarding out of the old WAN after mwan3 / policy routing moves the kernel route, so the flow disappears silently until ffe_aging (300 s) or a manual ffe_flush
+  verified: |
+    no on the board. The mechanism is code fact (entries carry only eport + next-hop MAC, accel.c:1542/2070-2200;
+    a single WAN link down does not flush the table, accel.c:4220 is reached only from accel close; aging 300 s, accel.c:232).
+    The guard's decision logic is covered by an offline self-test (15/15), not by a flashed image.
+  cause: |
+    Hardware entries have no "is this WAN alive" bit, and the kernel route switch does not
+    invalidate them. Two states exist at once: the kernel's current egress and the hardware's
+    pinned egress. See docs/operations/multiwan-ffe-safety.md.
+  workaround: |
+    shipped guard: /etc/init.d/zx_ffe_multiwan + /sbin/e2631-ffe-multiwan writes debugfs
+    accel_ipvN=stack when it sees >=2 default-route egress devices, a non-baseline ip rule
+    (v4/v6), or >=2 enabled mwan3 interfaces; re-evaluates on ifup/ifdown/ifupdate and every
+    5 s; restores the previous mode after 300 s of clear single-WAN state. Single WAN baseline:
+    zero accel_* writes. Manual restore/bypass: uci set zx_ffe.multiwan.enabled=0; uci commit zx_ffe;
+    /etc/init.d/zx_ffe_multiwan reload. IPv4 PPE offload is NOT covered (use flow_offloading_hw=0).
+  next: |
+    flash and verify on the box: procd brings the watch loop up, hotplug context can write debugfs,
+    the busybox ip applet has "rule", and the EBUSY retry path works on a saturated link.
+    Details and file:line index: docs/operations/multiwan-ffe-safety.md
+- id: NPTV6-NO-HW-ACCEL
+  severity: major
+  status: wontfix
+  surface: ipv6 / hardware acceleration
+  symptom: NPTv6 (RFC 6296) or 1:1 NAT66 rules never take the hardware path - the flows stay on the CPU stack, and no driver setting or image changes that
+  verified: |
+    offline only, but the blocking field widths are code fact. The rewrite instruction is 12 B of
+    enable bits with no address value (zx279128s-ppe.c:1040-1071); the only address value sources
+    are the 32-bit next-hop word0 (zx279128s-ppe.c:1320-1322, zx279128s-eth.h:194) and the 32-bit
+    per-subnet SNAT table (zx279128s-ppe.c:1097, zx279128s-eth.h:198); the two 128-bit PM RAMs are
+    16-entry DS-Lite tunnel endpoints and no flow field indexes them.
+  cause: |
+    Hardware cannot express it. The packet modifier has no 128-bit address value source and no
+    "this header is IPv6" mode bit (zx279128s-ppe.c:252-262). NPTv6 must rewrite the high 48/56
+    bits and keep the IID, NAT66 must replace the whole /128 - both are wider than the engine. Our
+    ppe.c therefore rejects every v6+mangle path with -EOPNOTSUPP (zx279128s-ppe.c:1237-1239,
+    zx279128s-ppe.c:1249-1253, zx279128s-ppe.c:1266-1267), and FFE learning drops v6+NAT flows
+    and counts nat6 (zx279128s-accel.c:2314-2319). The vendor tm.ko g_nptv6_sipv6/g_nptv6_dipv6
+    tables are unreferenced dead .bss - one read-only compare inside addFlowOperInfo, no writer
+    anywhere - and even filled they feed nothing into the PM; do not cite them as "the vendor did
+    it in hardware".
+  workaround: |
+    none on the hardware side. Software NAT66 works (kernel nft nat, or a CPU rewrite in the fast
+    path) but gives up acceleration. Fast-path entries that carry the NAT bit for v6 are returned
+    to the stack on purpose (zx279128s-accel.c:2314-2319).
+  next: |
+    nothing planned. Offline derivation and per-field evidence:
+    .scratch/ffe-fastpath/nat66-feasibility/20261104-1240/RESULT.md
+- id: RXSPLIT-CLA-BOOT-ORDER
+  severity: minor
+  status: open
+  surface: rx / performance
+  symptom: with rx_split=1 but no CLA table 7 programmer, sub-ring 1 stays empty - the extra NAPI polls nothing and the split buys nothing. With the CLA table programmed, the harmful state is the **分环 + `napi1` 组合态**（多一条 threaded NAPI）—— single-stream `-R` arm 916.29 -> 709.21 Mbit/s = **−22.60 %**（`-R` 臂，剔除异常点 −22.89 %）；**因果未分离**：无 A/B/A 交错（基线全在前、分环全在后）、回退只 2 点、未测 `rx_split=Y` + trap 全 0 ⇒ 只能说"分环 + `napi1` 组合态有害"，不能说"流量分环本身有害/负收益"。See docs/operations/bench-and-build.md section 7.4.
+  verified: |
+    2026-11-04 真机已验证（失败）：e2631-rxsplit start 与 stop 均 rc=1；start 在 trap0 回滚、
+    stop 只清 trap 0..15（0x110/0x17f 残留）。原因：verify_trap 把 0x18 bit0=1（idle）当 busy
+    （zx279128s-ppe.c:690-716）。另两半各自成立：CLA table 7 block1=lan2 -> qid1 把 2,564,422 帧全搬到
+    ring1（rx-block-map/20261104-2030/RESULT.md sections 2-3），rx_split=1 只建/删 ring1 的 NAPI（main.c:1189-1233）。
+  cause: |
+    two facts, do not merge: (1) the script defect is PROVEN - verify_trap's polarity is inverted, so
+    start rolls back at trap 0 and stop clears only 0..15; (2) the split's throughput benefit was not
+    demonstrated, and what is harmful is the **分环 + `napi1` 组合态** on single-stream `-R`
+    （**−22.60 %**；`-R` 臂，剔除异常点 −22.89 %）。**因果未分离**：无 A/B/A 交错（基线全在前、
+    分环全在后）、回退只 2 点、未测 `rx_split=Y` + trap 全 0 ⇒ 不能说"流量分环本身有害/负收益"。
+    The defect is being fixed; the feature stays off (rx_split default N) regardless of that fix.
+  workaround: |
+    /etc/init.d/e2631-rxsplit (START=99) acts only when rx_split is on: sysfs rx_split is the
+    real state (reads Y/N via param_get_bool, main.c:1232), uci zx_ffe.settings.rx_split is the
+    boot intent used only when sysfs says N. It writes block1 (base 0x100, lan2 ingress) traps
+    0..127 = index 0x100..0x17f (index = block base + trap, NOT (block<<7)|trap) to qid 1 via
+    cla_write pairs "14=cmd,1c=qid", reads every 16 back through dump=4 + dmesg, and on any
+    mismatch rewrites all 128 to 0 and exits non-zero. Revert order: stop (0 + readback) first,
+    then echo 0 > /sys/module/zx279128s_eth/parameters/rx_split.
+  next: |
+    源码已修（.scratch/ffe-fastpath/rxsplit-initd-fix/20261104-2130/RESULT.md）：verify_trap 极性改为
+    dump=4 读回比对、stop 无条件清 block1 全 0..127、加 RXSPLIT_FORCE=1 封禁门；但镜像内仍是旧版，
+    下次构建生效——旧镜像上不许写"已修"。功能本身已判死，rx_split 默认 N。
 ```
 
 ## WIFI-ASSOC-HARD-HANG
@@ -1909,3 +1993,122 @@ been found @1b60000`。所以 `e2631-fwslot switch` 从 slot1 切回原厂时，
 
 详见 `docs/features/zero-copy.md` §6（含判据与下一步：查厂商归还协议、
 退化方案 bp 世代 epoch、长期按 page_pool 重做）。
+
+## MULTIWAN-FFE-BLACKHOLE - 多 WAN 切路由时硬件条目静默黑洞（2026-11-04，已加守卫）
+
+**现象**：多 WAN（mwan3 或 `ip rule` 策略路由）把内核默认路由切到另一条 WAN 后，
+FFE 表里旧流的硬件条目仍按旧出口端口 + 旧下一跳 MAC 转发。内核认为该走新 WAN，
+硬件把包送进旧 WAN（或已 down 的口）⇒ 流量静默消失，没有丢包计数、没有 ICMP，
+要等 `ffe_aging`（默认 300 s）把条目老化掉，或人工 `ffe_flush`。
+
+**根因**（代码事实，不是推测）：
+
+- 条目只装五元组 / 出口端口 / 下一跳 MAC（`zx279128s-accel.c:1542` 的
+  `zx_ffe_learn_one()`、`:2070-2200` 的钩子），没有 WAN 存活位。
+- 单条 WAN down 不清表：全清只在加速整体关闭时发生（`zx279128s-accel.c:4220`，
+  调用者 `zx_accel_on_close()`）；netdev/地址通知链只维护本机地址与桥端口
+  （`:1134-1160`、`:1203-1230`）。
+- 老化 300 s（`zx279128s-accel.c:232`），活跃命中会刷新 `lastuse` ⇒ 黑洞流越活跃
+  条目越不会掉。
+
+**处置**：交付镜像里加常驻守卫 `/etc/init.d/zx_ffe_multiwan` +
+`/sbin/e2631-ffe-multiwan`：
+
+- 判据三条（任一成立）：主表默认路由出口设备 ≥2；存在非基线 `ip rule`；
+  mwan3 启用接口 ≥2。
+- 命中就写 debugfs `accel_ipvN = stack`（同步切换：排空 TX ≤100 ms → 清该族表 →
+  单字节写模式，`zx279128s-accel.c:3565-3628`）——已有条目当场清掉，不是只停学习。
+- 每次 ifup/ifdown/ifupdate 立刻重评，另有 5 s 轮询兜住没有 ifup 的路由/规则变化。
+- 判据全不成立后再等 300 s 才写回原模式，给 failover/failback 留窗口。
+- 单 WAN 基线不写任何 `accel_*`（离线自检 15/15）。
+
+**手动恢复/绕过**：`uci set zx_ffe.multiwan.enabled=0; uci commit zx_ffe;
+/etc/init.d/zx_ffe_multiwan reload`。只 `disable` init 脚本不够——hotplug 钩子是
+独立入口，`enabled=0` 才是两条路都认的总开关。
+
+**未验证**：没有构建/刷机/上机；procd 拉起、hotplug 上下文写 debugfs、
+busybox `ip rule` applet、满速下 EBUSY 重试都未在真机复核。
+
+**局限**：IPv4 的 PPE 硬件 offload 不归这个守卫管（`accel_ipv4=stack` 只是让驱动
+不插手，PPE 仍按 fw4 flowtable 工作）；要关 v4 的硬件 offload 用
+`uci firewall.@defaults[0].flow_offloading_hw=0`。
+
+完整判据、开关清单、为什么单 WAN 不误关、证据行号：`docs/operations/multiwan-ffe-safety.md`。
+
+## NPTV6-NO-HW-ACCEL - NPTv6 / NAT66 进不了硬件加速（2026-11-04，结构性）
+
+**现象**：给 NPTv6（RFC 6296，`nft ... snat ip6 prefix to`）或 1:1 NAT66 配了规则，
+v6 流即使命中硬件条目也拿不到加速；换任何驱动开关或镜像都不会变。FFE 学习侧对
+"family=6 且带 NAT 位"的条目直接丢弃并计 `nat6`（`zx279128s-accel.c:2314-2319`），
+所以 NPTv6 拓扑是 100% 走协议栈。
+
+**根因**（字段宽度，与匹配是否成立无关）：
+
+- 改写指令只有 12 B，全是使能位与索引，**没有一个地址值**：
+  `zx279128s-ppe.c:1040-1071`（`zx_ppe_flow_entry()`）。
+- 地址取值源只有两个 32 位字段：next-hop RAM 的 word0（目的 IPv4）
+  `zx279128s-ppe.c:1320-1322` + `zx279128s-eth.h:194`，和每 subnet 一个的 32 位
+  SNAT-IP 表 `zx279128s-ppe.c:1097` + `zx279128s-eth.h:198`。全 PM 唯一的 128 位
+  RAM 是表 10/11 的 16 项 DS-Lite 隧道端点，flow RAM 里没有指向它们的索引
+  （`next_hop_idx` → 表 1，`sub_ram_index` → 表 6）。
+- 没有"这是 IPv6 头"的模式位：`zx279128s-ppe.c:252-262` 原文写着
+  "the instruction has no 'this header is IPv6' field"；两个校验和更新位只对 v4
+  置位（`zx279128s-ppe.c:1061-1062`）。
+- 我方实现对 v6 + mangle 一律 `-EOPNOTSUPP`：v6 流里的 IPv4 地址 mangle
+  `zx279128s-ppe.c:1237-1239`、TCP/UDP 端口 mangle `:1249-1253`、IP6 mangle 落到
+  `default: return -EOPNOTSUPP` `:1266-1267`。
+- 原厂 `tm.ko` 的 `g_nptv6_sipv6`/`g_nptv6_dipv6`（`.bss`，各 640 B）是**未接线的
+  死表**：全模块只有 `addFlowOperInfo` 里一处只读比较引用（0x4fe70，字面量
+  0x50b18/0x50b20），没有任何代码写它们；即使被填，也没有 128 位值进入 PM。
+  这既不能当成"原厂做了 NPTv6 硬件"的证据，也不能当成"数据面存在 NPTv6 字段"的反证。
+
+**处置**：不要在硬件路线上再投入。软件能做（协议栈 NAT66，或快路里的 CPU 改写），
+但那等于放弃加速；且当前 v6 硬件条目"命中"本身仍未证（`docs/CONTRADICTIONS.md` X4）。
+逐位反汇编、PM 表清单与取值源：`.scratch/ffe-fastpath/nat66-feasibility/20261104-1240/RESULT.md`。
+本条**不是**"v6 不能转发"：v6 的软件快路仍在，见 `docs/features/v6-software-fastpath.md`。
+
+## RXSPLIT-CLA-BOOT-ORDER - rx_split=1 不会自己写 CLA 表（2026-11-04，操作坑）
+
+**现象**：`/sys/module/zx279128s_eth/parameters/rx_split` 写了 1、`napi1` 也建起来了，
+但反向流照样全落 `rxq0`——子环 1 一直是空的，拆分等于白建一条轮不到的 NAPI。不丢帧，也不会报任何
+错误，所以最容易被当成"split 没用"。
+
+> **注意"白建"≠"中性"**：一旦 CLA 真写对，有害的是**分环 + `napi1`（多一条 threaded NAPI）组合态**，
+> 不是"流量分环本身"——单流 `-R` 臂 **916.29 → 709.21 Mbit/s（−22.60 %；剔除异常点 −22.89 %）**，
+> 共享 RX 中断放大 6.4×，`rx_split` 因此**保持默认 `N`**。**因果未分离**：无 A/B/A 交错（基线全在前、
+> 分环全在后）、回退只 2 点、未测 `rx_split=Y` + trap 全 0 ⇒ 只能说"分环 + `napi1` 组合态有害"，
+> 不能说"流量分环本身有害/负收益"。
+> 实测、判据与回退步骤见 `docs/operations/bench-and-build.md` §7.4（数字来源
+> `.scratch/ffe-fastpath/rx-split-onbox/20261104-2050/RESULT.md`）。
+
+**根因**：驱动侧补丁只在 `rx_split=1` 时多建一条 threaded NAPI 专扫 q1，**一个 CLA
+寄存器都不碰**（`zx279128s-main.c:1009-1012`）；帧进哪条子环由 CLA 表 7 的 trap→qid
+映射决定，那是用户态的事。默认 `rx_split=0` 时模块参数也确实不写 CLA
+（`zx279128s-main.c:1230-1235`）。
+
+**处置**：`/etc/init.d/e2631-rxsplit`（START=99；写+分批读回 `:176-191`、开关判断
+`:193-212`、stop `:240-254`）在 `rx_split` 实际为开（sysfs 读
+`Y`；uci `zx_ffe.settings.rx_split=1` 只在实际为关时用来把它打开）时，把 block1
+（base `0x100` = lan2 入向）的 trap 0..127 写成 qid=1：
+
+- 下标是 **`index = block_base + trap`**（即 `0x100..0x17f`），不是 `(block<<7)|trap`
+  ——后者对 block1 算出 `0x80`，那是 block0 的区间（`rx-block-map/20261104-2030/logs/00-index-lists.txt:1`）。
+- 写协议是**一次 sysfs 写带最多 8 对 `off=val`**（`zx279128s-ppe.c:2089-2116`），
+  所以一行写 4 个 trap（`14=cmd,1c=qid` ×4）；**第 9 对起被驱动静默丢弃**
+  （循环条件 `:2099`），不是报错。
+- 读回不能读 `cla_write` 参数：它的 `.get` 是 `param_get_int`（`:2118-2121`），
+  永远返回静态 storage 0；只能 `echo 4 > .../parameters/dump` 后从 dmesg 的
+  `cla-reg 010:` 行取第 4 字（`0x1c`），第 2 字顺带核对 `0x14` 读命令。
+- **回退顺序：先写 0、再关 `rx_split`**。`/etc/init.d/e2631-rxsplit stop` 会把 128
+  个 trap 写回 0 并逐个读回；确认后再
+  `printf '0\n' > /sys/module/zx279128s_eth/parameters/rx_split`。反序在本驱动里
+  也不丢帧（`rx_split=0` 时 napi0 仍扫 q1），但别靠这个兜底。
+- 加载时机：ppe 是 out-of-tree `.ko`，`/sbin/e2631-ppe-boot` 在 S99 之后还要
+  `DEFER=20` 秒才 modprobe（`e2631-ppe-boot` 的 `sleep "$DEFER"`），所以脚本
+  用 60 s 上限轮询 `cla_write` 节点（`timeout 1 tail -f /dev/null`，不用 sleep）；
+  默认 `rx_split=0` 时完全不进这个等待。
+
+**未验证**：脚本没有构建、没有刷机、没有上机；"开机时 procd 顺序 + 60 s 轮询 +
+dmesg 读回 + 注入不符后的回滚"只在离线 mock 里跑过（18 项断言全过，见
+`.scratch/ffe-fastpath/rxsplit-initd/20261104-1920/logs/21-mock-functional.txt`），
+真机上的 dmesg 时序、`dump=4` 的可见性和长时间稳定性都还没测。
