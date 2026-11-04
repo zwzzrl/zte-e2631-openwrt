@@ -21,6 +21,8 @@ overlay/target/linux/sanechips/base-files/sbin/e2631-fwstate
 overlay/target/linux/sanechips/base-files/etc/init.d/e2631-wifi-eeprom
 overlay/target/linux/sanechips/base-files/etc/init.d/e2631-wifi-load
 overlay/target/linux/sanechips/base-files/etc/init.d/e2631-hb
+overlay/target/linux/sanechips/base-files/sbin/e2631-ffe-multiwan
+overlay/target/linux/sanechips/base-files/etc/init.d/zx_ffe_multiwan
 "
 rc=0
 for f in $FILES; do

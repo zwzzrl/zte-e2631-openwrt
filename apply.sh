@@ -64,8 +64,8 @@ for f in sbin/e2631-probe sbin/e2631-trial sbin/e2631-commit sbin/e2631-leds sbi
 	 sbin/e2631-userdata-status sbin/e2631-userdata-firstboot sbin/e2631-userdata-init \
 	 etc/init.d/e2631-trial etc/init.d/e2631-wifi-eeprom etc/init.d/e2631-wifi-load \
 	 etc/init.d/e2631-leds etc/init.d/e2631-hb etc/init.d/e2631-userdata \
-	 etc/init.d/e2631-netune \
-	 sbin/e2631-wanport \
+	 etc/init.d/e2631-netune etc/init.d/zx_ffe_multiwan etc/init.d/e2631-rxsplit \
+	 sbin/e2631-wanport sbin/e2631-ffe-multiwan \
 	 lib/upgrade/platform.sh \
 	 etc/hotplug.d/firmware/11-mt76-caldata; do
 	chmod +x "$TREE/target/linux/sanechips/base-files/$f"
