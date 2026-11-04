@@ -515,6 +515,35 @@ struct zx_ffe_learn_cnt {
 #define ZX_ALIAS_FAM_UNK	2
 #define ZX_ALIAS_FAM_NUM	3
 
+/*
+ * ④-B：快路 TX 批量提交的暂存区。同一 NAPI 轮次、同一出口（type+id）的
+ * 帧先攒在这里，flush 时**一次进 tx_lock** 完成：容量判 → 连续取号 →
+ * 连续写描述符 → 一次 dma_wmb → 按序扇出 N 次门铃 → 记账。
+ *
+ * 门铃为什么仍是 N 次：硬件一次 TX_START 只吃一个描述符（实测见
+ * zx279128s-main.c 的 zx_eth_txtest()：“一次门铃只启动一个描述符”那段，
+ * 攒 4 个只敲一次时硬件只吃掉一个、其余卡在环里）。所以批量摊薄的是锁、
+ * 回收、容量判与内存屏障，不是门铃本身。
+ *
+ * `n` 的语义 = **本批已承诺（reserved）、还没进发送环的槽位数**。容量判据
+ * 必须把它和已提交的 tx_pending 相加（见 zx_ffe_tx_batch_add()）。
+ *
+ * 只有 NAPI 上下文读写（单实例），不需要额外锁；计数是裸 u64++，与
+ * cnt[] 同一口径（丢几个只影响自证，不影响数据面）。
+ */
+#define ZX_FFE_TX_BATCH_MAX	16
+struct zx_ffe_tx_batch {
+	u8			n;		/* 已攒帧数 = reserved 槽位 */
+	u8			egress_type;	/* 本批共同出口类型 */
+	u16			egress_id;	/* 本批共同出口 id；换口先 flush */
+	struct zx_ffe_pkt	pkt[ZX_FFE_TX_BATCH_MAX];
+	/* dma_state 可观测计数：批次数 / 实际提交帧数 / flush 丢弃 / 最大批长 */
+	u64			batches;
+	u64			frames;
+	u64			drops;
+	u32			max_len;
+};
+
 struct zx_accel {
 	u8			v4_mode;	/* enum zx_accel_mode */
 	u8			v6_mode;	/* enum zx_accel_mode */
@@ -905,12 +934,14 @@ static inline bool zx_diag_on(unsigned int bit)
 }
 
 /*
- * accel.c 需要的三个入口（实现在 main.c，都在 mask 关掉时只做一次位测试；
+ * accel.c 需要的四个入口（实现在 main.c，都在 mask 关掉时只做一次位测试；
  * 调用点本身也带 zx_diag_on() 判断，见各自的调用处）。
  */
 void zx_diag_res_stamp(struct zx_eth_adapter *adapter, u16 bp);
 void zx_diag_res_clear(struct zx_eth_adapter *adapter, u16 bp);
 void zx_diag_drop(struct zx_eth_adapter *adapter, unsigned int why);
+/* ④-B：批量攒批因环满挡回也要进 DIAG 4/6 的同一个入口（逐帧 submit_bp 也用它） */
+void zx_diag_txq_block(struct zx_eth_adapter *adapter, int eport);
 
 struct zx_eth_adapter {
 	struct device		*dev;
@@ -1071,7 +1102,13 @@ struct zx_eth_adapter {
 	u64			zc_rxdrop;	/* 硬件给的 bp 还有人用，整帧丢弃 */
 	unsigned long		zc_park_at;
 
-	/* TX ring, BMU buffer allocation and the TX counters */
+	/*
+	 * TX 环提交锁。硬件只有一个 TX 环（一个 TX_RING 基址、一个 TX_START
+	 * 门铃、一个 TX_DONE 完成计数），五口共享，所以它**不能**按口/按队列
+	 * 拆成多把：门铃吃哪个槽位由"第几次门铃"决定，取号与门铃必须在同一
+	 * 临界区里。锁只包"判容量 + 取号 + 描述符 + 门铃 + 记账"；帧的补齐、
+	 * 拷贝、一致性同步都在锁外做（见 zx_eth_xmit() 的 P2 注释）。
+	 */
 	spinlock_t		tx_lock;
 	/* BMU free register and bmu_free_slots */
 	spinlock_t		bmu_free_lock;
@@ -1205,13 +1242,24 @@ struct zx_eth_adapter {
 	u64			accel_qfull_drop[2];
 
 	/*
-	 * DIAG（2026-11-03）：诊断状态指针，**结构体最后一个字段**。
-	 * 既有字段偏移一个都不动（ppe_flows 仍是 0x4eec），只让 sizeof 多 8 B
-	 * （0x5818 -> 0x5820，结构体 8 字节对齐）。指向独立分配的
+	 * DIAG（2026-11-03）：诊断状态指针。既有字段偏移一个都不动
+	 * （ppe_flows 仍是 0x4eec），只让 sizeof 多 8 B。指向独立分配的
 	 * struct zx_diag；分配失败时为 NULL，插桩点全部静默跳过。
 	 * BUILD_BUG_ON 断言见 main.c 的 zx_diag_abi_check()。
 	 */
 	struct zx_diag		*diag;
+
+	/*
+	 * ④-B：FFE 命中路径的 TX 攒批状态。**只许追加在结构体最尾部**（这条
+	 * 结构体的 ABI 由 main.c 的 zx_diag_abi_check() 钉着：ppe.ko 用写死的
+	 * 偏移访问前面的字段）。放这里而不是 struct zx_accel 里面，是因为
+	 * accel 在 0x50e0，往它里面加字段会把 tx_dup_reject/accel_qfull_drop/
+	 * diag 全部平移，ABI 断言当场编译不过——实测过（2026-11-04）。
+	 * 既有偏移一个不动，sizeof 从 0x5820 增到 0x59c8（尾部追加的代价，
+	 * 只落在 devm_kzalloc() 的立即数与 dma_state 的打印上）。
+	 * 字段说明见 struct zx_ffe_tx_batch（accel 之前）。
+	 */
+	struct zx_ffe_tx_batch	tx_batch;
 };
 
 /* MAC in the layout of the switch's MAC registers: bytes 2-5, then 0-1 */
@@ -1249,6 +1297,44 @@ void zx_tx_reclaim(struct zx_eth_adapter *adapter);
  */
 bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
 		     unsigned len);
+/*
+ * ④-B：一批 n 帧的提交（调用者持 tx_lock、做完容量检查、帧已改写）。
+ * 描述符连续写 → **一次 dma_wmb** → 按序扇出 k 次 TX_START（一次门铃只吃
+ * 一个描述符，见 zx_eth_txtest() 的实测注释）。锁内再做一次权威容量判，
+ * 只提交装得下的前缀 k = min(n, limit - tx_pending)。**没提交的帧一个
+ * 描述符都没写**；返回 k（0..n），不会返回负数。
+ */
+int zx_tx_submit_batch(struct zx_eth_adapter *adapter, int eport,
+		       const u16 *bps, const u16 *lens, int n);
+/*
+ * ④-B：快路批量 flush 的唯一入口。它可以由 zx_ffe_forward()（换口/批满/
+ * 没容量时）调用，也可以由 zx_eth_poll() 在每轮 NAPI 末尾调用——后者是
+ * **必须**的：最后不足一批的帧不能留到下一轮（RX 描述符已消费、bp 不许
+ * 归还，留着就是延迟发送 + 占缓冲）。空批是 no-op。
+ *
+ * 1b-A：@bidx 是**批索引**，不是环号。0 = adapter->tx_batch（默认的那一份，
+ * 与打补丁前完全一致，dma_state 的 tx_batch_* 也只统计它）；1 = ring1
+ * 专用的文件级批（accel.c 的 zx_tx_batch_ring1），只在 rx_split=1 时被
+ * 用到。两条 NAPI 并发时各写各的批，`b->n`/b->pkt[]/egress_type 不再共享，
+ * 这就是竞态②的处理方式（比加锁强：批的"归属"和顺序也一起隔离了）。
+ * adapter->tx_batch 仍是单写者 —— 只有 napi0 会传 0，TX 路径（ndo_start_xmit）
+ * 根本不碰任何 tx_batch。
+ */
+void zx_ffe_tx_batch_flush(struct zx_eth_adapter *adapter, int bidx);
+/*
+ * ④-B：把快路批量丢弃的 bp 还给 BMU（zx_bp_return + bmu_free_fail 计数）。
+ * 只有 accel.c 的 flush 用它：帧已改写、没进发送环，只能丢。
+ */
+void zx_ffe_bp_return(struct zx_eth_adapter *adapter, u16 bp);
+/*
+ * fix2（B3）：accel 模式切换的 quiesce 入口（定义在 main.c）。enter=true
+ * 让两条 RX NAPI（adapter->napi 与 rx_split 的 napi1）的 poll 立刻空转、
+ * 并等在场的那一轮退场；false 清标志、必要时补 schedule。**它不再调用
+ * napi_disable()/napi_enable()**，所以不取 dev->lock —— 这正是 B3（与
+ * rtnl 下的 napi_disable 双向等待）的结构性消除。调用点已在进程上下文，
+ * 可以睡（内部用 wait_event）。rx_split=0 时它只管 adapter->napi。
+ */
+void zx_rx_split_quiesce(struct zx_eth_adapter *adapter, bool enter);
 /* Turn the zero-copy path on/off.  It takes rtnl_lock() itself, so the caller
  * must not hold rtnl (zx_accel_set() relies on that).
  */
@@ -1283,6 +1369,13 @@ enum zx_ffe_rx_result {
 	ZX_FFE_RX_STACK = 0,
 	ZX_FFE_RX_FORWARDED,
 	ZX_FFE_RX_DROPPED,
+	/*
+	 * ④-B：已入批，还没进发送环。收尾与 FORWARDED 一样（描述符消费、
+	 * bp 不归还），区别只在**计数时机**：hit/fwd/bytes/dev_dstats 与
+	 * bp 的归属都在 flush 时按"实际提交了 k 帧"结算（见
+	 * zx_ffe_tx_batch_flush()）。调用方必须把它当作"帧已不在自己手里"。
+	 */
+	ZX_FFE_RX_BATCHED,
 };
 /*
  * P2 真转发：按设计 §2.2 的判据链判断，全部通过就把**同一个 bp** 写进发送
@@ -1299,9 +1392,16 @@ enum zx_ffe_rx_result {
  * 探针确认是 0x8864 会话帧后才解析；pppoe=0 时只多一次"读门控 + 分支"）。
  * 不从调用方传：两个只在 M7 才被读的字段会多压两个栈槽，把 zx_eth_rx()
  * （内联进 zx_eth_poll 的 6500 条指令）的帧偏移整体平移。
+ *
+ * 1b-A **故意打破** M2 的"签名不变"：多一个 @bidx（批索引，0 = 默认批、
+ * 1 = ring1 的批）。理由：只有 RX NAPI 会调本函数，两个调用点都在
+ * zx_eth_rx_q() 里、手里就有那个索引；不加参数就只能往 struct zx_ffe_pkt
+ * 里塞字段，而 zx_ffe_pkt 嵌在 struct zx_ffe_tx_batch → 该结构是 adapter 的
+ * 最后一个成员，加一个字节就把 sizeof_adapter 顶过 0x59c8 的 BUILD_BUG_ON，
+ * 等于要求 ppe.ko 同源重编。一个寄存器参数比 ABI 便宜得多。
  */
 enum zx_ffe_rx_result zx_ffe_rx(struct zx_eth_adapter *adapter, u16 bp, u16 len,
-				int rx_port, int family);
+				int rx_port, int family, int bidx);
 
 /* ---- M2：PPPoE 内核侧接口（宿主单测不编这里，见 pppoe.h 的 #ifdef __KERNEL__） */
 
@@ -1347,7 +1447,7 @@ void zx_ffe_pppoe_flush_work(struct work_struct *work);
  * "这一帧该被怎么处理"，所有计数集中在 ingress op 的 complete() 出口做一次
  * ——两族的口径只有一份，不会出现"v6 的 miss 忘了加上某个子集"这种对不上的账。
  *
- * 比 enum zx_ffe_rx_result 细一档是必要的：RX 结果只有三态，而计数要区分是
+ * 比 enum zx_ffe_rx_result 细一档是必要的：RX 结果只有四态，而计数要区分是
  * 哪条判据把人挡回去的（csum_err / ttl_err / drop_local / drop_noport /
  * fallback / qfull / rx_drop 都是 miss 的子集）。
  */
@@ -1367,6 +1467,10 @@ enum zx_ffe_verdict {
 	ZX_FFE_V_RX_DROP,	/* 已改写但提交失败，只能丢帧（不可达） */
 	ZX_FFE_V_QFULL_DROP,	/* P2：环满且 ffe_qfull_drop=1 —— 直接丢帧、不回栈；
 				 * 帧还没改写，bp 由调用方按 DROPPED 还回 BMU
+				 */
+	ZX_FFE_V_FWD_PEND,	/* ④-B：已改写并攒进批，还没进发送环。complete()
+				 * 不计数、返回 ZX_FFE_RX_BATCHED；hit/fwd/bytes
+				 * 与失败处置在 flush 时按实际提交结果结算
 				 */
 };
 
@@ -1393,9 +1497,15 @@ struct zx_ffe_ingress_ops {
  * 出口（egress）op（design/extensibility.md §1.1/§5 第 1 条）：**谁把帧发出去**。
  * 流表条目只记 type + id，提交按 type 分派；未注册的类型一律回栈（不猜）。
  *   usable()  这个出口现在能不能发（交换机口 = 存在 + running + carrier）；
- *   submit()  按批提交（现在恒 n == 1，见 §5 第 1 条）。调用者已经持 tx_lock、把帧
- *             改写完，并做过容量检查；返回非 0 = 这一帧已经改过、但提交不
- *             出去，只能丢（调用方返回 DROPPED，把 bp 还给 BMU）。
+ *   submit()  按批提交（④-B 起 n 可以 > 1）。调用者已经持 tx_lock、把帧
+ *             改写完，并做过容量检查。**返回值改成"实际提交的帧数"**：
+ *             >= 0 = 提交了这么多（0 可能是容量不够或重复 bp，一个描述符
+ *             都没写），< 0 = 一帧都没提交（负 errno，例如出口在判据之后
+ *             掉链）。**没提交的帧已经改写过，只能丢**——bp 由调用方
+ *             （批量是 flush）还给 BMU，并按 rx_drop 记账。
+ *             为什么返回计数而不是 bool：一批 N 帧时容量可能在权威判据处
+ *             只够前 k 帧（k < N），调用方必须知道哪一段进了环、哪一段
+ *             没进，才能只丢后半段。单帧路径下返回值只有 1 或负数。
  *
  * P10.2 起 submit() 只收 egress id，不收流表条目：数据面在 RCU 段里先做一次
  * 条目快照（struct zx_ffe_flow_rt，见 zx279128s-accel.c），控制面换节点后

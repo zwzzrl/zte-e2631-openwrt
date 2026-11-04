@@ -21,6 +21,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/bitops.h>	/* DIAG: fls()/rol32() */
+#include <linux/cpumask.h>	/* 1b-A: cpumask_of()/nr_cpu_ids（ring1 NAPI 绑核） */
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -32,6 +33,7 @@
 #include <linux/ipv6.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/math64.h>	/* ④-B: div64_u64()，ARM32 内核不链 libgcc 的 __aeabi_uldivmod */
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -39,7 +41,9 @@
 #include <linux/phy.h>
 #include <linux/platform_device.h>
 #include <linux/rtnetlink.h>
+#include <linux/sched.h>	/* 1b-A: set_cpus_allowed_ptr() */
 #include <linux/seq_file.h>
+#include <linux/wait.h>		/* fix2: quiesce 用 wait_event 等在场 poll 退场 */
 
 #include "zx279128s-eth.h"
 #include "zx279128s-ppe.h"
@@ -519,8 +523,8 @@ void zx_diag_drop(struct zx_eth_adapter *adapter, unsigned int why)
 		d->drop[why]++;
 }
 
-/* 4/6：提交被 txq_limit 挡回（栈路径与快路共用这一个入口） */
-static void zx_diag_txq_block(struct zx_eth_adapter *adapter, int eport)
+/* 4/6：提交被 txq_limit 挡回（逐帧 submit_bp 与 ④-B 批量攒批共用这一个入口） */
+void zx_diag_txq_block(struct zx_eth_adapter *adapter, int eport)
 {
 	struct zx_diag *d = READ_ONCE(adapter->diag);
 
@@ -687,7 +691,7 @@ static void zx_diag_abi_check(void)
 	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, tx_dup_reject) != 0x5790);
 	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, accel_qfull_drop) != 0x5808);
 	BUILD_BUG_ON(offsetof(struct zx_eth_adapter, diag) != 0x5818);
-	BUILD_BUG_ON(sizeof(struct zx_eth_adapter) != 0x5820);
+	BUILD_BUG_ON(sizeof(struct zx_eth_adapter) != 0x59c8);
 }
 
 /*
@@ -962,6 +966,456 @@ static unsigned int zxcoal_us = ZX_RX_IRQ_USECS;		/* µs */
 static unsigned int zxcoal_frames = ZX_RX_IRQ_FRAMES;	/* 帧 */
 static unsigned int zxnapi_weight = NAPI_POLL_WEIGHT;	/* 帧/轮 */
 
+/* =====================================================================
+ * 1b-A：给 RX 子环 1 一条独立 NAPI，绑到 CPU0。**默认关，可运行期回退。**
+ * =====================================================================
+ *
+ * 硬件前提（已上机证实，见 .scratch/ffe-fastpath/cla-q1-onbox/20261104-1855/）：
+ * RX 是**一个**基址寄存器 0x3400F0（eth.h 的 ZX_TM_BUF_F0）+ bank0 的 8 条
+ * 1024×16 B 子环，环 q 的描述符 = rx_ring + q*0x4000 + idx*16（eth.h 的
+ * ZX_RX_QUEUE_STRIDE）。写 CLA 表 7 的 qid=1 就让帧真的进子环 1。今天 8 条
+ * 环全由同一个 NAPI 用一份 budget 从 q7 扫到 q0（zx_eth_rx()）。
+ *
+ * 本补丁只做一件事：把 q1 从那个循环里摘出来，交给第二条 NAPI。
+ *
+ * 为什么状态放在**文件级**而不是 struct zx_eth_adapter：ppe.ko 用写死的
+ * 偏移访问 adapter（zx_diag_abi_check() 的 8 条 BUILD_BUG_ON，sizeof 必须
+ * 仍是 0x59c8），一个 struct napi_struct 放进去就把尾部整段平移，等于要求
+ * ppe.ko 同源重编——历史上已经为此 panic 回过一次。SoC 上只有一个以太网
+ * 控制器（见 probe 里的注释），文件级单例是安全的。
+ *
+ * 状态机（唯一开关是 rx_split）：
+ *   rx_split=0（默认）：dev->napi_list 里只有 adapter->napi，1 次
+ *                       request_irq，budget 64 全给它 —— 与打补丁前等价。
+ *   rx_split=1        ：多一个 zx_napi1：threaded（kthread）、只扫 q1、
+ *                       被 set_cpus_allowed_ptr() 绑到 rx_split_cpu。
+ * 0→1 在 setter 里 "建好 napi1 并 enable" → "napi_disable(napi0)" →
+ * "置 rx_split" → "napi_enable(napi0) + 排一次" → "排一次 napi1"；
+ * 1→0 反过来 "napi_disable(napi1)" → "置 rx_split=0" → "flush ring1 批" →
+ * "摘掉 napi1"。
+ * 两个方向都保证**不会有两核同时抓 q1**（见 rx_split_set 的注释）。
+ * 回退后 napi1 从 dev->napi_list 消失、kthread 被 kthread_stop、napi0 重新
+ * 扫 q1 —— 不需要重载模块。
+ *
+ * 预算与公平（任务书第 2 条）：两条 NAPI **各自**持有一份 weight（默认都是
+ * zxnapi_weight = 64）。这是故意的，不是按环数分：
+ *   - NAPI 的 budget 不是队列配额，是"一轮最多取多少帧"；取完 64 帧后
+ *     napi_complete_done() 会把它重新排上（MISSED/再调度），下一轮继续取。
+ *     所以按环数缩小 napi0 的 weight（7/8 × 64 = 56）只会让 7 条环更早
+ *     截断、多一次调度，不会提高任何环的吞吐。
+ *   - 反过来，q1 从此有**独立**的 64 帧预算，不再和 q7..q0 抢同一份 64。
+ *     今天 q7..q2 若先吃掉 64，q0/q1 本轮就是 0 帧；split 之后 q1 不会
+ *     被其它 7 条环饿死（这正是把 q1 拆出来的收益之一）。
+ *   - napi0 自己那 7 条环之间仍是老规则（q7 先、q0 后、共享 64），本补丁
+ *     不动它 —— 那属于 1b-B/1b-C 的范围。
+ *
+ * **边界：本驱动不碰 CLA、不依赖 ppe.ko。** "把某个 block 的 128 个 trap
+ * 写成 qid=1"是用户态 init/hotplug 脚本的事（/sys/module/zx279128s_ppe/
+ * parameters/cla_write：写 0x14=cmd(index|0x1C00000)、0x1c=qid）。
+ * **下标是 index = block_base + trap，不是 (block<<7)|trap**（上机实测 +
+ * init 脚本双证）：
+ *   block0..7 基址 = 0x080 / 0x100 / 0x180 / 0x200 / 0x280 / 0x000 /
+ *                    0x300 / 0x380（原厂 tm.ko:0x3b8bc；盒上清单
+ *                    rx-block-map/20261104-2030/logs/00-index-lists.txt:1-8）
+ *   例：block1 = 基址 0x100，trap0 ⇒ index=0x100、cmd=0x01c00100，
+ *       区间 0x100..0x17f（不是 0x080..0x0ff，0x080 是 block0 的区间）；
+ *       block5 的基址是 0x000，不是 0x280。
+ *   依据：rxsplit-initd/20261104-1920/logs/20-numeric-selfcheck.txt
+ *         （128/128 与盒上读回逐条一致）。
+ * 驱动这边只保证"q1 有人 poll"，所以存在一个合法状态：
+ * rx_split=1 而 CLA 表还没写（ring1 永远为空）。这个状态必须是**零代价**
+ * 的：ISR 只有看到 ring1 计数非 0 才排 napi1，napi1 的 poll 在空环上一次
+ * MMIO 读之后立刻 napi_complete_done() 回到睡眠，既不吃满 budget 也不
+ * 循环重排；没有帧就永远不会有下一次唤醒（详见 zx_eth_isr / zx_eth_poll /
+ * zx_eth_poll_ring1 的注释）。
+ *
+ * 实测依据（父任务 2026-11-04 20:30 补充）：block1(0x100)=lan2 入向、
+ * block2(0x180)=lan1 入向；只写 block1 的 128 个 trap=qid1 后，30 s 反向流
+ * 的 rxq1 增量 2,564,422 == lan2 rx 增量 2,564,422（比例 1.0000）、吞吐
+ * +0.29%、错误计数增量 0 —— 见 rx-block-map/20261104-2030/RESULT.md。
+ * 所以"硬件按 qid 分环"不再是假设；本补丁只负责 poll 那一半。
+ */
+struct zx_rx_split_state {
+	struct napi_struct	napi1;
+	bool			added;		/* 已在 dev->napi_list 里 */
+	/*
+	 * fix2（B3）：accel 模式切换的 quiesce 不再调 napi_disable()/enable()
+	 * —— 那两条都要 dev->lock（net/core/dev.c:7558-7563/7593-7599），而
+	 * ndo_stop / rx_split_set 在持 rtnl 时调同一个 napi_disable，重叠即
+	 * 双向等待。改成"两条 RX poll 看见标志就立刻收尾" + "enter 等在场的
+	 * poll 退场"（见 zx_rx_split_quiesce）。这些都是文件级状态，**不进**
+	 * struct zx_eth_adapter（ABI 铁律：ppe.ko 用写死的偏移）。
+	 */
+	bool			quiesced;	/* WRITE_ONCE；两个 poll 入口先看它 */
+	wait_queue_head_t	poll_wq;	/* poll_active[] 归零时唤醒 enter */
+	atomic_t		poll_active[2];	/* [0]=adapter->napi，[1]=napi1 */
+};
+
+static struct zx_rx_split_state zx_rxs;
+/* 默认 0：与打补丁前逐字节等价 */
+static bool rx_split;
+/* 绑核目标，默认 CPU0（本板只有 2 核，IRQ 已绑 CPU1，见 e2631-netune:83-85） */
+static unsigned int rx_split_cpu;
+
+/*
+ * RX 归还命令是**一对全局寄存器**（eth.h:118-123 的 ZX_RX_REL_CTRL/DATA）：
+ * 先写 DATA、再写 CTRL 才启动一条命令，两核同时下命令会互相覆盖（q/class
+ * 串台 ⇒ 该 q 的 TM 额度漏还，1024 帧后那条环永久丢帧）。一把文件级锁串起
+ * "等 BUSY + 写 DATA + 写 CTRL"整段即可（临界区 = 一次 MMIO poll + 两次写，
+ * 通常 <1 µs）。只在 rx_split=1 时才可能有第二个写者，但锁本身无条件存在，
+ * 默认路径的代价是一次未竞争 spin_lock_bh（几 ns），行为不变。
+ */
+static DEFINE_SPINLOCK(zx_rx_rel_lock);
+
+static int zx_eth_poll_ring1(struct napi_struct *napi, int budget);
+
+/*
+ * napi_set_threaded() 是 net/core/dev.c 的**内部函数**：6.18.55 里它既没有
+ * include 声明，也没有 EXPORT_SYMBOL（只有 netif_set_threaded()/
+ * netif_threaded_enable() 是对外 API，但它们作用于整个 net_device 的所有
+ * NAPI，会把 napi0 也搬出软中断——那正是本补丁要避免的回退面）。
+ * 本驱动是 built-in（CONFIG_ZX279128S_ETH=y），符号和我们同在 vmlinux 里，
+ * 自声明原型可以直接链接并调用；若哪天改成 =m 就会 undefined symbol，
+ * 所以这里用 #error 把它变成一个明确的编译期失败，而不是运行期惊喜。
+ * 这是本补丁**唯一**依赖内核内部符号的地方，RISKS.md 里列为一级未验证项。
+ */
+#ifdef MODULE
+#error "rx_split 需要 napi_set_threaded()（net/core/dev.c 内部符号，未 EXPORT_SYMBOL）：CONFIG_ZX279128S_ETH 必须是 =y（built-in）"
+#else
+extern int napi_set_threaded(struct napi_struct *napi,
+			     enum netdev_napi_threaded threaded);
+#endif
+
+/* 第二条 NAPI 挂在 netdev 上，poll 只拿得到 napi->dev。 */
+static struct zx_eth_adapter *zx_napi_adapter(struct napi_struct *napi)
+{
+	return ((struct zx_eth_priv *)netdev_priv(napi->dev))->adapter;
+}
+
+/*
+ * 建 ring1 的 NAPI。S5：顺序**不是**硬约束，依据写在这里免得再传错：
+ *   napi_enable_locked() 只在 `dev->threaded && n->thread` 时**补置**
+ *   THREADED（net/core/dev.c:7578-7580），它并不清 THREADED；真正清
+ *   THREADED 的是 napi_disable_locked()（dev.c:7536）。本驱动不用
+ *   dev_set_threaded()（它把 dev 上所有 NAPI 一起线程化），dev->threaded
+ *   恒 DISABLED ⇒ enable 不会把 set_threaded() 置的位抹掉，反序也能跑。
+ *   保留这个顺序只是为了可读性：
+ *   netif_napi_add_weight() → [open 中] napi_enable() →
+ *   napi_set_threaded(ENABLED) → set_cpus_allowed_ptr()，
+ *   与 zx_rx_split_enable_threaded() 走的是同一套。
+ *
+ * napi_set_threaded() 是**同步**建线程（→ napi_kthread_create → kthread_run），
+ * 返回 0 时 zx_rxs.napi1.thread 一定非 NULL，可以立刻绑核。不要用
+ * kthread_bind()：它等 TASK_UNINTERRUPTIBLE，而 NAPI 线程在
+ * TASK_INTERRUPTIBLE 上等 completion，会等不到。
+ */
+static int zx_rx_split_setup(struct zx_eth_adapter *adapter)
+{
+	struct net_device *nd = NULL;
+	int i, ret;
+
+	for (i = 0; i < ZX_NUM_PORTS; i++) {
+		if (adapter->ports[i]) {
+			nd = adapter->ports[i];
+			break;
+		}
+	}
+	if (!nd)
+		return -ENODEV;
+
+	netif_napi_add_weight(nd, &zx_rxs.napi1, zx_eth_poll_ring1,
+			      (int)READ_ONCE(zxnapi_weight));
+	zx_rxs.added = true;
+
+	/* 端口全关时 napi0 也是 disable 的；napi1 跟着不开，等 open 再 enable */
+	if (READ_ONCE(adapter->open_count) > 0)
+		napi_enable(&zx_rxs.napi1);
+
+	ret = napi_set_threaded(&zx_rxs.napi1, NETDEV_NAPI_THREADED_ENABLED);
+	if (ret) {
+		dev_warn(adapter->dev,
+			 "ring1 NAPI: kthread 建不出来 (%d)，rx_split 保持关闭\n",
+			 ret);
+		/*
+		 * 回滚已经 add/enable 的那一半。不交给调用者收尾：setter 里
+		 * 下一次写 0 会因为 "on == rx_split" 早退，那个 napi1 会一直
+		 * 挂在 dev->napi_list 上。
+		 */
+		if (READ_ONCE(adapter->open_count) > 0)
+			napi_disable(&zx_rxs.napi1);
+		/* 能走到这里就是因为 kthread 建失败 ⇒ thread 必为 NULL，
+		 * napi_set_threaded(DISABLED) 只会 assign_bit(THREADED, 0)，
+		 * 不会进 napi_stop_kthread() 的 msleep 死循环
+		 * （dev.c:7118-7128 只在 napi->thread 非 NULL 时才停线程）。 */
+		napi_set_threaded(&zx_rxs.napi1,
+				  NETDEV_NAPI_THREADED_DISABLED);
+		netif_napi_del(&zx_rxs.napi1);
+		zx_rxs.added = false;
+		return ret;
+	}
+	if (READ_ONCE(rx_split_cpu) < nr_cpu_ids) {
+		unsigned int cpu = READ_ONCE(rx_split_cpu);
+
+		if (set_cpus_allowed_ptr(zx_rxs.napi1.thread,
+					 cpumask_of(cpu)))
+			dev_warn(adapter->dev,
+				 "ring1 NAPI: 绑不到 CPU%u（继续跑，只是不绑核）\n",
+				 cpu);
+	} else {
+		dev_warn(adapter->dev,
+			 "ring1 NAPI: rx_split_cpu=%u 越界（nr_cpu_ids=%u），不绑核\n",
+			 READ_ONCE(rx_split_cpu), nr_cpu_ids);
+	}
+	return 0;
+}
+
+/*
+ * 拆 ring1 的 NAPI（setter 的 1→0 路径；进来时 rx_split 还是 1）。
+ *   napi_disable() 等它退出 poll → 之后 napi1 一定不在"扫 q1 的那一轮"里；
+ *   **立刻**置 rx_split=0（S1）→ napi0 从下一轮起重新扫 q1。这一步必须在
+ *   netif_napi_del() 之前：反过来的话，disable→del 这段窗口里 q1 一个人都不
+ *   poll，环满就丢帧（与 zx_eth_poll() 里 skip_ring1 的注释同义）。
+ *   netif_napi_del() 摘链表 + kthread_stop + synchronize_net()。
+ *
+ * **不要**在这里调 napi_set_threaded(DISABLED)：napi_disable() 结束时
+ * SCHED|NPSVC 是置上的（net/core/dev.c:7535）、THREADED 已清（dev.c:7536），
+ * 而 napi_stop_kthread() 只在 THREADED(SCHED_THREADED) 置位**或** SCHED
+ * 清零时才肯往下走，否则 msleep(20) 死循环（dev.c:7091-7102）⇒ `echo 0`
+ * 永久挂死。kthread 由 netif_napi_del() 里的 kthread_stop() 收掉
+ * （dev.c:7625-7627），thread 也会被它置回 NULL。
+ */
+static void zx_rx_split_teardown(struct zx_eth_adapter *adapter)
+{
+	if (!zx_rxs.added)
+		return;
+	/*
+	 * 顺序：**先** napi_disable()（保证 napi1 已经退出 poll，也就是不会再
+	 * 有人在写 ring1 那份批），**再**置 rx_split=0 把 q1 交回 napi0，
+	 * **再** flush ring1 那份批，**最后**摘 NAPI。
+	 * 反过来先 flush 会与 napi1 自己 poll 末尾的 flush(1) 并发。
+	 */
+	if (READ_ONCE(adapter->open_count) > 0)
+		napi_disable(&zx_rxs.napi1);
+	WRITE_ONCE(rx_split, false);
+	/* ring1 的批里可能还压着 BATCHED 帧（描述符已消费、bp 不许归还），
+	 * 摘 NAPI 之前必须结掉，否则那几帧永远发不出去。 */
+	zx_ffe_tx_batch_flush(adapter, 1);
+	netif_napi_del(&zx_rxs.napi1);
+	zx_rxs.added = false;
+}
+
+struct zx_rx_split_apply {
+	bool		on;
+	int		ret;
+	unsigned int	adapters;
+};
+
+static void zx_rx_split_one(struct zx_eth_adapter *adapter, void *data)
+{
+	struct zx_rx_split_apply *a = data;
+	bool open;
+
+	a->adapters++;
+	if (a->ret)
+		return;
+	open = READ_ONCE(adapter->open_count) > 0;
+	if (a->on) {
+		a->ret = zx_rx_split_setup(adapter);
+		if (a->ret)
+			return;
+		/*
+		 * 0→1 的翻位点（B2）。zx_eth_rx_q() 只认调用方给的 bidx、
+		 * 不看 rx_split，所以正在飞的那一轮 napi0（轮首读到的是
+		 * skip_ring1=0）还会继续扫 q1；napi1 一旦排上就同时扫 q1
+		 * ⇒ 两核算出同一个 idx、对同一个 bp 各转发/各归还一次、还
+		 * 同写 ring1 那份批。用 napi_disable(napi0) 等这一轮 poll
+		 * 退出（同时挡住新的一轮）→ 翻位 → napi_enable()+napi_schedule()
+		 * 放回去：翻位之后 napi0 一律跳过 q1，q1 由 napi1 独占。
+		 * open_count==0 时 napi0 本来就没 enable、没有在飞的 poll，直接
+		 * 翻位 —— 此时调 napi_disable() 会永远等 SCHED 清零
+		 * （net/core/dev.c:7530-7533）。
+		 */
+		if (open)
+			napi_disable(&adapter->napi);
+		WRITE_ONCE(rx_split, true);
+		if (open) {
+			napi_enable(&adapter->napi);
+			napi_schedule(&adapter->napi);
+		}
+		if (zx_rxs.added)
+			napi_schedule(&zx_rxs.napi1);
+	} else {
+		/* 1→0：teardown 内部在 napi_disable(napi1) 之后立刻置 0（S1） */
+		zx_rx_split_teardown(adapter);
+	}
+}
+
+static int rx_split_set(const char *val, const struct kernel_param *kp)
+{
+	struct zx_rx_split_apply a = { .on = false, .ret = 0 };
+	bool on;
+	int ret = kstrtobool(val, &on);
+
+	if (ret)
+		return ret;
+	if (on == READ_ONCE(rx_split))
+		return 0;
+
+	/*
+	 * 这个 setter 跑在进程上下文（kernfs write），所以 can sleep：
+	 * netif_napi_add_weight()/napi_enable()/napi_set_threaded()/
+	 * napi_disable()/netif_napi_del() 都允许睡。
+	 *
+	 * S2：整个遍历**持 rtnl**。否则与 ifup/ifdown（ndo_open/ndo_stop 都
+	 * 在 rtnl 下）并发时会双调 napi_enable()（BUG_ON，dev.c:7576）或双调
+	 * napi_disable()（usleep 死等 SCHED 清零，dev.c:7530-7533）。rtnl 是
+	 * mutex，可以在它下面睡 —— napi_disable() 自己就会睡。
+	 *
+	 * 顺序（翻位点已经挪进 zx_rx_split_one，由 napi_disable/napi_enable
+	 * 夹住）：
+	 *   0→1：先把 napi1 add + enable（此时 rx_split 还是 0，ISR 不排它）
+	 *        → napi_disable(napi0) → 置 rx_split=1 → napi_enable(napi0)
+	 *        + 排一次 → 排一次 napi1（q1 里可能已经压着帧）。翻位瞬间
+	 *        没有任何 napi0 的一轮在跑，所以不存在两核同时抓 q1。
+	 *   1→0：napi_disable(napi1) → 置 rx_split=0 → flush ring1 批 →
+	 *        摘掉 napi1。同样不存在并发。
+	 */
+	rtnl_lock();
+	a.on = on;
+	zx_eth_for_each_adapter(zx_rx_split_one, &a);
+	rtnl_unlock();
+	if (a.ret) {
+		int err = a.ret;
+
+		/* 建失败：setup 自己已经回滚那一半；若前面已经有 adapter 翻到
+		 * 1，这里再把它们按 1→0 收尾（单适配器时是 no-op），最后把
+		 * rx_split 压回 0 —— q1 立刻交回 napi0。 */
+		a.on = false;
+		a.ret = 0;
+		rtnl_lock();
+		zx_eth_for_each_adapter(zx_rx_split_one, &a);
+		rtnl_unlock();
+		WRITE_ONCE(rx_split, false);
+		return err;
+	}
+	if (!a.adapters)
+		return -ENODEV;
+
+	return 0;
+}
+
+static const struct kernel_param_ops rx_split_ops = {
+	.set	= rx_split_set,
+	.get	= param_get_bool,
+};
+
+module_param_cb(rx_split, &rx_split_ops, &rx_split, 0644);
+MODULE_PARM_DESC(rx_split, "1b-A: poll RX sub-ring 1 in its own threaded NAPI pinned to rx_split_cpu (0 = off = unchanged, default 0; writable at runtime)");
+module_param(rx_split_cpu, uint, 0644);
+MODULE_PARM_DESC(rx_split_cpu, "1b-A: CPU for the ring1 NAPI kthread (default 0; only read when rx_split goes 0->1, so set it before switching)");
+
+/*
+ * open 要做的一步：napi_enable() 之后再置一次 THREADED。
+ * （fix2/B3 起 quiesce_leave 不再 napi_disable(napi1)，THREADED 不会在
+ * 切换窗口里被清掉，所以那里不再需要这一步；见 zx_rx_split_quiesce。）
+ *
+ * S5：依据（以前写反了）—— 清 THREADED 的是 napi_disable_locked()
+ * （net/core/dev.c:7536 `new &= ~(THREADED|PREFER_BUSY_POLL)`）；
+ * napi_enable_locked() **不**清 THREADED，它只在 `dev->threaded &&
+ * napi->thread` 时补置（dev.c:7578-7580），而本驱动不用 dev_set_threaded()
+ * （那会把 napi0 也一起线程化），dev->threaded 恒 DISABLED ⇒ **napi_enable()
+ * 不会替我们置回 THREADED**。所以每次 disable/enable 之后都必须重调一次
+ * napi_set_threaded(ENABLED)；此时 thread 已存在，它只做
+ * assign_bit(THREADED, 1)（dev.c:7144），不重建 kthread。
+ * "先 enable 再 set_threaded"不是硬约束（反序也不会被 enable 清掉），保留
+ * 只是让中间态是"调度状态先合法、再线程化"。
+ *
+ * S3：返回值不再丢。建不出 kthread 就把这一半回滚（napi_disable +
+ * netif_napi_del + rx_split=0），把 q1 交回 napi0，并把错误返回给调用方。
+ */
+static int zx_rx_split_enable_threaded(void)
+{
+	int ret;
+
+	if (!zx_rxs.added)
+		return 0;
+	napi_enable(&zx_rxs.napi1);
+	ret = napi_set_threaded(&zx_rxs.napi1, NETDEV_NAPI_THREADED_ENABLED);
+	if (ret) {
+		/* 回滚：napi1 刚被上面 enable 过，disable 合法（SCHED 已置）。 */
+		napi_disable(&zx_rxs.napi1);
+		netif_napi_del(&zx_rxs.napi1);
+		zx_rxs.added = false;
+		WRITE_ONCE(rx_split, false);
+	}
+	return ret;
+}
+
+/*
+ * fix2（B3）：accel 模式切换的 quiesce **不再调用任何 napi_disable()/enable()**。
+ *
+ * 原来的死锁（REVIEW2 §2）：napi_disable() 会持 dev->lock 无限等 SCHED|NPSVC
+ * 清零（net/core/dev.c:7558-7563 + 7530-7533），而唯一能清掉它们的
+ * napi_enable() 同样要 dev->lock（dev.c:7593-7599）。rx_split_set 与
+ * zx_eth_stop 在持 rtnl 时调 napi_disable(napi1)（见 zx_rx_split_teardown /
+ * zx_eth_stop），accel 切换的 quiesce 窗口却不持 rtnl（zx_accel_set() 只在
+ * 取 bound 快照时短占 rtnl_lock/rtnl_unlock）⇒ 两边重叠就是双向等待：
+ * A 等 B 的 enable，B 的 enable 等 A 手里的 dev->lock。同型还有 napi0：
+ * 0→1 翻位（zx_rx_split_one）与 zx_eth_stop 的第二条 disable。
+ *
+ * 结构上消除：quiesce 只在文件级状态里置 quiesced 标志，两条 RX poll
+ * （zx_eth_poll / zx_eth_poll_ring1）进函数先看它，为真就
+ * napi_complete_done() 立刻退场 —— 不取帧、不进快路、不碰 TX 批；enter
+ * 再等 poll_active[] 归零。这等价于"napi_disable() 等在场的那一轮 poll
+ * 退出"，但用的是本文件自己的 waitqueue，一次都不碰 dev->lock。
+ *
+ * 于是 NAPI 生命周期的写者只剩下面这些，而且实际调用全在 rtnl 下
+ * （probe 期由 module_param 触发的 setup 在 open_count==0 时既不 enable
+ * 也不 disable，端口也还没注册、没有并发 poll）：
+ *   napi1：zx_rx_split_setup / 它的回滚 / zx_rx_split_teardown /
+ *          zx_rx_split_enable_threaded（open 与它的回滚）/ zx_eth_stop；
+ *   napi0：zx_eth_open / zx_eth_stop / zx_rx_split_one 的 0→1 翻位。
+ * 天然串行 ⇒ 不可能再与"要 dev->lock 的 napi_enable"重叠。
+ *
+ * 调用方（accel.c 的 zx_accel_set，三条入口：debugfs 写、age work 的
+ * autofallback、zc 兼容写）都在进程上下文，可以睡。窗口内到队的帧留在
+ * 硬件环里；leave 先清标志，再补 napi_schedule(napi1)，napi0 由 accel.c
+ * 的 quiesce_leave 解除屏蔽 + 补 poll。
+ */
+void zx_rx_split_quiesce(struct zx_eth_adapter *adapter, bool enter)
+{
+	if (!enter) {
+		/*
+		 * leave 必须无条件清标志：enter 可能因 open_count==0 早退，
+		 * 也可能这中间 ifdown 把 open_count 降到 0（accel.c 仍会调
+		 * 到这里）。漏清一次，端口再 up 后两条 poll 会永远空转。
+		 */
+		WRITE_ONCE(zx_rxs.quiesced, false);
+		/* 先清标志再排：排上的那一轮要真的取帧，不是再空转一次。 */
+		if (zx_rxs.added && READ_ONCE(rx_split) &&
+		    READ_ONCE(adapter->open_count) > 0)
+			napi_schedule(&zx_rxs.napi1);
+		return;
+	}
+	/* 端口全关时两条 NAPI 都是 disable 的，没有 poll 可等 */
+	if (READ_ONCE(adapter->open_count) <= 0)
+		return;
+	WRITE_ONCE(zx_rxs.quiesced, true);
+	/*
+	 * 与两条 poll 的 "atomic_inc() → 读标志" 配对：本侧 store 之后加一个
+	 * 满屏障再读计数。注意 atomic_inc() 是无返回值的 RMW，本身不含任何
+	 * 屏障（Documentation/atomic_t.txt："RMW operations that have no
+	 * return value are unordered"），所以 poll 侧必须在 atomic_inc() 之后
+	 * 另加一个 smp_mb()：enter 侧 smp_mb() 与两条 poll 入口 atomic_inc
+	 * 之后的 smp_mb() 配对，缺任一边 SB（store-buffer）都成立 —— "poll
+	 * 没看到标志"和"这里读到计数为 0"就会同时发生。
+	 */
+	smp_mb();
+	wait_event(zx_rxs.poll_wq,
+		   !atomic_read(&zx_rxs.poll_active[0]) &&
+		   !atomic_read(&zx_rxs.poll_active[1]));
+}
+
 #define ZXCOAL_TICKS_PER_US	50U	/* 0x30 的 LSB = 20 ns ⇒ 1 µs = 50 ticks */
 #define ZXCOAL_US_MAX		1000000U	/* 1 s = 50e6 ticks，u32 装得下 */
 #define ZXCOAL_FRAMES_MAX	4096U
@@ -1085,6 +1539,10 @@ static void zx_napi_weight_one(struct zx_eth_adapter *adapter, void *data)
 
 	a->adapters++;
 	WRITE_ONCE(adapter->napi.weight, (int)a->weight);
+	/* 1b-A：rx_split=1 时两条 NAPI 各持一份 weight，改参数要一起改，
+	 * 否则 napi1 永远停在 setup 那一刻的快照上。 */
+	if (zx_rxs.added)
+		WRITE_ONCE(zx_rxs.napi1.weight, (int)a->weight);
 	if (!a->quiet || old != a->weight)
 		dev_info(adapter->dev,
 			 "zxnapi_weight=%u: napi.weight %u -> %u (readback %d)\n",
@@ -1468,6 +1926,18 @@ static int zx_bp_return(struct zx_eth_adapter *adapter, u16 bp)
 	return zx_bmu_free_bp(adapter, bp);
 }
 
+/*
+ * ④-B：快路批量 flush 的唯一归还口。语义与 ffe_done 的 DROPPED 收尾完全
+ * 一样：bp 还是 RX 那个 bp、没进过发送环、帧已改写，所以只还一次 BMU，
+ * 归还失败照旧记 bmu_free_fail。accel.c 拿不到 static 的 zx_bp_return，
+ * 这里开一个只做这一件事的窄口，不把 zx_bp_return 本身导出。
+ */
+void zx_ffe_bp_return(struct zx_eth_adapter *adapter, u16 bp)
+{
+	if (zx_bp_return(adapter, bp))
+		adapter->bmu_free_fail++;
+}
+
 /* ---- RX descriptor release ----------------------------------------- */
 
 /*
@@ -1485,17 +1955,29 @@ static int zx_bp_return(struct zx_eth_adapter *adapter, u16 bp)
 static int zx_rx_release(struct zx_eth_adapter *adapter, int q, int class,
 			 u32 n)
 {
+	unsigned long flags;
 	u32 val;
 	int ret;
 
+	/*
+	 * 1b-A：CTRL/DATA 是**一对全局寄存器**（一条命令 = 写 DATA 再写 CTRL），
+	 * 两核同时下令会互相覆盖（q/class 串台 ⇒ 该 q 的 TM 额度漏还，1024 帧
+	 * 后那条环永久丢帧）。rx_split=1 时 napi0（CPU1）与 napi1（CPU0）会并发
+	 * 走到这里，所以必须把"等 BUSY → 写 DATA → 写 CTRL"整段串起来，只锁
+	 * 一次 MMIO 写不够（BUSY 位的语义是"上一条命令还没被硬件吃掉"）。
+	 * 默认路径（rx_split=0）只有 napi0 一个调用者，锁不竞争。
+	 */
+	spin_lock_irqsave(&zx_rx_rel_lock, flags);
 	ret = readl_poll_timeout_atomic(adapter->base + ZX_RX_REL_CTRL,
 					val, !(val & ZX_RX_REL_BUSY), 1, 5000);
 	if (ret)
-		return ret;
+		goto out;
 	writel(FIELD_PREP(ZX_RX_REL_COUNT, n) | FIELD_PREP(ZX_RX_REL_CLASS, class) |
 	       FIELD_PREP(ZX_RX_REL_QUEUE, q), adapter->base + ZX_RX_REL_DATA);
 	writel(ZX_RX_REL_BUSY, adapter->base + ZX_RX_REL_CTRL);
-	return 0;
+out:
+	spin_unlock_irqrestore(&zx_rx_rel_lock, flags);
+	return ret;
 }
 
 /*
@@ -1920,7 +2402,15 @@ static int zx_hw_init(struct zx_eth_adapter *adapter)
 	writel((u32)adapter->pkt_pool_dma, base + ZX_TM_BUF_START);
 	writel((u32)adapter->pkt_pool_dma + ZX_BUF_POOL_SIZE, base + ZX_TM_BUF_END);
 	writel((u32)adapter->rx_ring_dma, base + ZX_TM_BUF_F0);
-	writel(16, base + ZX_TM_CONFIG_START);
+	/*
+	 * 原厂无此项：这里本来有一句 `writel(16, base + ZX_TM_CONFIG_START)`，
+	 * 即 0x340004 = 0x10。三个原厂二进制（tm.ko / plat / vmlinux.elf）里
+	 * 该地址**既无读也无写**，连字节模式 `04 00 34 00` 都 0 命中，也没有
+	 * 任何 movt 拼出 0x3400xx（见 rx-qid-verify/20261104-1810/RESULT.md
+	 * §1）。值 16 若要表达"bit4 起的字段=1"，正确目标应是 0x340000 的
+	 * bits[7:4]，而不是 +0x04。零依据 → 删掉，不写"不知道的寄存器"。
+	 * 宏 ZX_TM_CONFIG_START（eth.h）保留，仅作历史标注，无引用。
+	 */
 
 	/* DMA and TM control values from the vendor pon_tm_dma_init() and
 	 * the stock firmware, programmed before the BMU is configured.
@@ -2812,6 +3302,30 @@ void zx_zc_set(struct zx_eth_adapter *adapter, bool on)
 /* ---- TX path ------------------------------------------------------- */
 
 /*
+ * 写一个发送描述符（8 个字里的 6 个有效字节），不含 dma_wmb() 与门铃。
+ * 单帧（zx_tx_submit_bp）与批量（zx_tx_submit_batch）共用这一段，保证
+ * 两条路写进环的字节**完全一样**——描述符格式只有一个来源。
+ */
+static void zx_tx_write_desc(struct zx_eth_adapter *adapter, int eport,
+			     u32 tx_idx, u16 bp, unsigned int len)
+{
+	__le32 *desc = (__le32 *)adapter->tx_ring +
+		       tx_idx * (ZX_DESC_SIZE / sizeof(*desc));
+
+	/*
+	 * Directed egress to the port's TM queue.  The switch does not
+	 * forward between ports: the Linux bridge does, one netdev per port.
+	 */
+	desc[0] = cpu_to_le32(0x80 | (ZX_PORT_TX_QUEUE(eport) << 20));
+	desc[3] = cpu_to_le32(0x3 | ((len & 0x3fff) << 2));
+	desc[1] = cpu_to_le32(0x10000);
+	desc[2] = cpu_to_le32(0x21000000 | ((len & 0x3fff) << 9));
+
+	((u8 *)desc)[7] = (u8)((bp & 0x7f) << 1);
+	((u8 *)desc)[8] = (u8)(bp >> 7);
+}
+
+/*
  * 把一个已经躺在池槽位 bp 里的帧提交给发送硬件：写描述符 → 每包一次
  * TX_START → 推进/占用发送环 → 到限流就停所有端口队列。
  *
@@ -2833,7 +3347,6 @@ bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
 		     unsigned len)
 {
 	void __iomem *base = adapter->base;
-	__le32 *desc;
 	u32 tx_idx;
 
 	if (unlikely(adapter->tx_pending >= READ_ONCE(zx_txq_limit))) {
@@ -2850,19 +3363,7 @@ bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
 	}
 
 	tx_idx = adapter->tx_cur_idx % ZX_NUM_TX_DESC;
-	desc = (__le32 *)adapter->tx_ring + tx_idx * (ZX_DESC_SIZE / sizeof(*desc));
-
-	/*
-	 * Directed egress to the port's TM queue.  The switch does not
-	 * forward between ports: the Linux bridge does, one netdev per port.
-	 */
-	desc[0] = cpu_to_le32(0x80 | (ZX_PORT_TX_QUEUE(eport) << 20));
-	desc[3] = cpu_to_le32(0x3 | ((len & 0x3fff) << 2));
-	desc[1] = cpu_to_le32(0x10000);
-	desc[2] = cpu_to_le32(0x21000000 | ((len & 0x3fff) << 9));
-
-	((u8 *)desc)[7] = (u8)((bp & 0x7f) << 1);
-	((u8 *)desc)[8] = (u8)(bp >> 7);
+	zx_tx_write_desc(adapter, eport, tx_idx, bp, len);
 
 	dma_wmb();
 	writel(1, base + ZX_DMA_TX_START);
@@ -2918,6 +3419,143 @@ bool zx_tx_submit_bp(struct zx_eth_adapter *adapter, int eport, u16 bp,
 }
 
 /*
+ * ④-B：批量版提交，n 个描述符一次写完、**一次 dma_wmb**、按序扇出 n 次
+ * TX_START。
+ *
+ * 门铃为什么扇 n 次：硬件一次 TX_START 只启动一个描述符。这不是猜的，是
+ * zx_eth_txtest() 里的实测（"一次门铃只启动一个描述符"那段：把 4 个描述符
+ * 攒起来只敲一次门铃，硬件只吃掉一个，其余卡在环里，整条发送路径随后慢到
+ * 3 秒一个包、tx_pending 留了 3 只能重启清）。所以批量**不改**"槽位顺序 =
+ * 门铃顺序"这条铁律：描述符按 tx_cur_idx 递增写，门铃按同一顺序逐个敲。
+ *
+ * 一次 dma_wmb 放在第一个门铃之前：k 个描述符在任何一个门铃之前就都已可见。
+ * 于是即便哪天硬件真会连续吃描述符，它也只能读到已经写完的槽位——这条
+ * 顺序是**保守正确**的，不依赖"一次只吃一个"这个前提。
+ *
+ * 容量：调用方已经判过一次；这里锁内再判一次（权威，tx_pending 只在本锁
+ * 下增长），只提交装得下的**前缀** k = min(n, limit - tx_pending)。k 之后
+ * 的帧一个描述符都没写，所以"已写的描述符不能留在环里"自然成立：没写的
+ * 就是没写。它们由调用方按"已改写、不能回栈"丢弃。
+ *
+ * C1 同源守卫：整批先查重复 bp（已经在发送环里），有一个就整批拒绝、一个
+ * 描述符都不写——与单帧版"拒掉这个 bp、什么都不写"一致。
+ *
+ * 返回真正提交的帧数 k（0..n），不返回负数。
+ */
+int zx_tx_submit_batch(struct zx_eth_adapter *adapter, int eport,
+		       const u16 *bps, const u16 *lens, int n)
+{
+	void __iomem *base = adapter->base;
+	u32 limit;
+	int i, k;
+
+	if (unlikely(n <= 0))
+		return 0;
+	limit = READ_ONCE(zx_txq_limit);
+	if (unlikely(adapter->tx_pending >= limit))
+		return 0;
+	k = n;
+	if (unlikely((u32)k > limit - adapter->tx_pending))
+		k = (int)(limit - adapter->tx_pending);
+
+	if (unlikely(adapter->bp_state)) {
+		for (i = 0; i < k; i++) {
+			u16 bp = bps[i];
+
+			if (bp < ZX_NUM_BUFFERS &&
+			    READ_ONCE(adapter->bp_state[bp]) == ZX_BP_TX) {
+				adapter->tx_dup_reject++;
+				return 0;
+			}
+		}
+	}
+
+	/*
+	 * 1) 先把 k 个描述符全部写完：起点是当前 tx_cur_idx，按 i 递增，
+	 *    与下面门铃的顺序一一对应。
+	 */
+	for (i = 0; i < k; i++)
+		zx_tx_write_desc(adapter, eport,
+				 (adapter->tx_cur_idx + (u32)i) % ZX_NUM_TX_DESC,
+				 bps[i], lens[i]);
+	/* 2) 一次内存屏障：第一个门铃之前 k 个描述符都已可见 */
+	dma_wmb();
+	/*
+	 * 3) 按序扇出 k 次门铃，并在每次"这一帧已交给硬件"之后记账。
+	 *    各帧的 tx_idx 由 tx_cur_idx 依次推进得到，与写描述符时同一个
+	 *    取模序列。
+	 */
+	for (i = 0; i < k; i++) {
+		u32 tx_idx = adapter->tx_cur_idx % ZX_NUM_TX_DESC;
+		u16 bp = bps[i];
+
+		writel(1, base + ZX_DMA_TX_START);
+
+		adapter->tx_cur_idx++;
+		adapter->tx_pending++;
+		/* 与单帧版同一段：bp_state/tx_bp 影子环 + diag + 剂量臂 */
+		if (likely(adapter->bp_state && bp < ZX_NUM_BUFFERS)) {
+			adapter->tx_bp[tx_idx] = bp;
+			WRITE_ONCE(adapter->bp_state[bp], ZX_BP_TX);
+		}
+		if (unlikely(READ_ONCE(zx_diag_mask)))
+			zx_diag_tx_submit(adapter, eport, bp, tx_idx,
+					  adapter->tx_pending - 1, lens[i]);
+		if (unlikely(READ_ONCE(zxdly_tx_ns))) {
+			unsigned int zxdly_ns = READ_ONCE(zxdly_tx_ns);
+
+			if (zxdly_ns < 1000)
+				ndelay(zxdly_ns);
+			else
+				udelay(DIV_ROUND_UP(zxdly_ns, 1000));
+		}
+	}
+	/*
+	 * 环占用峰值：本段只增不减，循环结束时的 tx_pending 就是本段峰值，
+	 * 所以只记一次（与单帧版逐帧取 max 结果相同）。
+	 */
+	if (adapter->tx_pending > READ_ONCE(adapter->accel.cnt[0].qlen_peak))
+		WRITE_ONCE(adapter->accel.cnt[0].qlen_peak, adapter->tx_pending);
+	if (adapter->tx_pending >= READ_ONCE(zx_txq_limit)) {
+		int p;
+
+		for (p = 0; p < ZX_NUM_PORTS; p++)
+			if (adapter->ports[p])
+				netif_stop_queue(adapter->ports[p]);
+		zx_tx_kick(adapter);
+		if (unlikely(zx_diag_on(ZX_DIAG_B_TXQ)))
+			zx_diag_txq_trip(adapter, eport);
+	}
+	return k;
+}
+
+/*
+ * 把 skb 拷进池槽位 bp，并在池可缓存时把 16 B 池头 + 帧推到一致性点。
+ *
+ * 只碰 skb（调用者独占）与 bp（调用者私有、还没写进任何描述符），所以
+ * **不需要 tx_lock** —— P2（tx-lock-scope）就是把它从 zx_eth_xmit() 的
+ * 临界区里挪出来的。返回 false 表示 skb_copy_bits() 没拷全（帧没进环，
+ * 调用者还 bp + 丢帧）。
+ */
+static bool zx_tx_copy_frame(struct zx_eth_adapter *adapter,
+			     struct sk_buff *skb, u16 bp, unsigned int len)
+{
+	u8 *buf = (u8 *)adapter->pkt_pool + (u32)bp * ZX_BUF_SIZE + 16;
+
+	if (skb_headlen(skb) >= len) {
+		memcpy(buf, skb->data, len);
+	} else if (skb_copy_bits(skb, 0, buf, len)) {
+		return false;
+	}
+	if (adapter->pkt_pool_cacheable)
+		dma_sync_single_for_device(adapter->dev,
+					   adapter->pkt_pool_dma +
+					   (u32)bp * ZX_BUF_SIZE,
+					   16 + len, DMA_TO_DEVICE);
+	return true;
+}
+
+/*
  * 池子的映射属性（缓存 / 非缓存）由 pool_cacheable 决定，两条路径的实测代价见
  * docs/ffe-cacheable-pool-2026-10-30.md。预取（pld/pldw）在这颗 SoC 上是负收益：实测 1400 B
  * 帧的接收拷贝 6.67 -> 9.85 us、发送拷贝+同步 15.09 -> 18.57 us，已回退。
@@ -2927,7 +3565,6 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 	struct zx_eth_priv *priv = netdev_priv(netdev);
 	struct zx_eth_adapter *adapter = priv->adapter;
 	unsigned int len = skb->len;
-	u8 *buf_ptr;
 	int bp = -1;
 	u16 zcbp = 0;
 	bool pre_bp = false;
@@ -2990,6 +3627,46 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 	}
 	t_alloc = ZX_TS();
 
+	/*
+	 * P2（tx-lock-scope）：补齐 + 拷贝 + 一致性同步全部挪到**锁外**。
+	 *
+	 * 这三步只碰两样东西：
+	 *   - skb：本函数独占（qdisc 交下来的，返回 BUSY 之前没有别人能碰）；
+	 *   - bp：上面刚申请到、还没写进任何描述符的私有槽位（它是
+	 *     zx_bmu_alloc_bp_nb() 从硬件空闲表里摘下来的，BMU 不会再发出去，
+	 *     别的 CPU 也拿不到）。
+	 * 所以它们不需要 tx_lock。锁里只留"判容量 + 取号 + 描述符 + 门铃 +
+	 * 记账"—— 那才是**五口共享、必须串行**的那一小段（单环，见
+	 * zx_tx_submit_bp() 的头注释）。
+	 *
+	 * 顺序仍是"先补齐后拷贝"：skb_put_padto() 会改 skb->len，len 必须在它
+	 * 之后重取。环满时照样返回 NETDEV_TX_BUSY：skb_put_padto() 幂等，qdisc
+	 * 重排队后再进本函数不会把帧补长第二遍。
+	 *
+	 * skb_put_padto() 失败时**已经释放了 skb**（__skb_put_padto 的
+	 * free_on_error=true，include/linux/skbuff.h:3949），这里只差把预申请的
+	 * bp 还回去，绝不能再 kfree 一次。
+	 */
+	if (skb_put_padto(skb, ETH_ZLEN)) {
+		if (pre_bp)
+			zx_bmu_free_bp_nowait(adapter, (u16)bp);
+		dev_dstats_tx_dropped(netdev);
+		return NETDEV_TX_OK;
+	}
+	len = skb->len;
+	if (pre_bp) {
+		if (unlikely(adapter->zc_state[bp] == ZX_ZC_BS_SHADOW))
+			adapter->zc_tx_dup++;	/* 调试：BMU 把还挂着影子的 bp 给了发送 */
+		zx_zc_ev(adapter, (u16)bp, 4, adapter->zc_state[bp]);
+		if (!zx_tx_copy_frame(adapter, skb, (u16)bp, len)) {
+			zx_bmu_free_bp_nowait(adapter, (u16)bp);
+			dev_dstats_tx_dropped(netdev);
+			dev_kfree_skb_any(skb);
+			return NETDEV_TX_OK;
+		}
+	}
+	t_copy = ZX_TS();
+
 	spin_lock_bh(&adapter->tx_lock);
 	zx_tx_reclaim(adapter);
 	t_reclaim = ZX_TS();
@@ -3006,26 +3683,20 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 			zx_bmu_free_bp_nowait(adapter, (u16)bp);
 		return NETDEV_TX_BUSY;
 	}
-	/*
-	 * skb_put_padto() 失败时**已经释放了 skb**（__skb_put_padto 的
-	 * free_on_error=true，include/linux/skbuff.h:3949），这里只差把预申请的
-	 * bp 还回去，绝不能再 kfree 一次。
-	 */
-	if (skb_put_padto(skb, ETH_ZLEN)) {
-		spin_unlock_bh(&adapter->tx_lock);
-		if (pre_bp)
-			zx_bmu_free_bp_nowait(adapter, (u16)bp);
-		dev_dstats_tx_dropped(netdev);
-		return NETDEV_TX_OK;
-	}
-	len = skb->len;
 	if (!pre_bp) {
 		if (zx_zc_tx_take(adapter, skb, &zcbp)) {
 			/*
-			 * 零拷贝：帧本来就在这个槽位里，既不申请缓冲也不搬家，
-			 * 硬件发完自己把 bp 还回 BMU。
+			 * 零拷贝：帧本来就在这个槽位里，既不申请缓冲也不搬家，硬件
+			 * 发完自己把 bp 还回 BMU。池是可缓存映射时仍要推到一致性
+			 * 点：协议栈（转发时的 L2 重写、NAT、flowtable 改头）可能
+			 * 已经把它改脏在 cache 里，不 clean 就等于把旧内容发出去。
 			 */
 			bp = zcbp;
+			if (adapter->pkt_pool_cacheable)
+				dma_sync_single_for_device(adapter->dev,
+							   adapter->pkt_pool_dma +
+							   (u32)bp * ZX_BUF_SIZE,
+							   16 + len, DMA_TO_DEVICE);
 		} else {
 			/*
 			 * 罕见：候选为真但 take 拒了（引用计数 > 1、陈旧 tag、
@@ -3040,37 +3711,18 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 				zx_tx_alloc_fail_drop(adapter, netdev, skb);
 				return NETDEV_TX_OK;
 			}
+			if (unlikely(adapter->zc_state[bp] == ZX_ZC_BS_SHADOW))
+				adapter->zc_tx_dup++;
+			zx_zc_ev(adapter, (u16)bp, 4, adapter->zc_state[bp]);
+			if (!zx_tx_copy_frame(adapter, skb, (u16)bp, len)) {
+				spin_unlock_bh(&adapter->tx_lock);
+				zx_bmu_free_bp_nowait(adapter, (u16)bp);
+				dev_dstats_tx_dropped(netdev);
+				dev_kfree_skb_any(skb);
+				return NETDEV_TX_OK;
+			}
 		}
 	}
-	if (!zcbp) {
-		if (unlikely(adapter->zc_state[bp] == ZX_ZC_BS_SHADOW))
-			adapter->zc_tx_dup++;	/* 调试：BMU 把还挂着影子的 bp 给了发送 */
-		zx_zc_ev(adapter, (u16)bp, 4, adapter->zc_state[bp]);
-		buf_ptr = (u8 *)adapter->pkt_pool +
-			  ((u32)bp * ZX_BUF_SIZE) + 16;
-		if (skb_headlen(skb) >= len) {
-			memcpy(buf_ptr, skb->data, len);
-		} else if (skb_copy_bits(skb, 0, buf_ptr, len)) {
-			spin_unlock_bh(&adapter->tx_lock);
-			zx_bmu_free_bp_nowait(adapter, (u16)bp);
-			dev_dstats_tx_dropped(netdev);
-			dev_kfree_skb_any(skb);
-			return NETDEV_TX_OK;
-		}
-	}
-	/*
-	 * 池是可缓存映射时，帧必须在 BMU 读之前推到一致性点。零拷贝这一支同样
-	 * 需要：帧是硬件 DMA 进来的，读之前失效过，但协议栈（转发时的 L2 重写、
-	 * NAT66、flowtable 的改头）可能已经把它改脏在 cache 里，不 clean 就等于
-	 * 把旧内容发出去。默认映射是非缓存，所以这段平时不执行。
-	 */
-	if (adapter->pkt_pool_cacheable)
-		dma_sync_single_for_device(adapter->dev,
-					   adapter->pkt_pool_dma +
-					   (u32)bp * ZX_BUF_SIZE,
-					   16 + len, DMA_TO_DEVICE);
-
-	t_copy = ZX_TS();
 	/*
 	 * 描述符 + TX_START + 环推进 + 限流都在 zx_tx_submit_bp() 里，快路用的是
 	 * 同一段代码。上面在同一次 tx_lock 会话里刚查过容量，tx_pending 在那之后
@@ -3088,15 +3740,18 @@ static netdev_tx_t zx_eth_xmit(struct sk_buff *skb, struct net_device *netdev)
 	t_start = ZX_TS();
 
 	/*
-	 * P0 起四段的含义（申请已经不在锁里）：[0] 锁外申请/零拷贝预判，
-	 * [1] 取锁 + 回收，[2] 拷贝 + 同步（含锁内那次罕见的补申请），
-	 * [3] 提交。dma_state 的标签同步改过。
+	 * P2 起四段的含义（拷贝也已经挪到锁外）：
+	 *   [0] 锁外申请 BMU 缓冲 / 零拷贝候选预判；
+	 *   [1] 锁外补齐 + 拷贝 + 一致性同步（零拷贝路径 ≈ 0）；
+	 *   [2] **取锁等待** + 回收 + 判容量 —— 跨核争用就看这一格；
+	 *   [3] 描述符 + 门铃 + 记账，真正的串行段。
+	 * dma_state 的标签同步改过。
 	 */
 	if (unlikely(timing)) {
 		adapter->tx_stage_ns[0] += t_alloc - t_entry;
-		adapter->tx_stage_ns[1] += t_reclaim - t_alloc;
-		adapter->tx_stage_ns[2] += t_copy - t_reclaim;
-		adapter->tx_stage_ns[3] += t_start - t_copy;
+		adapter->tx_stage_ns[1] += t_copy - t_alloc;
+		adapter->tx_stage_ns[2] += t_reclaim - t_copy;
+		adapter->tx_stage_ns[3] += t_start - t_reclaim;
 		adapter->tx_stage_n++;
 	}
 
@@ -3197,24 +3852,36 @@ static void zx_alias_snapshot(struct zx_eth_adapter *adapter,
 		   (slot + 1) & (ZX_ALIAS_SNAP_N - 1));
 }
 
-static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
+/*
+ * 1b-A：把原来 for(q) 循环体抽成"扫一条环"。q 变成参数，budget 是本 q 的
+ * 剩余额度，napi 是本轮 poll 的 NAPI（napi_alloc_skb/napi_gro_receive 必须
+ * 记到**当前** NAPI 上：否则 ring1 的 skb 记进 napi0 的 GRO/napi_id，
+ * napi1 完成时不会 flush 那批 GRO，帧要等 napi0 下次 poll 才上去）。
+ * diag_fwd 改成出参：调用方一轮只记一个桶（原 diag_poll 的语义）。
+ *
+ * @bidx 是 FFE 攒批索引（0 = adapter->tx_batch，1 = zx_tx_batch_ring1），
+ * **由调用方按"这条环归谁"给定，函数内绝不看 rx_split**：napi0 恒传 0
+ * （哪怕 rx_split 在它本轮中途翻成 1），napi1 恒传 1。原来这里是
+ * `q == 1 && READ_ONCE(rx_split)` 现算，会和 zx_eth_rx() 轮首的 skip_ring1
+ * 快照不一致 —— 0→1 那一瞬 napi0 已经在扫 q1，却算出 bidx=1，于是两核
+ * 同写 ring1 那份批（b->n 双写，ffe_tx_batch=16 时 pkt[16] 越界）。翻位点
+ * 的并发由 rx_split_set() 用 napi_disable/napi_enable 夹住（见该处注释）。
+ *
+ * 默认路径（rx_split=0）由 zx_eth_rx() 从 q7 到 q0 依次调用本函数，
+ * 与原来的内联循环**同序、同 budget 语义**；多出的是一层函数调用开销
+ * （非 __always_inline，编译器自己决定是否内联）。
+ *
+ * 注意 while 循环体**保留了原来 for 体内的缩进**（多一层 tab）：这样
+ * diff 里那 590 行是纯搬运、零改动，审阅时不必逐行比对缩进。C 不关心。
+ */
+static int zx_eth_rx_q(struct zx_eth_adapter *adapter, struct napi_struct *napi,
+		       int q, int bidx, int budget, int *diag_fwd)
 {
-	int work_done = 0, q;
-	/* DIAG 3：本轮快路转发帧数（只在 diag_poll 打开时才累加） */
-	int diag_fwd = 0;
+	int work_done = 0;
+	u32 avail = readl(adapter->base + ZX_DMA_RX_QUEUE_CNT(q)) & 0xffff;
+	u32 rel[2] = { 0, 0 };
 
-	if (unlikely(adapter->zc_q_head != READ_ONCE(adapter->zc_q_tail)))
-		zx_zc_reap(adapter);
-	if (unlikely(adapter->zc_rx && time_after(jiffies, adapter->zc_park_at))) {
-		adapter->zc_park_at = jiffies + HZ;
-		zx_zc_park_pages(adapter);
-	}
-
-	for (q = ZX_RX_QUEUES - 1; q >= 0 && work_done < budget; q--) {
-		u32 avail = readl(adapter->base + ZX_DMA_RX_QUEUE_CNT(q)) & 0xffff;
-		u32 rel[2] = { 0, 0 };
-
-		while (avail && work_done < budget) {
+	while (avail && work_done < budget) {
 			u32 idx = adapter->rx_cur_idx[q] % ZX_NUM_RX_DESC;
 			__le32 *desc = adapter->rx_ring + q * ZX_RX_QUEUE_STRIDE +
 				       idx * ZX_DESC_SIZE;
@@ -3499,7 +4166,7 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 				if (zx_accel_cur_mode(&adapter->accel, fam) ==
 				    ZX_ACC_FFE)
 					ffe = zx_ffe_rx(adapter, bp, len,
-							port, fam);
+							port, fam, bidx);
 			} else {
 				int nfam = zx_accel_cur_mode(&adapter->accel, 0) ==
 					   ZX_ACC_FFE ? 0 : 1;
@@ -3507,20 +4174,24 @@ static int zx_eth_rx(struct zx_eth_adapter *adapter, int budget)
 				if (zx_accel_cur_mode(&adapter->accel, nfam) ==
 				    ZX_ACC_FFE)
 					ffe = zx_ffe_rx(adapter, bp, len,
-							port, nfam);
+							port, nfam, bidx);
 			}
 			/*
 			 * DIAG 1：快路入口打的戳只属于"真的被快路转发"的帧。
 			 * 回栈/丢弃的帧把戳撤掉，否则同一个 bp 之后被栈路径
 			 * 拿去发送时会被误结算成一次超长停留。
-			 * FORWARDED 的戳已经在 zx_tx_submit_bp() 里结算掉了。
+			 * FORWARDED 的戳已经在 zx_tx_submit_bp() 里结算掉了；
+			 * ④-B 的 BATCHED 在 flush（zx_tx_submit_batch → 同一个
+			 * zx_diag_tx_submit）里结算，所以这里也不能撤戳。
 			 */
 			if (unlikely(zx_diag_on(ZX_DIAG_B_RESIDENCE)) &&
-			    ffe != ZX_FFE_RX_FORWARDED)
+			    ffe != ZX_FFE_RX_FORWARDED &&
+			    ffe != ZX_FFE_RX_BATCHED)
 				zx_diag_res_clear(adapter, bp);
-			if (ffe == ZX_FFE_RX_FORWARDED &&
+			if ((ffe == ZX_FFE_RX_FORWARDED ||
+			     ffe == ZX_FFE_RX_BATCHED) &&
 			    unlikely(zx_diag_on(ZX_DIAG_B_POLL)))
-				diag_fwd++;
+				(*diag_fwd)++;
 			if (ffe != ZX_FFE_RX_STACK)
 				goto ffe_done;
 accel_slow:
@@ -3709,7 +4380,7 @@ accel_slow:
 			}
 zc_skip:
 			if (!zc)
-				skb = napi_alloc_skb(&adapter->napi, len);
+				skb = napi_alloc_skb(napi, len);
 			if (skb && dest_dev && (dest_dev->flags & IFF_UP)) {
 				if (!zc) {
 					dma_rmb();
@@ -3722,7 +4393,7 @@ zc_skip:
 				t3 = ZX_TS();
 				skb->dev = dest_dev;
 				skb->protocol = eth_type_trans(skb, dest_dev);
-				napi_gro_receive(&adapter->napi, skb);
+				napi_gro_receive(napi, skb);
 				t4 = ZX_TS();
 				dev_dstats_rx_add(dest_dev, len);
 			} else {
@@ -3805,6 +4476,41 @@ ffe_done:
 			adapter->rx_rel_fail++;
 		if (rel[1] && zx_rx_release(adapter, q, 1, rel[1]))
 			adapter->rx_rel_fail++;
+	return work_done;
+}
+
+/*
+ * 一轮 NAPI 的 RX 入口。rx_split=0（默认）：8 条环从 q7 扫到 q0，共享这一份
+ * budget — 与打补丁前逐字节等价。rx_split=1：napi0 让出 q1（q1 归 napi1），
+ * 否则两条 NAPI 会在两核上同时抓同一条环的同一个 rx_cur_idx[1]（两核同时
+ * ++ ⇒ 重取/漏取描述符、同一 tp 两次归还）。
+ * 本函数扫的环**一律传 bidx=0**（用 adapter->tx_batch）：q1 归 napi1 之后
+ * 由 zx_eth_poll_ring1() 用 bidx=1 扫。skip_ring1 只是本轮"让不让出 q1"
+ * 的快照，不再回读 rx_split 去决定批索引（0→1 的翻位已被
+ * napi_disable()/napi_enable() 夹住，见 rx_split_set()）。
+ * zc_reap/zc_park_pages 留在 napi0：它们动的是全局 zc 环，不该被两个上下文
+ * 同时跑。
+ */
+static int zx_eth_rx(struct zx_eth_adapter *adapter, struct napi_struct *napi,
+		     int budget, bool skip_ring1)
+{
+	int work_done = 0, q;
+	/* DIAG 3：本轮快路转发帧数（只在 diag_poll 打开时才累加） */
+	int diag_fwd = 0;
+
+	if (unlikely(adapter->zc_q_head != READ_ONCE(adapter->zc_q_tail)))
+		zx_zc_reap(adapter);
+	if (unlikely(adapter->zc_rx && time_after(jiffies, adapter->zc_park_at))) {
+		adapter->zc_park_at = jiffies + HZ;
+		zx_zc_park_pages(adapter);
+	}
+
+	for (q = ZX_RX_QUEUES - 1; q >= 0 && work_done < budget; q--) {
+		if (skip_ring1 && q == 1)
+			continue;
+		/* napi0 恒用默认批（bidx=0），不看 rx_split —— 见 zx_eth_rx_q() */
+		work_done += zx_eth_rx_q(adapter, napi, q, 0, budget - work_done,
+					 &diag_fwd);
 	}
 	/* DIAG 3：本轮的"处理帧数 / 其中快路转发数"各进一个桶（0..64） */
 	if (unlikely(zx_diag_on(ZX_DIAG_B_POLL)))
@@ -3823,6 +4529,26 @@ static irqreturn_t zx_eth_isr(int irq, void *dev_id)
 
 	writel(~0, adapter->base + ZX_TM_INT_MASK);
 	napi_schedule(&adapter->napi);
+	/*
+	 * 1b-A：rx_split=1 时才可能排 napi1（它扫 q1）。
+	 *
+	 * 这里**先读一次 ring1 的可用计数**，非 0 才排。原因：CLA 表是由用户态
+	 * 脚本写的（驱动不碰 CLA、也不依赖 ppe.ko），所以"rx_split=1 但表还没
+	 * 写"是一个合法状态 —— 此时 ring1 永远是空的。若无条件排 napi1，它会
+	 * 被每个 RX 中断唤醒（coalesce 上限 4000/s）去做一次空 poll；加上这一
+	 * 个判断，空环时 napi1 **一次都不会醒**，kthread 一直睡在
+	 * napi_thread_wait() 上，零 CPU。默认路径（rx_split=0）连这次 MMIO
+	 * 读都不做（短路）。
+	 *
+	 * 计数器滞后/正好读到 0 的漏排由 zx_eth_poll() 末尾的兜底补上。
+	 *
+	 * 另外注意：这是**两个 schedule、一个 mask** —— 屏蔽/解屏蔽仍只由
+	 * napi0 负责，napi1 从头到尾不碰 TM_INT_MASK。这就是竞态③的处理方式：
+	 * 不靠加锁，靠"结构上只有一个 MASK 写者"。
+	 */
+	if (READ_ONCE(rx_split) &&
+	    (readl(adapter->base + ZX_DMA_RX_QUEUE_CNT(1)) & 0xffff))
+		napi_schedule(&zx_rxs.napi1);
 	return IRQ_HANDLED;
 }
 
@@ -3831,6 +4557,22 @@ static int zx_eth_poll(struct napi_struct *napi, int budget)
 	struct zx_eth_adapter *adapter =
 		container_of(napi, struct zx_eth_adapter, napi);
 	int work_done;
+
+	atomic_inc(&zx_rxs.poll_active[0]);
+	smp_mb(); /* 与 quiesce 的 smp_mb() 配对：见 REVIEW3 M1 */
+	/*
+	 * fix2（B3）：accel 模式切换的 quiesce 窗口内什么都不做 —— 原来靠
+	 * napi_disable(napi0) 达到同一语义（enter 等这一轮退场后才改表），
+	 * 但那要持 dev->lock 去等 SCHED，与持 rtnl 的另一条 disable 成环。
+	 * 这里立刻 napi_complete_done 退场；批在每轮结尾必已结清（见下面
+	 * zx_ffe_tx_batch_flush），所以不刷也不丢帧。
+	 */
+	if (unlikely(READ_ONCE(zx_rxs.quiesced))) {
+		napi_complete_done(napi, 0);
+		if (atomic_dec_and_test(&zx_rxs.poll_active[0]))
+			wake_up(&zx_rxs.poll_wq);
+		return 0;
+	}
 
 	spin_lock_bh(&adapter->tx_lock);
 	zx_tx_reclaim(adapter);
@@ -3847,11 +4589,93 @@ static int zx_eth_poll(struct napi_struct *napi, int budget)
 	/* FIX1：先排待归还队列，再探“停口是否该唤醒” */
 	zx_bmu_defer_drain(adapter, 4);
 	zx_tx_starve_recover(adapter);
-	work_done = budget ? zx_eth_rx(adapter, budget) : 0;
+	/*
+	 * 1b-A：rx_split=1 时 napi0 让出 q1（q1 归 napi1，见 zx_eth_rx）。
+	 * 注意 skip_ring1 只影响"扫哪几条环"，budget 仍是整份 64 ——
+	 * napi0 那 7 条环之间的老规则（q7 先、q0 后、共享 64）一位没动。
+	 */
+	work_done = budget ? zx_eth_rx(adapter, napi, budget,
+				       READ_ONCE(rx_split)) : 0;
+	/*
+	 * ④-B：本轮的 FFE 攒批必须在本轮结束前提交。
+	 *
+	 * 为什么必须在这里结：入批帧的 RX 描述符在 ffe_done 已经消费、bp 又
+	 * 不许还（帧已改写过），批里留着的帧既不会自己发出去、也不会被下一轮
+	 * 无条件捡起（下一轮可能没帧）。所以放在 napi_complete_done() **之前**：
+	 * 中断重新打开时批里一定没有残留，否则那几帧会被推迟到下一个包才走。
+	 * 空批是 no-op；批量关闭时这里也只多一次 n == 0 的读。
+	 */
+	zx_ffe_tx_batch_flush(adapter, 0);
+
+	/*
+	 * 1b-A 兜底：ISR 只在"看到 ring1 计数器非 0"时才排 napi1（见
+	 * zx_eth_isr），怕的是计数器更新比 ISR 晚一拍。这里 napi0 每轮再补看
+	 * 一次：非 0 就排。napi_schedule() 是幂等的（已 SCHED 只置 MISSED），
+	 * 已经排上的情况多调一次不会让它多跑一轮。
+	 * rx_split=0 时整段被短路 —— 默认路径一次寄存器读都不多。
+	 */
+	if (unlikely(READ_ONCE(rx_split)) &&
+	    (readl(adapter->base + ZX_DMA_RX_QUEUE_CNT(1)) & 0xffff))
+		napi_schedule(&zx_rxs.napi1);
 
 	if (work_done < budget && napi_complete_done(napi, work_done))
 		writel(~ZX_TM_INT_RX, adapter->base + ZX_TM_INT_MASK);
 
+	if (atomic_dec_and_test(&zx_rxs.poll_active[0]))
+		wake_up(&zx_rxs.poll_wq);
+
+	return work_done;
+}
+
+/*
+ * 1b-A：ring1 的 poll。**只**扫 q1，预算同样是一整份 weight（默认 64）。
+ *
+ * 三件"故意不做"的事，都有原因：
+ *   1. 不解屏蔽（不写 ZX_TM_INT_MASK）。屏蔽/解屏蔽全归 napi0 —— 竞态③就
+ *      这样被结构性消除，而不是靠锁。napi1 是 threaded（kthread）被
+ *      napi_schedule() 直接唤醒，和中断屏蔽状态本来就无关。
+ *   2. 不做 zx_tx_reclaim。TX 完成回收由 napi0 每轮做（它一直在跑：中断
+ *      由它解屏蔽），而下面 zx_ffe_tx_batch_flush(adapter, 1) 自己也会在
+ *      tx_lock 里 reclaim 一次（见 accel.c 的 flush），所以 ring1 的
+ *      BATCHED 帧不会因为 napi0 恰好没跑而饿死。
+ *   3. 不碰 zc_reap/zc_park_pages/bmu_defer_drain/tx_starve_recover ——
+ *      那些动全局状态，留在 napi0 单写者上下文里。
+ */
+static int zx_eth_poll_ring1(struct napi_struct *napi, int budget)
+{
+	struct zx_eth_adapter *adapter = zx_napi_adapter(napi);
+	int work_done, diag_fwd = 0;
+
+	atomic_inc(&zx_rxs.poll_active[1]);
+	smp_mb(); /* 与 quiesce 的 smp_mb() 配对：见 REVIEW3 M1 */
+	/*
+	 * fix2（B3）：两个早退。
+	 *   - quiesced：accel 模式切换窗口。原来靠 napi_disable(napi1) 停住，
+	 *     但那要 dev->lock，与 napi_enable 同锁成环；现在只看文件级标志，
+	 *     立刻收尾，窗口里到队的帧留在 q1 环里，leave 会补 schedule。
+	 *   - !rx_split：回退窗口（见下）。
+	 * 早退都必须 flush(1)：ring1 那份批里可能还压着 BATCHED 帧（描述符
+	 * 已消费、bp 不许归还），不结掉就永远发不出去；空批是 no-op。
+	 * 回退窗口的其余说明见原注释。
+	 */
+	if (unlikely(READ_ONCE(zx_rxs.quiesced) ||
+		     !READ_ONCE(rx_split))) {
+		zx_ffe_tx_batch_flush(adapter, 1);
+		napi_complete_done(napi, 0);
+		if (atomic_dec_and_test(&zx_rxs.poll_active[1]))
+			wake_up(&zx_rxs.poll_wq);
+		return 0;
+	}
+
+	/* napi1 恒用 ring1 那份批（bidx=1），不看 rx_split —— 见 zx_eth_rx_q() */
+	work_done = budget ? zx_eth_rx_q(adapter, napi, 1, 1, budget, &diag_fwd) : 0;
+	/* 本轮 ring1 的批必须在本轮结束前结掉（理由同 napi0 的 flush） */
+	zx_ffe_tx_batch_flush(adapter, 1);
+
+	if (work_done < budget)
+		napi_complete_done(napi, work_done);
+	if (atomic_dec_and_test(&zx_rxs.poll_active[1]))
+		wake_up(&zx_rxs.poll_wq);
 	return work_done;
 }
 
@@ -3873,6 +4697,14 @@ static int zx_eth_open(struct net_device *netdev)
 
 	if (adapter->open_count == 0) {
 		napi_enable(&adapter->napi);
+		/* 1b-A：napi1 的 enable 状态跟着 open_count 走。依据见
+		 * zx_rx_split_enable_threaded()：napi_disable 会清 THREADED、
+		 * napi_enable 不补置，所以 enable 之后必须重调 set_threaded。
+		 * S3：失败时它已回滚 napi1 并把 rx_split 压回 0（q1 归
+		 * napi0），端口照常 open —— 只是这条可选路径关了。 */
+		if (zx_rxs.added && zx_rx_split_enable_threaded())
+			dev_warn(adapter->dev,
+				 "ring1 NAPI: 线程化失败，已回滚到 rx_split=0（q1 归 napi0）\n");
 		writel(~ZX_TM_INT_RX, adapter->base + ZX_TM_INT_MASK);
 		/* 加速框架的 0→1 钩子（设计 §1.4 最后一段） */
 		zx_accel_on_open(adapter);
@@ -3900,6 +4732,9 @@ static int zx_eth_stop(struct net_device *netdev)
 	if (adapter->open_count == 0) {
 		writel(~0, adapter->base + ZX_TM_INT_MASK);
 		hrtimer_cancel(&adapter->tx_timer);
+		/* 1b-A：先停 napi1（它在 CPU0 的 kthread 里跑，也要退出 poll） */
+		if (zx_rxs.added)
+			napi_disable(&zx_rxs.napi1);
 		napi_disable(&adapter->napi);
 		/* a last poll may have unmasked it again */
 		writel(~0, adapter->base + ZX_TM_INT_MASK);
@@ -4144,6 +4979,26 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 		   adapter->tx_cur_idx, adapter->tx_complete_cnt,
 		   adapter->tx_pending, adapter->tx_done_excess,
 		   adapter->rx_resync_cnt);
+	/*
+	 * ④-B：FFE 攒批的可观测计数（上机判读用）。
+	 *   tx_batch        flush 次数（n > 0 的批；批长 1 也算一批）
+	 *   tx_batch_frames 真正提交进发送环的帧数（= 这些批的 Σk）
+	 *   tx_batch_avg    平均批长 = frames / batches（四舍五入前取整）
+	 *   tx_batch_max    见过的最大批长（≤ 模块参数 ffe_tx_batch，默认 8）
+	 *   tx_batch_drops  flush 时因为权威容量不够、或出口在攒批之后掉链而
+	 *                   丢弃的帧数（已改写、回不了栈，只能还 bp）
+	 * 判读：tx_batch_avg 接近 1 ⇒ 攒不起来（每轮只有一帧 / 出口来回切），
+	 * 批量化没意义；drops 非 0 ⇒ 攒批后环满，该调小 ffe_tx_batch 或
+	 * txq_limit，别当成丢包。
+	 */
+	{
+		struct zx_ffe_tx_batch *b = &adapter->tx_batch;
+
+		seq_printf(s, "tx_batch=%llu tx_batch_frames=%llu tx_batch_avg=%u tx_batch_max=%u tx_batch_drops=%llu\n",
+			   b->batches, b->frames,
+			   b->batches ? (u32)div64_u64(b->frames, b->batches) : 0,
+			   b->max_len, b->drops);
+	}
 	seq_printf(s, "rx_alias=%u rx_nobuf=%u rx_rel_fail=%u rx_bad=%u rx_len_short=%llu rx_len_long=%llu\n",
 		   adapter->rx_alias_cnt, adapter->rx_nobuf_cnt,
 		   adapter->rx_rel_fail, adapter->rx_bad_cnt,
@@ -4220,7 +5075,7 @@ static int zx_eth_dma_state_show(struct seq_file *s, void *data)
 		u32 n = adapter->tx_stage_n;
 		int j;
 
-		seq_printf(s, "tx阶段(ns/包) 申请BMU(锁外) %llu 取锁+回收 %llu 拷贝+同步 %llu 启动 %llu 合计 %llu n=%u\n",
+		seq_printf(s, "tx阶段(ns/包) 申请BMU(锁外) %llu 拷贝+同步(锁外) %llu 取锁等待+回收+判容 %llu 描述符+门铃 %llu 合计 %llu n=%u\n",
 			   div_u64(adapter->tx_stage_ns[0], n),
 			   div_u64(adapter->tx_stage_ns[1], n),
 			   div_u64(adapter->tx_stage_ns[2], n),
@@ -4964,6 +5819,366 @@ static const struct file_operations zx_eth_diag_fops = {
 	.release	= single_release,
 };
 
+/* ---- 只读寄存器窗口 reg_ro ------------------------------------------
+ *
+ * 为什么要有它：/dev/mem 在这颗 armv7 上读 0x92xxxxxx 会 EFAULT
+ * （read_mem() 走 __va()，超出直接映射），而 TM/DMA 窗口（0x340000/
+ * 0x350000 起）的现值只能从驱动已经映射好的 reg base 里读。这个文件的
+ * 写侧只是**选范围**，不碰任何寄存器；读侧只调 readl()。
+ *
+ * 协议（写侧，控制面）：
+ *   echo 0x354000 > reg_ro           # 从偏移 0x354000 读 64 字节（默认）
+ *   echo "0x354000 0x40" > reg_ro    # 偏移 + 字节数（都接受 0x/十进制）
+ *   cat reg_ro                       # 每行一个 32 位字：0x<偏移>: <值>
+ *
+ * 偏移口径：**相对驱动 reg base（0x92000000）的字节偏移**，不是相对
+ * ZX_TM_BASE。eth.h:36-39 写的就是"offsets from the start of the block
+ * (0x92000000)"，ZX_TM_BASE=0x340000 只是这块 4 MiB 窗口里的一个偏移；
+ * 所以 0x354000 读的是物理 0x92354000。若某个寄存器号是相对 TM 基址
+ * 给的（例如 tm.ko 里的 0x14000），先加 0x340000 再写进来。
+ *
+ * 安全闸（硬要求，任一不满足 -> -EINVAL + 一行 dev_info）：
+ *   1. 偏移 ∈ [0x300000, 0x3FFFFF] 且 4 字节对齐；
+ *   2. 字节数 4..256 且是 4 的倍数（一条命令最多 64 个字）；
+ *   3. 本文件只 readl()，没有对寄存器的写调用（注释也刻意不出现那个
+ *      函数名，便于 grep 自证）。
+ *
+ * 选择状态放文件级 static，而不是 struct zx_eth_adapter 的字段：
+ * sizeof(struct zx_eth_adapter) 被本文件的 BUILD_BUG_ON 钉死为 0x59c8
+ * （ABI 铁律，ppe.ko 按偏移访问），不能加字段。本平台只有一个 gmac
+ * 实例，选择范围全局共享；读的时候各自由自己的 base 取址。
+ *
+ * 解析用的 strim()/strsep()/memcpy() 来自本文件已包含的 <linux/seq_file.h>
+ * （它第一行就 include <linux/string.h>），因此不新增 include —— 上面
+ * 687-694 行的八条 ABI 断言因此一行都不挪，git diff 只有纯追加。
+ */
+#define ZX_REG_RO_OFF_MIN	0x300000u
+#define ZX_REG_RO_OFF_MAX	0x3FFFFFu
+#define ZX_REG_RO_LEN_DEF	64u
+#define ZX_REG_RO_LEN_MAX	256u
+
+static DEFINE_MUTEX(zx_reg_ro_lock);
+static u32 zx_reg_ro_off;
+static u32 zx_reg_ro_len;
+
+/* "0x<off> [0x<len>]"：第一段必填，第二段可选，多一段一律拒绝 */
+static int zx_reg_ro_parse(const char *buf, size_t count, u32 *off, u32 *len)
+{
+	char tmp[64];
+	char *p, *tok;
+
+	if (!count || count >= sizeof(tmp))
+		return -EINVAL;
+	memcpy(tmp, buf, count);
+	tmp[count] = '\0';
+
+	p = strim(tmp);
+	if (!*p)
+		return -EINVAL;
+	tok = strsep(&p, " \t");
+	if (!tok || kstrtou32(tok, 0, off))
+		return -EINVAL;
+
+	*len = ZX_REG_RO_LEN_DEF;
+	if (p) {
+		p = strim(p);
+		if (*p) {
+			tok = strsep(&p, " \t");
+			if (!tok || kstrtou32(tok, 0, len))
+				return -EINVAL;
+			if (p) {
+				p = strim(p);
+				if (*p)
+					return -EINVAL;
+			}
+		}
+	}
+	return 0;
+}
+
+/* 三条安全闸 + 范围不越界；失败时打一行提示并返回 -EINVAL */
+static int zx_reg_ro_check(struct zx_eth_adapter *adapter, u32 off, u32 len)
+{
+	if (off < ZX_REG_RO_OFF_MIN || off > ZX_REG_RO_OFF_MAX) {
+		dev_info(adapter->dev,
+			 "reg_ro: offset 0x%x outside [0x%x,0x%x]\n",
+			 off, ZX_REG_RO_OFF_MIN, ZX_REG_RO_OFF_MAX);
+		return -EINVAL;
+	}
+	if (off & 0x3) {
+		dev_info(adapter->dev,
+			 "reg_ro: offset 0x%x not 4-byte aligned\n", off);
+		return -EINVAL;
+	}
+	if (len < 4 || len > ZX_REG_RO_LEN_MAX || (len & 0x3)) {
+		dev_info(adapter->dev,
+			 "reg_ro: length %u invalid (4..%u, multiple of 4)\n",
+			 len, ZX_REG_RO_LEN_MAX);
+		return -EINVAL;
+	}
+	if (off + len - 1 > ZX_REG_RO_OFF_MAX) {
+		dev_info(adapter->dev,
+			 "reg_ro: range 0x%x+%u crosses 0x%x\n",
+			 off, len, ZX_REG_RO_OFF_MAX);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int zx_reg_ro_show(struct seq_file *s, void *unused)
+{
+	struct zx_eth_adapter *adapter = s->private;
+	u32 off, len, i;
+
+	mutex_lock(&zx_reg_ro_lock);
+	off = zx_reg_ro_off;
+	len = zx_reg_ro_len;
+	mutex_unlock(&zx_reg_ro_lock);
+
+	if (!len) {
+		seq_puts(s, "reg_ro: no range selected yet; write \"0x<off> [0x<len>]\" first\n");
+		return 0;
+	}
+	/* 防御性复检：只有上面的 write 能改这两个值，且已过同一套闸 */
+	if (zx_reg_ro_check(adapter, off, len))
+		return 0;
+
+	seq_printf(s, "reg_ro: off=0x%x len=%u (readl only)\n", off, len);
+	for (i = 0; i < len; i += 4)
+		seq_printf(s, "0x%06x: %08x\n", off + i,
+			   readl(adapter->base + off + i));
+	return 0;
+}
+
+static ssize_t zx_reg_ro_write(struct file *file, const char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct zx_eth_adapter *adapter = s->private;
+	char buf[64];
+	u32 off, len;
+	int ret;
+
+	if (!count || count >= sizeof(buf))
+		goto bad;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	ret = zx_reg_ro_parse(buf, count, &off, &len);
+	if (ret)
+		goto bad;
+	ret = zx_reg_ro_check(adapter, off, len);
+	if (ret)
+		return ret;
+
+	mutex_lock(&zx_reg_ro_lock);
+	zx_reg_ro_off = off;
+	zx_reg_ro_len = len;
+	mutex_unlock(&zx_reg_ro_lock);
+
+	dev_info(adapter->dev, "reg_ro: range set to 0x%x+%u (read-only)\n",
+		 off, len);
+	return count;
+
+bad:
+	dev_info(adapter->dev,
+		 "reg_ro: usage \"0x<off> [0x<len>]\" (off 0x300000-0x3fffff, len 4-256)\n");
+	return -EINVAL;
+}
+
+static int zx_reg_ro_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_reg_ro_show, inode->i_private);
+}
+
+static const struct file_operations zx_reg_ro_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_reg_ro_open,
+	.read		= seq_read,
+	.write		= zx_reg_ro_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+/* ---- 运行期寄存器写钩子 reg_rw --------------------------------------
+ *
+ * 为什么要有它：TM SCH 块（偏移 0x354000..0x3540ff）的调度参数在原厂
+ * kernel 里是运行期写进去的；排查/回滚需要不重启就改一个 32 位字。
+ * 硬要求是**窄白名单 + 默认关闭**：白名单外一律拒绝、没有例外；模块参数
+ * reg_rw_arm 默认 0，未 arm 时任何写都返回 -EPERM（提示只打一次）。
+ *
+ * 协议：
+ *   echo 1 > /sys/module/zx279128s_eth/parameters/reg_rw_arm  # arm（默认 0）
+ *   echo "0x354000 0x00000000" > reg_rw   # 偏移 + 值（都接受 0x/十进制）
+ *   cat reg_rw                            # last: off=0x… val=0x… now=0x…
+ *
+ * 安全闸（任一不满足 -> 拒绝 + 一行 dev_info）：
+ *   1. reg_rw_arm == 1，否则 -EPERM；
+ *   2. 偏移 ∈ [0x354000, 0x3540ff]（白名单外一律 -EINVAL，没有例外）；
+ *   3. 偏移 4 字节对齐（-EINVAL）。
+ *
+ * 写用 writel()、写前读回与 cat 的 now 都用 readl()；本次新增的寄存器写调用
+ * 只有 reg_rw_write() 这一处。状态放文件级 static：struct zx_eth_adapter 的
+ * sizeof 被 BUILD_BUG_ON 钉死为 0x59c8（ABI 铁律），不能加字段；mutex 只护
+ * 这几个 static，不跨 MMIO。解析用的 strim()/strsep()/memcpy()/kstrtou32()
+ * 与 reg_ro 同源，不新增 include（687-694 行因此一行都不挪）。
+ */
+#define ZX_REG_RW_OFF_MIN	0x354000u
+#define ZX_REG_RW_OFF_MAX	0x3540FFu
+
+static DEFINE_MUTEX(zx_reg_rw_lock);
+static bool zx_reg_rw_have_last;
+static u32 zx_reg_rw_last_off;
+static u32 zx_reg_rw_last_val;
+static bool zx_reg_rw_warned;
+
+/*
+ * 默认 0：必须显式 arm。0644 是为了能在 /sys/module/.../parameters 里改。
+ * 声明在文件尾部而不是顶部参数区，是因为 687-694 行的 ABI 断言行号不许动。
+ */
+static int reg_rw_arm;
+module_param(reg_rw_arm, int, 0644);
+MODULE_PARM_DESC(reg_rw_arm,
+		 "enable reg_rw register writes (0=off, default 0)");
+
+/* "0x<off> 0x<val>"：两段都必填，多一段一律拒绝 */
+static int zx_reg_rw_parse(const char *buf, size_t count, u32 *off, u32 *val)
+{
+	char tmp[64];
+	char *p, *tok;
+
+	if (!count || count >= sizeof(tmp))
+		return -EINVAL;
+	memcpy(tmp, buf, count);
+	tmp[count] = '\0';
+
+	p = strim(tmp);
+	if (!*p)
+		return -EINVAL;
+	tok = strsep(&p, " \t");
+	if (!tok || kstrtou32(tok, 0, off))
+		return -EINVAL;
+	if (!p)
+		return -EINVAL;
+	p = strim(p);
+	tok = strsep(&p, " \t");
+	if (!tok || kstrtou32(tok, 0, val))
+		return -EINVAL;
+	if (p) {
+		p = strim(p);
+		if (*p)
+			return -EINVAL;
+	}
+	return 0;
+}
+
+/* 窄白名单 + 4 字节对齐；失败时打一行提示并返回 -EINVAL */
+static int zx_reg_rw_check(struct zx_eth_adapter *adapter, u32 off)
+{
+	if (off < ZX_REG_RW_OFF_MIN || off > ZX_REG_RW_OFF_MAX) {
+		dev_info(adapter->dev,
+			 "reg_rw: offset 0x%x outside [0x%x,0x%x]\n",
+			 off, ZX_REG_RW_OFF_MIN, ZX_REG_RW_OFF_MAX);
+		return -EINVAL;
+	}
+	if (off & 0x3) {
+		dev_info(adapter->dev,
+			 "reg_rw: offset 0x%x not 4-byte aligned\n", off);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/* 读路径不受 arm 限制：回显上一次写入 + 该偏移的当前值，不做批量 dump */
+static int zx_reg_rw_show(struct seq_file *s, void *unused)
+{
+	struct zx_eth_adapter *adapter = s->private;
+	u32 off, val;
+	bool have;
+
+	mutex_lock(&zx_reg_rw_lock);
+	have = zx_reg_rw_have_last;
+	off = zx_reg_rw_last_off;
+	val = zx_reg_rw_last_val;
+	mutex_unlock(&zx_reg_rw_lock);
+
+	if (!have) {
+		seq_printf(s, "reg_rw: no write yet (arm=%d)\n",
+			   READ_ONCE(reg_rw_arm));
+		return 0;
+	}
+	seq_printf(s, "last: off=0x%06x val=0x%08x now=0x%08x\n",
+		   off, val, readl(adapter->base + off));
+	return 0;
+}
+
+static ssize_t zx_reg_rw_write(struct file *file, const char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct zx_eth_adapter *adapter = s->private;
+	char buf[64];
+	u32 off, val, old;
+	int ret;
+
+	/* 未 arm：任何写都拒绝，提示只打一次 */
+	if (!READ_ONCE(reg_rw_arm)) {
+		if (!zx_reg_rw_warned) {
+			zx_reg_rw_warned = true;
+			dev_info(adapter->dev,
+				 "reg_rw: disabled (reg_rw_arm=0); set /sys/module/zx279128s_eth/parameters/reg_rw_arm=1 first\n");
+		}
+		return -EPERM;
+	}
+
+	if (!count || count >= sizeof(buf))
+		goto bad;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	ret = zx_reg_rw_parse(buf, count, &off, &val);
+	if (ret)
+		goto bad;
+	ret = zx_reg_rw_check(adapter, off);
+	if (ret)
+		return ret;
+
+	old = readl(adapter->base + off);
+	writel(val, adapter->base + off);
+
+	mutex_lock(&zx_reg_rw_lock);
+	zx_reg_rw_have_last = true;
+	zx_reg_rw_last_off = off;
+	zx_reg_rw_last_val = val;
+	mutex_unlock(&zx_reg_rw_lock);
+
+	/* dmesg 就是写入史，便于回滚：old 是写前读回值 */
+	dev_info(adapter->dev, "reg_rw: off=0x%06x val=0x%08x old=0x%08x\n",
+		 off, val, old);
+	return count;
+
+bad:
+	dev_info(adapter->dev,
+		 "reg_rw: usage \"0x<off> 0x<val>\" (off 0x354000-0x3540ff, 4-byte aligned, reg_rw_arm=1)\n");
+	return -EINVAL;
+}
+
+static int zx_reg_rw_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, zx_reg_rw_show, inode->i_private);
+}
+
+static const struct file_operations zx_reg_rw_fops = {
+	.owner		= THIS_MODULE,
+	.open		= zx_reg_rw_open,
+	.read		= seq_read,
+	.write		= zx_reg_rw_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 {
 	struct dentry *dir = debugfs_create_dir(dev_name(adapter->dev), NULL);
@@ -5008,6 +6223,17 @@ static void zx_eth_debugfs_init(struct zx_eth_adapter *adapter)
 	 */
 	debugfs_create_file("soc_temp", 0444, dir, adapter,
 			    &zx_accel_soc_temp_fops);
+	/*
+	 * 只读寄存器窗口（0644 的写侧只用来选范围，不是寄存器写）。
+	 * 协议与安全闸见本节上方的 "只读寄存器窗口 reg_ro" 注释。
+	 */
+	debugfs_create_file("reg_ro", 0644, dir, adapter, &zx_reg_ro_fops);
+	/*
+	 * 运行期寄存器写钩子（0644，默认关闭）：只写 TM SCH 白名单里的
+	 * 一个 32 位字，必须先 arm（reg_rw_arm=1）。协议与安全闸见本节
+	 * 上方的 "运行期寄存器写钩子 reg_rw" 注释。
+	 */
+	debugfs_create_file("reg_rw", 0644, dir, adapter, &zx_reg_rw_fops);
 }
 
 static void zx_pkt_pool_free(struct device *dev,
@@ -5119,7 +6345,7 @@ static int zx_eth_probe(struct platform_device *pdev)
 
 	/*
 	 * 初始模式按 module_param 直接写字段，不走 zx_accel_set()：probe 期
-	 * NAPI 还没 enable、端口还没注册，做 quiesce/napi_disable 没有意义，
+	 * NAPI 还没 enable、端口还没注册，做 quiesce（停 poll）没有意义，
 	 * 也没有数据面在跑。
 	 */
 	adapter->accel.v4_mode = (unsigned int)accel_v4 <= ZX_ACC_ZC ?
@@ -5374,9 +6600,28 @@ static int zx_eth_probe(struct platform_device *pdev)
 	zx_update_mac_tables(adapter);
 	mutex_unlock(&adapter->ppe_lock);
 
+	/*
+	 * fix2（B3）：quiesce 的"等在场 poll 退场"用文件级 waitqueue；static
+	 * 零初始化对 wait_queue_head 不够（链表头必须 INIT_LIST_HEAD 过），
+	 * 所以在第一次可能 poll / quiesce 之前显式初始化一次。
+	 */
+	init_waitqueue_head(&zx_rxs.poll_wq);
+
 	/* One NAPI context serves all ports */
 	netif_napi_add_weight(adapter->ports[i], &adapter->napi, zx_eth_poll,
 			      (int)READ_ONCE(zxnapi_weight));
+	/*
+	 * 1b-A：只有在 cmdline/早于 probe 的 sysfs 已经把 rx_split 打开时，
+	 * 这里才建第二条 NAPI。默认 0 ⇒ dev->napi_list 里仍只有 napi0，
+	 * "一条 NAPI、一次 request_irq、预算 64 全给它"的形状分毫不动。
+	 * 此时 open_count 还是 0，所以 setup 只 add + 建 kthread + 绑核，
+	 * enable 留给 zx_eth_open()。
+	 */
+	if (READ_ONCE(rx_split)) {
+		ret = zx_rx_split_setup(adapter);
+		if (ret)
+			goto err_napi;
+	}
 	hrtimer_setup(&adapter->tx_timer, zx_eth_tx_timer,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
@@ -5421,6 +6666,17 @@ err_irq:
 	writel(~0, adapter->base + ZX_TM_INT_MASK);
 	devm_free_irq(dev, adapter->irq, adapter);
 err_napi:
+	/* 1b-A：probe 失败时 napi1 可能已经 add（本路径 open_count 还是 0，
+	 * 所以它没被 enable）。**不能**在这里调 napi_set_threaded(DISABLED)：
+	 * 它内部 napi_stop_kthread() 要求 THREADED 置位或 SCHED 清零，而
+	 * "从未 enable 过"的 NAPI 恰好是 SCHED 置上的 ⇒ msleep(20) 死循环
+	 * （net/core/dev.c:7091-7102）⇒ probe 失败也挂死。kthread 由
+	 * netif_napi_del() 里的 kthread_stop() 收掉（dev.c:7625-7627）。 */
+	if (zx_rxs.added) {
+		zx_ffe_tx_batch_flush(adapter, 1);
+		netif_napi_del(&zx_rxs.napi1);
+		zx_rxs.added = false;
+	}
 	netif_napi_del(&adapter->napi);
 err_disconnect:
 	for (i = 0; i < ZX_NUM_PORTS; i++) {
