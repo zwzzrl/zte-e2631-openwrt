@@ -4,7 +4,7 @@ date: 2026-11-04
 status: done
 topic: ops-net
 summary: 硬件条目不知道 WAN 死活；守卫检测到多 WAN/策略路由就写 stack，单 WAN 不写。
-evidence: overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128s-accel.c:3615, overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128s-main.c:4984, overlay/target/linux/sanechips/base-files/sbin/e2631-ffe-multiwan:1, overlay/target/linux/sanechips/base-files/etc/init.d/zx_ffe_multiwan:1
+evidence: overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128s-accel.c:3960, overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128s-main.c:6199, overlay/target/linux/sanechips/base-files/sbin/e2631-ffe-multiwan:1, overlay/target/linux/sanechips/base-files/etc/init.d/zx_ffe_multiwan:1
 ---
 
 # 多 WAN / 策略路由下 FFE 快路的黑洞与自动关停
@@ -27,12 +27,12 @@ evidence: overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128
 ## §1 为什么硬件条目会进黑洞
 
 1. **条目里没有 WAN 存活位**：学习钩子只解析五元组、出口端口和下一跳 MAC，装进
-   FFE 表（`SRC/zx279128s-accel.c:2070-2200` 的 `zx_ffe_learn_hook()` 与
-   `:1542` 的 `zx_ffe_learn_one()`）；之后命中就直接按条目里的端口/改写转发。
-2. **路由切换不会清表**：驱动只在"加速整体关闭"时全清（`SRC/zx279128s-accel.c:4220`
+   FFE 表（`SRC/zx279128s-accel.c:2094-2224` 的 `zx_ffe_learn_hook()` 与
+   `:1566` 的 `zx_ffe_learn_one()`）；之后命中就直接按条目里的端口/改写转发。
+2. **路由切换不会清表**：驱动只在"加速整体关闭"时全清（`SRC/zx279128s-accel.c:4565`
    `schedule_work(&adapter->accel.port_flush_work)`，调用点在 `zx_accel_on_close()`），
    单条 WAN 链路 down 不触发它；netdev 通知链只维护本机地址/桥端口
-   （`:1134-1160`、`:1203-1230`），不看路由。
+   （`:1158-1184`、`:1227-1253`），不看路由。
 3. **老化是 300 s**：`ffe_aging = 300`（`SRC/zx279128s-accel.c:232`），节拍 1 s
    （`:224`）；活跃流每次命中刷新 `lastuse`，所以只要旧条目还在被命中，它就永远不
    老化 —— 恰恰是"黑洞流一直有包进来"的形态。
@@ -43,12 +43,12 @@ evidence: overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128
 
 | # | 手段 | 运行期可切 | 立即生效 | 是否等于"关快路" | 证据 |
 |---|---|---|---|---|---|
-| 1 | `echo stack > /sys/kernel/debug/92000000.ethernet/accel_ipv6`（v4 同名 `accel_ipv4`） | 是（0644） | 是，同步：返回时已是 stack 或什么都没变 | **是**。S4 先清该族表，S5 写模式字节；钩子/数据面只认 `ffe` | `SRC/zx279128s-main.c:4982-4985`（注册）、`SRC/zx279128s-accel.c:3471-3672`（切换）、`:2106-2111` 与 `SRC/zx279128s-main.c:3499-3508`（只认 ffe） |
-| 2 | `echo 0 > .../ffe_learn` | 是 | 是 | **否**：只停"学新流"，已有条目照常转发到老化 | `SRC/zx279128s-accel.c:5047` 的注释原文、`:5180-5193` 写口 |
-| 3 | `echo 1 > .../ffe_flush` | 是 | 是 | **否**：一次性清表；学习开着会立刻重学 | `SRC/zx279128s-accel.c:4796-4845`、`:759` `__zx_ffe_flush()` |
-| 4 | `echo 0 > .../accel_autofallback` | 是 | 是 | **否**：只在 drop>0.1% 或 fallback>50% 持续 10 s 时降级 | `SRC/zx279128s-main.c:124-128`、`:5002` |
-| 5 | `echo 0 > /sys/module/zx279128s_eth/parameters/accel_v6` | **否**（0644 但无回调，probe 读一次） | 否 | 只能开机前传参 | `SRC/zx279128s-main.c:114-120`（默认值）、`:5121-5128`（只有 probe 写模式字段） |
-| 6 | `ffe_aging`（sysfs 0644 / debugfs） | 是 | 下一拍老化判定 | 否：只改老化时间；0 = 永不老化，方向上更危险 | `SRC/zx279128s-accel.c:232-234`、`:4993-5031` |
+| 1 | `echo stack > /sys/kernel/debug/92000000.ethernet/accel_ipv6`（v4 同名 `accel_ipv4`） | 是（0644） | 是，同步：返回时已是 stack 或什么都没变 | **是**。S4 先清该族表，S5 写模式字节；钩子/数据面只认 `ffe` | `SRC/zx279128s-main.c:6197-6200`（注册）、`SRC/zx279128s-accel.c:3816-4017`（切换）、`:2130-2135` 与 `SRC/zx279128s-main.c:4166-4175`（只认 ffe） |
+| 2 | `echo 0 > .../ffe_learn` | 是 | 是 | **否**：只停"学新流"，已有条目照常转发到老化 | `SRC/zx279128s-accel.c:5392` 的注释原文、`:5525-5538` 写口 |
+| 3 | `echo 1 > .../ffe_flush` | 是 | 是 | **否**：一次性清表；学习开着会立刻重学 | `SRC/zx279128s-accel.c:5141-5190`、`:783` `__zx_ffe_flush()` |
+| 4 | `echo 0 > .../accel_autofallback` | 是 | 是 | **否**：只在 drop>0.1% 或 fallback>50% 持续 10 s 时降级 | `SRC/zx279128s-main.c:128-132`、`:6217` |
+| 5 | `echo 0 > /sys/module/zx279128s_eth/parameters/accel_v6` | **否**（0644 但无回调，probe 读一次） | 否 | 只能开机前传参 | `SRC/zx279128s-main.c:118-124`（默认值）、`:6347-6354`（只有 probe 写模式字段） |
+| 6 | `ffe_aging`（sysfs 0644 / debugfs） | 是 | 下一拍老化判定 | 否：只改老化时间；0 = 永不老化，方向上更危险 | `SRC/zx279128s-accel.c:232-234`、`:5338-5376` |
 | 7 | `learn_delay_ms` | 否（0444） | — | 否 | `SRC/zx279128s-accel.c:261-263` |
 | 8 | uci 配置 | — | — | **不存在**加速模式开关；`BASE/etc/uci-defaults/61_e2631_config:8-11` 明确写"驱动 debugfs 拥有它" | 同左 |
 | 9 | init 脚本 | — | — | `zx_ffe_coalesce` 只写 RX 合并/NAPI 三个参数，不碰模式 | `BASE/etc/init.d/zx_ffe_coalesce:47`、`:116-166` |
@@ -56,15 +56,15 @@ evidence: overlay/target/linux/sanechips/files/drivers/net/ethernet/zte/zx279128
 结论：**不需要改内核**。第 1 行就是现成的运行期总开关，守卫只调它。
 
 注意 IPv4 的 PPE 硬件 offload **不归 `accel_ipv4` 管**：`hw` 模式的语义只是"放行
-PPE 接管"（`SRC/zx279128s-accel.c:3509-3518` 注释），数据面判据链只在 `ffe` 模式跑
-（`SRC/zx279128s-main.c:3499-3508`）。要关 v4 的硬件 offload 得用 fw4 的
+PPE 接管"（`SRC/zx279128s-accel.c:3854-3863` 注释），数据面判据链只在 `ffe` 模式跑
+（`SRC/zx279128s-main.c:4166-4175`）。要关 v4 的硬件 offload 得用 fw4 的
 `flow_offloading_hw=0`；`accel_ipv6` 第 3 行的 `hint=disable_flow_offloading_hw_to_use_ffe`
-就是这条提示（`SRC/zx279128s-accel.c:4265`）。本守卫默认只守 `families=6`（IPv6 FFE），
+就是这条提示（`SRC/zx279128s-accel.c:4610`）。本守卫默认只守 `families=6`（IPv6 FFE），
 就是交付态 `accel_v6=ffe` 的那一族。
 
 ## §3 守卫的判据（三条，任一成立 = 多 WAN/策略路由态）
 
-实现：`BASE/sbin/e2631-ffe-multiwan`，`detect_reason()` 在 `:187`。
+实现：`BASE/sbin/e2631-ffe-multiwan`，`detect_reason()` 在 `:195`。
 
 | 判据 | 怎么判 | 为什么是这条 |
 |---|---|---|
@@ -84,17 +84,17 @@ PPE 接管"（`SRC/zx279128s-accel.c:3509-3518` 注释），数据面判据链�
 
 ## §4 检测到以后关掉什么、怎么恢复
 
-- **关**：对该族 debugfs 文件写 `stack`（`BASE/sbin/e2631-ffe-multiwan:233` `disengage()`）。
+- **关**：对该族 debugfs 文件写 `stack`（`BASE/sbin/e2631-ffe-multiwan:241` `disengage()`）。
   内核侧一次同步切换：S2 quiesce → S3 排空 TX（≤100 ms）→ S4 **清该族表** →
-  S5 单字节写模式（`SRC/zx279128s-accel.c:3565-3672`）。所以不只是"以后不学"：
-  已经装错的条目在 S4 就被清掉了（`:3604`）。返回时读回第一行自证，不是 stack 就记
-  `user.err` 并在下一拍重试（排空失败走 `:3588` 的 EBUSY 回滚，模式一个字节都不动）。
-- **学**：切换后该族钩子在解析前就返回（`SRC/zx279128s-accel.c:2106-2111`），
+  S5 单字节写模式（`SRC/zx279128s-accel.c:3910-4017`）。所以不只是"以后不学"：
+  已经装错的条目在 S4 就被清掉了（`:3949`）。返回时读回第一行自证，不是 stack 就记
+  `user.err` 并在下一拍重试（排空失败走 `:3933` 的 EBUSY 回滚，模式一个字节都不动）。
+- **学**：切换后该族钩子在解析前就返回（`SRC/zx279128s-accel.c:2130-2135`），
   不会一边 stack 一边偷偷学。
 - **记**：切之前的第一行模式写进 `/tmp/zx_ffe_multiwan.state`（如 `6 ffe`）；只记
   本守卫自己改的那一次。重启 `/tmp` 清空，驱动按 `module_param` 起，守卫再判一次。
 - **恢复**：三条判据全不成立后，先等 `hold_seconds`（默认 300 s，`restore_all()` 在
-  `:255`）再写回记下的模式；窗口内又检测到多 WAN 就取消倒计时。写回前先看当前模式，
+  `:263`）再写回记下的模式；窗口内又检测到多 WAN 就取消倒计时。写回前先看当前模式，
   如果已经被用户/别的脚本改成非 stack，就**不覆盖**、只清记录。
 - **用户关守卫**：`/etc/config/zx_ffe` 的 `multiwan.enabled=0` ⇒ 立刻写回（不等 hold），
   之后两条触发路径（hotplug 与轮询）都跳过。
@@ -118,7 +118,7 @@ PPE 接管"（`SRC/zx279128s-accel.c:3509-3518` 注释），数据面判据链�
 学习开关一个都没动，因此和没有这个服务时逐字节相同（新增的只有用户态读操作）。
 
 - 代码路径：`detect_reason()` 返回空串 ⇒ `restore_all()`，`/tmp/zx_ffe_multiwan.state`
-  不存在就 `return 0`（`BASE/sbin/e2631-ffe-multiwan:257-260`），**没有任何写**。
+  不存在就 `return 0`（`BASE/sbin/e2631-ffe-multiwan:265-268`），**没有任何写**。
 - 离线自检：`bash test-guard.sh` 的 `t_single_wan_does_nothing` 连跑 3 次 `apply`，
   断言 v6 仍 `ffe`、v4 仍 `hw`、无状态文件、无倒计时、syslog 一条都没写。
   原始输出（本轮）：`artifacts/test-guard.log`，末行 `RESULT: PASS (15/15)`。
@@ -164,29 +164,29 @@ echo ffe > /sys/kernel/debug/92000000.ethernet/accel_ipv6   # 先 enabled=0，�
 1. procd 是否按 `START=99` 把 `watch` 拉起来、`respawn` 行为是否符合预期 —— 未在设备上
    `ps`/`logread` 验证。
 2. hotplug 上下文里写 debugfs 是否成功 —— 未验证（同类"hotplug 里调 init.d 会静默
-   失败"的坑见 `BASE/etc/hotplug.d/iface/20-e2631-netune:14-16`）。
+   失败"的坑见 `BASE/etc/hotplug.d/iface/20-e2631-netune:15-17`）。
 3. 目标镜像的 busybox `ip` 是否编进 `rule` applet（没有的话判据 `policy-rule` 失效，
    只剩 `multi-default` 与 `mwan3` 两条）—— 未验证。
-4. `zx_accel_set(STACK)` 在满速链路上排空 TX 失败（`SRC/zx279128s-accel.c:3588` 的
+4. `zx_accel_set(STACK)` 在满速链路上排空 TX 失败（`SRC/zx279128s-accel.c:3933` 的
    EBUSY）时守卫会重试，但"重试用多久能成功"没有实测。
 5. IPv4 的 PPE 硬件 offload 黑障不在本守卫覆盖范围内（见 §2 末），没有动
    `flow_offloading_hw`。
 
 ## §9 证据索引
 
-- 快路条目/学习/老化：`SRC/zx279128s-accel.c:224`、`:232`、`:1542`、`:2070-2200`、
-  `:4220`。
-- 运行期总开关：`SRC/zx279128s-main.c:4969-4985`（debugfs 目录与两个文件）、
-  `SRC/zx279128s-accel.c:3471-3672`（S0-S7 同步切换）、`:3588`（排空失败回滚）、
-  `:3604`（切表清表）、`:3615`（单字节写模式）。
-- 只认 ffe：`SRC/zx279128s-accel.c:2106-2111`、`SRC/zx279128s-main.c:3499-3508`。
-- 不是总开关的那些：`SRC/zx279128s-accel.c:5047`（`ffe_learn=0` 的语义）、
-  `SRC/zx279128s-main.c:5121-5128`（module_param 只 probe 读）、
-  `SRC/zx279128s-accel.c:4265`（PPE hint）。
-- 守卫实现：`BASE/sbin/e2631-ffe-multiwan:128`（PPPoE 折叠）、`:144`（判据 a）、`:156`（判据 b）、
-  `:174`（判据 c）、`:233`（关）、`:255`（恢复）、`:305`（单次 apply）、`:351`（轮询）。
+- 快路条目/学习/老化：`SRC/zx279128s-accel.c:224`、`:232`、`:1566`、`:2094-2224`、
+  `:4565`。
+- 运行期总开关：`SRC/zx279128s-main.c:6184-6200`（debugfs 目录与两个文件）、
+  `SRC/zx279128s-accel.c:3816-4017`（S0-S7 同步切换）、`:3933`（排空失败回滚）、
+  `:3949`（切表清表）、`:3960`（单字节写模式）。
+- 只认 ffe：`SRC/zx279128s-accel.c:2130-2135`、`SRC/zx279128s-main.c:4166-4175`。
+- 不是总开关的那些：`SRC/zx279128s-accel.c:5392`（`ffe_learn=0` 的语义）、
+  `SRC/zx279128s-main.c:6347-6354`（module_param 只 probe 读）、
+  `SRC/zx279128s-accel.c:4610`（PPE hint）。
+- 守卫实现：`BASE/sbin/e2631-ffe-multiwan:128`（PPPoE 折叠）、`:151`（判据 a）、`:163`（判据 b）、
+  `:182`（判据 c）、`:241`（关）、`:263`（恢复）、`:313`（单次 apply）、`:359`（轮询）。
 - 触发与服务：`BASE/etc/hotplug.d/iface/30-zx_ffe_multiwan:11`、
-  `BASE/etc/init.d/zx_ffe_multiwan:33-52`、`BASE/etc/config/zx_ffe:28-46`。
+  `BASE/etc/init.d/zx_ffe_multiwan:31-52`、`BASE/etc/config/zx_ffe:35-53`。
 - 离线自检：`.scratch/ffe-fastpath/multiwan-safety/20261104-1240/test-guard.sh` 与
   同目录 `artifacts/test-guard.log`。
 - 相关限制（不在本守卫覆盖范围内）：NPTv6 / NAT66 结构性进不了硬件加速，多 WAN 的 v6
