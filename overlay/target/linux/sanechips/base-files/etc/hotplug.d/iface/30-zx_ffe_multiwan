@@ -1,0 +1,12 @@
+#!/bin/sh
+# 多 WAN / 策略路由守卫的即时触发口：接口状态一变就重评一次，不用等 watch 循环
+# 的 5 s 兜底。判据、恢复办法与"为什么必须重评"见
+# /sbin/e2631-ffe-multiwan 的文件头，以及 docs/operations/multiwan-ffe-safety.md。
+#
+# hotplug-call 是普通进程上下文，直接写 debugfs 是允许的（对比：这个上下文里
+# 调 /etc/init.d 会静默失败，见同目录 20-e2631-netune 的说明）。守卫自己带锁，
+# 与 watch 循环撞上时后到的那个直接退出，最多晚一拍。
+[ "$ACTION" = ifup ] || [ "$ACTION" = ifdown ] || [ "$ACTION" = ifupdate ] || exit 0
+[ -x /sbin/e2631-ffe-multiwan ] || exit 0
+/sbin/e2631-ffe-multiwan apply >/dev/null 2>&1
+exit 0

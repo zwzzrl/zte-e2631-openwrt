@@ -1,0 +1,383 @@
+#!/bin/sh
+# e2631-ffe-multiwan —— 多 WAN / 策略路由时自动关掉 FFE 快路（fail-safe）
+#
+# 为什么要有它：FFE 条目里只有"出口端口 + 下一跳 MAC"，没有"这条 WAN 现在
+# 是否存活"这个概念。多 WAN（mwan3 / ip rule 策略路由）把内核路由切走以后，
+# 内核改走新出口，硬件条目仍按旧出口转发 ⇒ 流量静默进黑洞，要等 ffe_aging
+# （默认 300 s）或人工 ffe_flush 才恢复。本脚本检测到多 WAN/策略路由就把该族
+# 的 accel 模式写成 stack（纯软件转发），并在每次网络变化后重新评估。
+#
+# 怎么关：写 debugfs 的 accel_ipvN = stack。这是运行期、同步、不用重载模块的
+# 唯一整体开关（zx_accel_set()：排空 TX → 清该族表 → 单字节切模式，
+# zx279128s-accel.c:3471-3628）。ffe_learn=0 只停"学新流"，已有条目照常转发
+# 到老化（zx279128s-accel.c:5047），不能当关快路用；accel_v6/accel_v4 这两个
+# module_param 是 probe-only（zx279128s-main.c:5121-5128），运行期写也不生效。
+#
+# 判据（任一成立 = 多 WAN/策略路由态；三条都只看"现在能不能换出口"）：
+#   multi-default  主路由表默认路由的出口设备 ≥2 个（v4+v6 合看）。
+#                  同一出口上的多条 default（多 metric / v4+v6 各一条）不算：
+#                  内核没有第二个出口可切，FFE 条目不会指向别的口。
+#   policy-rule    v4 或 v6 存在**带 lookup 的非基线** ip rule（基线 = 0/local、32766/main、32767/default）
+#                  才算；无 lookup 的丢弃型（failed_policy、unreachable、blackhole）只丢包不选表，不计入。mwan3 的 fwmark 带 lookup，就落这里。
+#   mwan3          /etc/config/mwan3 里启用（enabled 不为 0）的接口 ≥2 个。
+#                  mwan3 配了多接口但当前只有一个 default 时，这条仍成立。
+#
+# 重新评估的时机（不能只判一次）：
+#   - /etc/hotplug.d/iface/30-zx_ffe_multiwan：ifup/ifdown/ifupdate 立刻 apply；
+#   - /etc/init.d/zx_ffe_multiwan 的 watch 循环：每 poll_interval 秒 apply 一次，
+#     兜住"没有 ifup 的路由/规则变化"（mwan3 改表、手工 ip rule、metric 变）。
+#
+# 恢复：判据全部不成立后，再等 hold_seconds（默认 300 s，给 failover/failback
+# 留窗口）才写回检测前的模式；这段窗口里保持 stack。检测到多 WAN 立刻取消失
+# 恢复倒计时。记下的"检测前模式"在 state 文件里（默认 /tmp），重启清空 —— 重启
+# 后驱动自己按 module_param 起，守卫再判一次。
+#
+# 手动恢复/绕过/彻底关掉守卫：见 docs/operations/multiwan-ffe-safety.md。
+#
+# 测试口（只在离线自检时用，设备上不需要设置）：
+#   ZX_FFE_DEBUGFS     假 debugfs 根（默认 /sys/kernel/debug）
+#   ZX_FFE_TMP         放 state/hold/lock 的目录（默认 /tmp）
+#   ZX_FFE_MWAN3_CONF  mwan3 配置文件（默认 /etc/config/mwan3）
+#
+# 退出码：0 = 正常（包括"驱动不在/没东西可做"）；2 = 用法错。
+set -u
+
+TAG=zx_ffe_multiwan
+DEBUGFS=${ZX_FFE_DEBUGFS:-/sys/kernel/debug}
+TMP=${ZX_FFE_TMP:-/tmp}
+MWAN3_CONF=${ZX_FFE_MWAN3_CONF:-/etc/config/mwan3}
+STATE=$TMP/zx_ffe_multiwan.state
+HOLD=$TMP/zx_ffe_multiwan.hold
+LOCK=$TMP/zx_ffe_multiwan.lock
+
+log()     { logger -t "$TAG" "$*" 2>/dev/null; }
+log_err() { logger -t "$TAG" -p user.err "$*" 2>/dev/null; }
+
+now_s() { cut -d. -f1 /proc/uptime 2>/dev/null || echo 0; }
+
+# 取 uci 值；没配 / 读不到 = 默认值
+cfg_get() {
+	local v
+	v=$(uci -q get "zx_ffe.multiwan.$1" 2>/dev/null)
+	[ -n "$v" ] || v=$2
+	printf '%s\n' "$v"
+}
+
+# 要守的协议族（空白分隔，合法值 4/6）；配置写坏了退回 "6"
+families() {
+	local f out=""
+	for f in $(cfg_get families "6"); do
+		case "$f" in
+		4|6) out="$out $f" ;;
+		esac
+	done
+	[ -n "$out" ] || out=" 6"
+	printf '%s\n' "${out# }"
+}
+
+# 该族的 debugfs 文件；驱动不在就返回 1（目录名 92000000.ethernet 由 DTS 决定，
+# 这里不写死，按 *.ethernet 找）
+accel_file() {
+	local f
+	for f in "$DEBUGFS"/*.ethernet/accel_ipv"$1"; do
+		[ -f "$f" ] && {
+			printf '%s\n' "$f"
+			return 0
+		}
+	done
+	return 1
+}
+
+mode_of() { head -n 1 "$1" 2>/dev/null; }
+
+# 写模式并读回自证。返回非零 = 没生效（含驱动 EBUSY 拒绝：那一刻模式没变）
+write_mode() {
+	local f=$1 want=$2 got
+	printf '%s\n' "$want" >"$f" 2>/dev/null || return 1
+	got=$(mode_of "$f")
+	[ "$got" = "$want" ]
+}
+
+state_get() {
+	local fam=$1
+	[ -f "$STATE" ] || return 1
+	awk -v f="$fam" '$1 == f { print $2; found = 1 } END { exit !found }' "$STATE"
+}
+
+state_set() {
+	local fam=$1 prev=$2 tmp="$STATE.$$"
+	{
+		[ -f "$STATE" ] && awk -v f="$fam" '$1 != f' "$STATE"
+		printf '%s %s\n' "$fam" "$prev"
+	} >"$tmp" || return 1
+	mv "$tmp" "$STATE"
+}
+
+state_del() {
+	local fam=$1 tmp="$STATE.$$"
+	[ -f "$STATE" ] || return 0
+	awk -v f="$fam" '$1 != f' "$STATE" >"$tmp" || return 1
+	mv "$tmp" "$STATE"
+	[ -s "$STATE" ] || rm -f "$STATE"
+	return 0
+}
+
+# 逻辑口折叠：PPPoE 的 pppoe-<iface> 和 uci network.<iface>.device 是同一个上行。
+# 不折叠的话，"v4 走 pppoe-wan、v6 的 RA 落在 wan"这种单 WAN 双栈会被判成两个出口
+# （误关快路）。真实多 WAN 的两个 PPPoE 口会折成两个不同的物理口，判据不变。
+collapse_dev() {
+	local phys
+	case "$1" in
+	pppoe-*)
+		phys=$(uci -q get "network.${1#pppoe-}.device" 2>/dev/null)
+		[ -n "$phys" ] || phys=$(uci -q get "network.${1#pppoe-}.ifname" 2>/dev/null)
+		[ -n "$phys" ] && {
+			printf '%s\n' "$phys"
+			return
+		}
+		;;
+	esac
+	printf '%s\n' "$1"
+}
+
+# 判据 (a)：主表默认路由的出口设备集合 ≥2（v4+v6 合看；按 dev 去重）
+#
+# 一行里可能有**多个** dev：同 metric 的双 default 被内核合成 multipath 时，
+# `ip route show default` 输出成
+#   default proto static ... nexthop via A dev eth0 weight 1 nexthop via B dev eth1 ...
+# 只取每行第一个 dev 会漏掉第二个出口，判据 (a) 就失效（真·多 WAN 被判成
+# 单 WAN，快路不关）。所以这里把行内**所有** "dev <name>" 都列出来，交给
+# 下面逐行 collapse + sort -u 去重；单 WAN 仍然只有一个 dev，行为不变。
+default_devices() {
+	{
+		ip -4 route show default 2>/dev/null
+		ip -6 route show default 2>/dev/null
+	} | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1) }' |
+		while read -r d; do
+			[ -n "$d" ] && collapse_dev "$d"
+		done | sort -u
+}
+
+# 判据 (b)：**带 `lookup` 的非基线** ip rule 才算策略路由；无 `lookup` 的是丢弃型规则——netifd `failed_policy`（interface-ip.c:1866-1867）、内核 `unreachable`/`blackhole`（fib6_rules.c:228-231 的 FR_ACT_POLICY_FAILED ⇒ discard；PD 的 unreachable 见 interface-ip.c:1125-1126）：只丢包、不选表、不改出口，不是多出口策略路由 ⇒ **不计入**。
+# 基线三条 `0: … lookup local` / `32766: … lookup main` / `32767: … lookup default` 由内核自带，先排除；mwan3 的 `fwmark … lookup N` 带 lookup，照旧计入。输出命中的规则（v4+v6 各一次；同一行出现两次不影响判断）。
+extra_rules() {
+	{
+		ip -4 rule show 2>/dev/null
+		ip -6 rule show 2>/dev/null
+	} | awk '
+		/^[0-9]+:/ {
+			prio = $1; sub(/:.*/, "", prio)
+			look = ""
+			for (i = 2; i <= NF; i++) if ($i == "lookup") look = $(i + 1)
+			# 无 lookup = 丢弃型规则（netifd failed_policy、内核 unreachable/blackhole）：不选表、不改出口，不是多出口策略路由 ⇒ 不计入（interface-ip.c:1866-1867、fib6_rules.c:228-231，2026-11-04 核）
+			if (look == "") next
+			if (prio == 0     && look == "local")   next
+			if (prio == 32766 && look == "main")    next
+			if (prio == 32767 && look == "default") next
+			print
+		}'
+}
+
+# 判据 (c)：mwan3 配置里启用的接口名（≥2 个才输出）。enabled 缺省 = 1（mwan3 默认）。
+mwan3_enabled_ifaces() {
+	local s n=0 names=""
+	[ -f "$MWAN3_CONF" ] || return 0
+	for s in $(uci -q show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([^.]*\)=interface$/\1/p'); do
+		[ "$(uci -q get "mwan3.$s.enabled" 2>/dev/null)" = 0 ] && continue
+		n=$((n + 1))
+		names="$names $s"
+	done
+	[ "$n" -ge 2 ] && printf '%s\n' "${names# }"
+	return 0
+}
+
+# 输出判据说明；空串 = 单 WAN 基线（不动快路）。判据全在，才敢说"不是多 WAN"。
+detect_reason() {
+	local reason="" devs n rules mw
+
+	devs=$(default_devices)
+	n=$(printf '%s\n' "$devs" | sed '/^$/d' | wc -l)
+	[ "${n:-0}" -ge 2 ] && reason="$reason multi-default[$(printf '%s' "$devs" | tr '\n' ' ')]"
+
+	rules=$(extra_rules | head -n 3)
+	[ -n "$rules" ] && reason="$reason policy-rule[$(printf '%s' "$rules" | tr '\n' ';')]"
+
+	mw=$(mwan3_enabled_ifaces)
+	[ -n "$mw" ] && reason="$reason mwan3[$(printf '%s' "$mw" | tr ' ' ',')]"
+
+	printf '%s\n' "${reason# }"
+}
+
+# 只在 DEBUGFS 是真实路径时兜底挂 debugfs；测试用假目录时不动
+ensure_debugfs() {
+	[ "$DEBUGFS" = /sys/kernel/debug ] || return 0
+	[ -d /sys/kernel/debug ] || mkdir -p /sys/kernel/debug 2>/dev/null
+	grep -q ' /sys/kernel/debug ' /proc/mounts 2>/dev/null ||
+		mount -t debugfs none /sys/kernel/debug 2>/dev/null
+	return 0
+}
+
+unlock() {
+	rm -f "$LOCK/pid" 2>/dev/null
+	rmdir "$LOCK" 2>/dev/null
+	return 0
+}
+
+# 单次尝试的锁：抢不到就退出（另一拍/另一个 hotplug 正在做同样的事，5 s 内还会有
+# 下一拍）。超过 1 分钟的锁目录当残留清掉（进程被 SIGKILL 才会留下）。
+lock() {
+	if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -mmin +1 2>/dev/null)" ]; then
+		rm -f "$LOCK/pid" 2>/dev/null
+		rmdir "$LOCK" 2>/dev/null
+	fi
+	mkdir "$LOCK" 2>/dev/null || return 1
+	printf '%s\n' "$$" >"$LOCK/pid" 2>/dev/null
+	trap 'unlock' EXIT
+	trap 'unlock; exit 0' INT TERM
+	return 0
+}
+
+# 检测到多 WAN：把该族切 stack，并记下切换前的模式（只记第一次）
+disengage() {
+	local reason=$1 fam f cur prev changed=""
+	rm -f "$HOLD"
+	for fam in $(families); do
+		f=$(accel_file "$fam") || continue
+		cur=$(mode_of "$f")
+		[ "$cur" = stack ] && continue
+		if write_mode "$f" stack; then
+			prev=$(state_get "$fam" 2>/dev/null || true)
+			[ -n "$prev" ] || state_set "$fam" "$cur"
+			changed="$changed v$fam($cur->stack)"
+		else
+			log_err "多WAN/策略路由($reason) 但 v$fam 写 stack 失败（当前 $(mode_of "$f")）；下一拍重试，期间快路仍可能黑洞"
+		fi
+	done
+	[ -n "$changed" ] &&
+		log "多WAN/策略路由($reason) ⇒ FFE 已关:$changed（恢复办法见 docs/operations/multiwan-ffe-safety.md）"
+	return 0
+}
+
+# 判据全不成立：等满 hold_seconds 再写回检测前的模式。
+# force=1 跳过倒计时（用户显式关掉守卫时用）。
+restore_all() {
+	local force=${1:-0} fam prev f cur changed="" hold_s hold_until now
+	[ -f "$STATE" ] || {
+		rm -f "$HOLD"
+		return 0
+	}
+
+	hold_s=$(cfg_get hold_seconds 300)
+	case "$hold_s" in
+	''|*[!0-9]*) hold_s=300 ;;
+	esac
+	now=$(now_s)
+	if [ "$force" != 1 ] && [ "$hold_s" -gt 0 ]; then
+		hold_until=$(cat "$HOLD" 2>/dev/null)
+		if [ -z "$hold_until" ]; then
+			printf '%s\n' "$((now + hold_s))" >"$HOLD"
+			return 0
+		fi
+		[ "$now" -ge "$hold_until" ] 2>/dev/null || return 0
+	fi
+	rm -f "$HOLD"
+
+	# 用 STATE 里的族恢复，不用当前 families：改过配置也能收尾
+	while read -r fam prev; do
+		case "$fam" in
+		4|6) ;;
+		*) continue ;;
+		esac
+		f=$(accel_file "$fam") || {
+			state_del "$fam"
+			continue
+		}
+		cur=$(mode_of "$f")
+		if [ "$cur" = stack ]; then
+			if write_mode "$f" "$prev"; then
+				state_del "$fam"
+				changed="$changed v$fam(stack->$prev)"
+			else
+				log_err "v$fam 恢复 $prev 失败（当前 $(mode_of "$f")）；下一拍重试"
+			fi
+		else
+			# 别的东西已经改过模式：尊重它，不再回写
+			state_del "$fam"
+		fi
+	done <"$STATE"
+	[ -n "$changed" ] && log "多WAN/策略路由已解除并稳定超过 ${hold_s}s ⇒ FFE 恢复:$changed"
+	[ -s "$STATE" ] || rm -f "$STATE"
+	return 0
+}
+
+apply_once() {
+	local reason
+	ensure_debugfs
+	lock || return 0
+	if [ "$(cfg_get enabled 1)" != 1 ]; then
+		restore_all 1
+		unlock
+		return 0
+	fi
+	reason=$(detect_reason)
+	if [ -n "$reason" ]; then
+		disengage "$reason"
+	else
+		restore_all 0
+	fi
+	unlock
+	return 0
+}
+
+status_cmd() {
+	local reason fam f
+	reason=$(detect_reason)
+	if [ -n "$reason" ]; then
+		printf 'state=multiwan reason=%s\n' "$reason"
+	else
+		printf 'state=single-wan reason=none\n'
+	fi
+	for fam in $(families); do
+		if f=$(accel_file "$fam"); then
+			printf 'v%s path=%s mode=%s\n' "$fam" "$f" "$(mode_of "$f")"
+		else
+			printf 'v%s path=absent mode=-\n' "$fam"
+		fi
+	done
+	printf 'guard_enabled=%s families=%s poll_interval=%s hold_seconds=%s\n' \
+		"$(cfg_get enabled 1)" "$(families)" \
+		"$(cfg_get poll_interval 5)" "$(cfg_get hold_seconds 300)"
+	[ -f "$STATE" ] && {
+		printf 'saved_state:\n'
+		sed 's/^/  v/' "$STATE"
+	}
+	[ -f "$HOLD" ] &&
+		printf 'restore_hold_until_uptime=%s now=%s\n' "$(cat "$HOLD")" "$(now_s)"
+	return 0
+}
+
+watch_cmd() {
+	local interval
+	trap 'exit 0' INT TERM
+	ensure_debugfs
+	while :; do
+		apply_once
+		interval=$(cfg_get poll_interval 5)
+		case "$interval" in
+		''|*[!0-9]*) interval=5 ;;
+		esac
+		[ "$interval" -ge 1 ] && [ "$interval" -le 60 ] || interval=5
+		sleep "$interval"
+	done
+}
+
+case "${1:-status}" in
+status) status_cmd ;;
+apply) apply_once ;;
+watch) watch_cmd ;;
+*)
+	echo "usage: $0 status|apply|watch" >&2
+	exit 2
+	;;
+esac
+exit 0

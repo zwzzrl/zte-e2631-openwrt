@@ -1,0 +1,52 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/zx_ffe_multiwan —— 多 WAN / 策略路由时自动关 FFE 快路的守卫
+#
+# 为什么要有它：FFE 硬件条目不知道 WAN 是否还活着。多 WAN 一切换路由，旧条目
+# 仍按旧出口转发 ⇒ 流量静默进黑洞，要等 ffe_aging（默认 300 s）才恢复。守卫
+# 检测到多 WAN/策略路由就把 debugfs 的 accel_ipvN 写成 stack，退回纯软件转发；
+# 判据与恢复办法见 /sbin/e2631-ffe-multiwan 的文件头与
+# docs/operations/multiwan-ffe-safety.md。
+#
+# 为什么要常驻：需求是"每次网络变化都重评"，不能只在开机判一次。
+#   - /etc/hotplug.d/iface/30-zx_ffe_multiwan 在 ifup/ifdown/ifupdate 时立刻 apply；
+#   - 这里的 watch 循环每 poll_interval 秒 apply 一次，兜住没有 ifup 的变化
+#     （mwan3 改路由表、手工 ip rule、metric 变）。5 s 是默认值，可在
+#     /etc/config/zx_ffe 的 multiwan 段改 1..60。
+#
+# 单 WAN 拓扑下这个服务只读不写：判据全不成立 ⇒ 一次 accel_* 写都没有，快路
+# 行为与没有这个服务时逐字节相同（理由与自检见上面那篇文档）。
+#
+# 启动时机：START=99。驱动 probe 后默认 learn_delay_ms=120000（2 分钟）才自动
+# 开学习，S99 远早于它，所以多 WAN 机器不会在守卫判完之前先学出一批条目。
+#
+# 开关：
+#   /etc/init.d/zx_ffe_multiwan start|stop|restart|reload
+#   uci set zx_ffe.multiwan.enabled=0; uci commit zx_ffe   # 关守卫并写回原模式
+#
+# 日志：logread -t zx_ffe_multiwan
+#
+# 失败口径：驱动没加载（accel_ipvN 不存在）⇒ 什么都不写，下一拍再看；写 stack
+# 被 EBUSY 拒绝（TX 排不空，zx279128s-accel.c:3588）⇒ 记 user.err，下一拍重试。
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /sbin/e2631-ffe-multiwan watch
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
+
+# reload：立刻按当前配置评估一次（watch 循环下一拍也会读到新配置）
+reload_service() {
+	/sbin/e2631-ffe-multiwan apply
+}
+
+stop_service() { :; }
+
+service_triggers() {
+	procd_add_reload_trigger "zx_ffe"
+}
+
+boot() { start; }
