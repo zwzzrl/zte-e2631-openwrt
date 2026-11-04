@@ -1061,7 +1061,7 @@ points at something in the repository or at a measurement.
   severity: minor
   status: open
   surface: rx / performance
-  symptom: with rx_split=1 but no CLA table 7 programmer, sub-ring 1 stays empty - the extra NAPI polls nothing and the split buys nothing. With the CLA table programmed, the harmful state is the **分环 + `napi1` 组合态**（多一条 threaded NAPI）—— single-stream `-R` arm 916.29 -> 709.21 Mbit/s = **−22.60 %**（`-R` 臂，剔除异常点 −22.89 %）；**因果未分离**：无 A/B/A 交错（基线全在前、分环全在后）、回退只 2 点、未测 `rx_split=Y` + trap 全 0 ⇒ 只能说"分环 + `napi1` 组合态有害"，不能说"流量分环本身有害/负收益"。See docs/operations/bench-and-build.md section 7.4.
+  symptom: with rx_split=1 but no CLA table 7 programmer, sub-ring 1 stays empty - the extra NAPI polls nothing and the split buys nothing. With the CLA table programmed, the **分环 + `napi1` 组合态**（多一条 threaded NAPI）is harmful **on single-stream `-R`**: 916.29 -> 709.21 Mbit/s = **−22.60 %**（`-R` 臂，剔除异常点 −22.89 %）；**双向（方式 A）只有 −4.50 %**（A 中位 851.70 vs B 中位 813.35），落在 **±5–6 %** 台架分辨率内（`$H/modeA-split-abab/20261104-2345/RESULT.md` §2）⇒ 双向只能说"**未观察到提升**"，不能判"有害"；**因果未分离**：无 A/B/A 交错（基线全在前、分环全在后）、回退只 2 点、未测 `rx_split=Y` + trap 全 0 ⇒ 只能说"分环 + `napi1` 组合态在单流 `-R` 上有害"，不能说"流量分环本身有害/负收益"。See docs/operations/bench-and-build.md section 7.4.
   verified: |
     2026-11-04 真机已验证（失败）：e2631-rxsplit start 与 stop 均 rc=1；start 在 trap0 回滚、
     stop 只清 trap 0..15（0x110/0x17f 残留）。原因：verify_trap 把 0x18 bit0=1（idle）当 busy
@@ -1071,7 +1071,8 @@ points at something in the repository or at a measurement.
     two facts, do not merge: (1) the script defect is PROVEN - verify_trap's polarity is inverted, so
     start rolls back at trap 0 and stop clears only 0..15; (2) the split's throughput benefit was not
     demonstrated, and what is harmful is the **分环 + `napi1` 组合态** on single-stream `-R`
-    （**−22.60 %**；`-R` 臂，剔除异常点 −22.89 %）。**因果未分离**：无 A/B/A 交错（基线全在前、
+    （**−22.60 %**；`-R` 臂，剔除异常点 −22.89 %）。**双向（方式 A）只有 −4.50 %**（851.70→813.35；`$H/modeA-split-abab/20261104-2345/RESULT.md` §2），
+    落在 ±5–6 % 内 ⇒ 双向"未观察到提升"，不判有害。**因果未分离**：无 A/B/A 交错（基线全在前、
     分环全在后）、回退只 2 点、未测 `rx_split=Y` + trap 全 0 ⇒ 不能说"流量分环本身有害/负收益"。
     The defect is being fixed; the feature stays off (rx_split default N) regardless of that fix.
   workaround: |
@@ -2073,13 +2074,15 @@ v6 流即使命中硬件条目也拿不到加速；换任何驱动开关或镜�
 但反向流照样全落 `rxq0`——子环 1 一直是空的，拆分等于白建一条轮不到的 NAPI。不丢帧，也不会报任何
 错误，所以最容易被当成"split 没用"。
 
-> **注意"白建"≠"中性"**：一旦 CLA 真写对，有害的是**分环 + `napi1`（多一条 threaded NAPI）组合态**，
+> **注意"白建"≠"中性"**：一旦 CLA 真写对，**在单流 `-R` 上**有害的是**分环 + `napi1`（多一条 threaded NAPI）组合态**，
 > 不是"流量分环本身"——单流 `-R` 臂 **916.29 → 709.21 Mbit/s（−22.60 %；剔除异常点 −22.89 %）**，
-> 共享 RX 中断放大 6.4×，`rx_split` 因此**保持默认 `N`**。**因果未分离**：无 A/B/A 交错（基线全在前、
-> 分环全在后）、回退只 2 点、未测 `rx_split=Y` + trap 全 0 ⇒ 只能说"分环 + `napi1` 组合态有害"，
+> 共享 RX 中断放大 6.4×，`rx_split` 因此**保持默认 `N`**。**双向（方式 A）只有 −4.50 %**（851.70→813.35），
+> 落在 **±5–6 %** 内 ⇒ 双向只能说"**未观察到提升**"，不能判"有害"。**因果未分离**：无 A/B/A 交错（基线全在前、
+> 分环全在后）、回退只 2 点、未测 `rx_split=Y` + trap 全 0 ⇒ 只能说"分环 + `napi1` 组合态在单流 `-R` 上有害"，
 > 不能说"流量分环本身有害/负收益"。
-> 实测、判据与回退步骤见 `docs/operations/bench-and-build.md` §7.4（数字来源
-> `.scratch/ffe-fastpath/rx-split-onbox/20261104-2050/RESULT.md`）。
+> 实测、判据与回退步骤见 `docs/operations/bench-and-build.md` §7.4（−22.60 % 来源
+> `.scratch/ffe-fastpath/rx-split-onbox/20261104-2050/RESULT.md`；−4.50 % 来源
+> `.scratch/ffe-fastpath/modeA-split-abab/20261104-2345/RESULT.md` §2）。
 
 **根因**：驱动侧补丁只在 `rx_split=1` 时多建一条 threaded NAPI 专扫 q1，**一个 CLA
 寄存器都不碰**（`zx279128s-main.c:1009-1012`）；帧进哪条子环由 CLA 表 7 的 trap→qid
