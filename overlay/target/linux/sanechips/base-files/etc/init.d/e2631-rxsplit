@@ -1,0 +1,371 @@
+#!/bin/sh /etc/rc.common
+# e2631-rxsplit —— RXSPLIT_FORCE=1 时把 CLA 表 7 的 block1 128 个 trap 写成 qid=1
+#
+# ===== 实测结论（2026-11-04 真机 A/B，3 轮 60 s 中位数）：分环永不默认开 =====
+#   --bidir -P8 : 937.75 -> 907.10 Mbit/s（-3.27 %，3 轮区间不重叠）
+#   单流 -R     : 916.29 -> 709.21 Mbit/s（-22.60 %）
+# 判据是"有害"，不是"无收益"：所以 rx_split 默认恒 0，本脚本 start() 默认只打印拒绝、
+# 一个寄存器都不写（return 0，避免开机脚本报错）。只有显式 RXSPLIT_FORCE=1 才走写入。
+# 证据：.scratch/ffe-fastpath/rx-split-onbox/20261104-2050/RESULT.md §0/§1
+#       .scratch/ffe-fastpath/rx-split-onbox/20261104-2050/logs/summary-table.csv
+#
+# ===== 两处历史缺陷（ae370da7 真机实测；本版已修）=====
+# 1) verify_trap 的 0x18 极性写反：驱动语义 status bit0=1 是 idle/ready
+#    （zx279128s-eth.h:176-177 原文 "status bit 0 = idle"；zx279128s-ppe.c:690-694
+#    zx_pp_wait() 就是 readl_poll_timeout(..., val & 1, ...)）。旧脚本把 bit0=1 当
+#    busy 拒收 ⇒ start 恒 rc=1 并在 trap0 回滚；stop 恒 rc=1 且只清了 trap 0..15，
+#    实测 index 0x110 / 0x17f 仍=1 —— lan2 帧继续被导向 ring1，属危险残留。
+# 2) 回退依赖 start 记录的成功范围 ⇒ start 半途失败后 stop 清不干净。本版 stop() 与
+#    start() 的回滚都**无条件**写 block1 全部 128 个 trap（index 0x100..0x17f）再逐条读回。
+#
+# 为什么需要这个用户态脚本：驱动侧补丁只在 rx_split=1 时多建第二条 threaded NAPI
+# （绑 rx_split_cpu=0 即 CPU0）专扫子环 1，**驱动一个 CLA 寄存器都不碰**
+# （zx279128s-main.c:987-996 状态机注释）。帧要真进子环 1，必须由用户态把 CLA 表 7 的
+# trap→qid 映射写下去；否则 rx_split=1 只是让一个空环有人轮询（合法但零收益）。
+#
+# 本板实测（2026-11-04，rx-block-map/20261104-2030/RESULT.md §2/§3）：
+#   - block1（基址 0x100）= lan2 入向，block2（基址 0x180）= lan1 入向；
+#   - 只写 block1 的 128 个 trap = qid1 后，30 s 反向流 rxq1 增量 2,564,422
+#     == lan2 rx 增量（比例 1.0000），四项错误计数增量为 0；
+#   - 8 个 block 的基址（0x080/0x100/0x180/0x200/0x280/0x000/0x300/0x380，每块 128
+#     个，index = base | trap）见 rx-block-map/.../logs/00-index-lists.txt:1-9；
+#     它们依次衔接、互不重叠 ⇒ block1 恰为 0x100..0x17f，清它不碰 block0/2..7。
+#     （表 7 只承载"入向端口→RX 子环"的默认映射；FFE 的流表在 CLA 表 2/3/8，
+#      驱动源码 eth.h:188-192，运行期 hits/flows 与表 7 无关，故清 block1 不影响 FFE。）
+#
+# CLA 写协议（以驱动源码为准，不是口述）：
+#   /sys/module/zx279128s_ppe/parameters/cla_write 的 set 是 zx279128s-ppe.c:2089-2116，
+#   把 "offset=value,..." 解析成最多 8 对（ZX_PPE_CLA_WR_MAX，:2064），在**同一个
+#   ppe_lock 临界区**里按顺序 writel（:2072-2085）。注意：**超过 8 对不报错，第 9 对
+#   起被静默丢弃**（循环条件 :2099）⇒ 一组最多写 4 个 trap（每 trap 两对：0x14=cmd、
+#   0x1c=qid = 8 对），这是硬限制。间接窗口：ZX_PP_IND_CMD=0x14、
+#   ZX_PP_IND_STATUS=0x18、ZX_PP_IND_DATA=0x1c、ZX_PP_IND_READ=BIT(27)
+#   （zx279128s-eth.h:180-186）；表 7 的 table 字段 = 7<<22 = 0x1C00000，
+#   命令 = index | 0x1C00000，data word0 = qid，写 0x1c 即锁存。
+#
+# CLA 读回协议（唯一可信路径）：
+#   cla_write 的 .get 是 param_get_int（ppe.c:2118-2122），读的是从未赋值的静态
+#   storage，**永远返回 0**，不是 word0。真实读回只能：
+#   ① 往 0x14 写 index|0x1C00000|BIT(27)（读方向）；
+#   ② echo 4 > .../parameters/dump（mask bit2 = 只打 CLA 寄存器窗口，ppe.c:2604-2614
+#      → zx_ppe_dump_regs :2002-2016，行格式 "cla-reg 010:"）；
+#   ③ dmesg 里该行的 4 个字 = 寄存器 0x10/0x14/0x18/0x1c：
+#      第 2 字 = 0x14（命令，必须等于本次读命令 ⇒ 证明这次 dump 真发生了，不是旧行）；
+#      第 3 字 = 0x18（status，**bit0=1 = idle/ready**，bit0=0 = busy）；
+#      第 4 字 = 0x1c（word0 = qid，必须等于写入值）。
+#   ⇒ "写成功"的判据是 **0x18 bit0=1（命令完成）+ 0x1c 等于写入值**；status 没有别的
+#   错误位，cla_write 的返回/它打印的 "reads back" 只是寄存器原始回读，不能证明条目锁存。
+#
+# 开关与优先级（本脚本唯一的策略判断）：
+#   0) RXSPLIT_FORCE 必须=1，否则 start 直接拒绝（分环永不默认开，见文件头结论）。
+#   1) /sys/module/zx279128s_eth/parameters/rx_split 是**实际状态**，优先。它的 .get
+#      是 param_get_bool（main.c:1306-1310），cat 出来是 "Y"/"N"，不是 "0"/"1"。
+#   2) 只有实际状态为关时，才看 uci zx_ffe.settings.rx_split（=1 表示"这次开机要开"）；
+#      此时脚本先把 sysfs 写成 1，再写 CLA。
+#   3) 两者都关（默认）⇒ **一个 sysfs 字节都不写，连日志都不留**，直接 return 0。
+#   本脚本不改 rx_split_cpu；绑核目标仍是驱动默认 CPU0（想改先写 rx_split_cpu 再开）。
+#
+# 加载时机：ppe 是 out-of-tree .ko，由 /etc/init.d/e2631-ppe 拉起 /sbin/e2631-ppe-boot，
+# 后者 **sleep 20 s 后**才 modprobe（e2631-ppe-boot:23/48 的 DEFER=20）。START=99 只保证
+# 本脚本在"ppe 启动器"之后，**不保证模块已经在**，所以 start 里用 60 s 上限轮询
+# cla_write 节点；每轮用 `timeout 1 tail -f /dev/null` 等 1 s（本机禁 sleep）。默认被
+# 拒绝时根本不进这个等待，开机不会被拖慢。
+#
+# 失败口径：start 每写 16 个 trap 就逐条读回这 16 个；任一不符（含 dmesg 解析失败）
+# ⇒ 把 block1 **全部 128 个**无条件写 0 并逐条读回确认，logger -p user.err 记一条，
+# start 返回非 0。回滚也失败时日志会明说"可能仍有 lan2 帧被导向 ring1"。
+# stop 不看 rx_split，只要 ppe 在就把 128 个无条件写 0 并逐条读回；核实失败重试**一次**，
+# 仍失败则打印最终 rc 与失败 trap 列表。
+#
+# 幂等：RXSPLIT_FORCE=1 时 start 重复跑只会把同样的 1 再写一遍并读回；stop 重复跑同理
+# 写 0（唯一可见副作用是 dump=4 留在 dmesg 里的 cla-reg 行）。
+# enable/disable 不覆盖，走 rc.common 默认（只增删 /etc/rc.d 自启链接）。
+#
+# 手工回退（三条命令，顺序不能反：先写 0、再读回、最后关 rx_split）：
+#   /etc/init.d/e2631-rxsplit stop
+#   printf '14=09c00100\n' > /sys/module/zx279128s_ppe/parameters/cla_write; \
+#     echo 4 > /sys/module/zx279128s_ppe/parameters/dump; \
+#     dmesg | grep -F 'cla-reg 010:' | tail -1   # 第 3 字 bit0=1、第 4 字 00000000
+#   printf '0\n' > /sys/module/zx279128s_eth/parameters/rx_split
+# （反序也不丢帧——rx_split=0 时 napi0 仍扫 q1——但不要靠这个兜底。）
+#
+# 日志：logread -t e2631-rxsplit
+
+START=99
+
+ETH_PARAM=/sys/module/zx279128s_eth/parameters
+
+# CLA 间接窗口偏移（zx279128s-eth.h:180-186）与表 7 编码
+CLA_CMD_TXT=14		# ZX_PP_IND_CMD  = 0x14
+CLA_DATA_TXT=1c		# ZX_PP_IND_DATA = 0x1c
+CLA_TABLE7=0x1C00000	# table 7 << 22
+CLA_READ=0x8000000	# ZX_PP_IND_READ = BIT(27)
+BLOCK1_BASE=0x100	# block1 = lan2 入向
+TRAPS=128
+BATCH=16		# 每批 16 个 trap，分 4 次写（每次 4 个 = 8 对，驱动上限）
+QID=1
+WAIT_SECS=60
+
+log_info() { logger -t e2631-rxsplit "$*" 2>/dev/null; }
+log_err() { logger -t e2631-rxsplit -p user.err "$*" 2>/dev/null; }
+
+# 实际状态："Y"/"y"/"1"/"on" 都算开（param_get_bool 打 Y/N，kstrtobool 认这四种）
+rx_split_on() {
+	case "$(cat "$ETH_PARAM/rx_split" 2>/dev/null)" in
+	[Yy1]|on|ON) return 0 ;;
+	esac
+	return 1
+}
+
+# 模块名里的连字符会被内核规整成下划线，两种目录都试（与 e2631-ppe-boot 同口径）
+find_ppe_dir() {
+	local d
+	for d in /sys/module/zx279128s_ppe/parameters /sys/module/zx279128s-ppe/parameters; do
+		[ -e "$d/cla_write" ] && { echo "$d"; return 0; }
+	done
+	return 1
+}
+
+# 等 ppe 模块的参数节点；每轮 1 s，最多 WAIT_SECS 轮。不 sleep：timeout 1 tail -f /dev/null。
+wait_ppe() {
+	local _i=0
+	while [ "$_i" -lt "$WAIT_SECS" ]; do
+		PPE_PARAM=$(find_ppe_dir) && return 0
+		[ -e /etc/e2631-ppe-failed ] && return 1
+		timeout 1 tail -f /dev/null
+		_i=$((_i + 1))
+	done
+	return 1
+}
+
+# 写 4 个 trap（t..t+3）为同一个 qid：一次 sysfs 写、8 对，正好是驱动上限。
+# 顺序：先 0x14 命令、再 0x1c 数据；写 0x1c 时硬件锁存。
+write_tr4() {
+	local _t=$1 _q=$2 _line= _i=0 _idx _cmd _d
+	while [ "$_i" -lt 4 ]; do
+		_idx=$((BLOCK1_BASE + _t + _i))
+		_cmd=$(printf '%08x' $((_idx | CLA_TABLE7)))
+		_d=$(printf '%08x' "$_q")
+		_line="$_line${_line:+,}${CLA_CMD_TXT}=$_cmd,${CLA_DATA_TXT}=$_d"
+		_i=$((_i + 1))
+	done
+	printf '%s\n' "$_line" > "$PPE_PARAM/cla_write" 2>/dev/null
+}
+
+# 读回一个 trap 的 word0（0x1c），逐字段比对：
+#   0x18 bit0 必须=1（idle/ready；驱动原文 eth.h:176-177 "status bit 0 = idle"，
+#   ppe.c:690-694 的 zx_pp_wait() 等 val & 1）。旧版把 1 当 busy 是极性写反。
+#   0x14 必须等于本次读命令（证明 dump 是刚发生的，不是 tail 到上一轮旧行）。
+#   0x1c 必须等于 expected。
+# 返回 0 = 三个字全部自洽；失败时置 FAIL_T / FAIL_GOT / FAIL_RAW（原始 dmesg 行）。
+verify_trap() {
+	local _t=$1 _want _idx _cmd _line _rest _st _got
+	_want=$(printf '%08x' "$2")
+	_idx=$((BLOCK1_BASE + _t))
+	_cmd=$(printf '%08x' $((_idx | CLA_TABLE7 | CLA_READ)))
+
+	FAIL_RAW=""
+	printf '%s=%s\n' "$CLA_CMD_TXT" "$_cmd" > "$PPE_PARAM/cla_write" 2>/dev/null || {
+		FAIL_T=$_t; FAIL_GOT="写读命令失败"; return 1; }
+	printf '4\n' > "$PPE_PARAM/dump" 2>/dev/null || {
+		FAIL_T=$_t; FAIL_GOT="写 dump=4 失败"; return 1; }
+
+	_line=$(dmesg 2>/dev/null | grep -F 'cla-reg 010:' | tail -n 1)
+	printf '0\n' > "$PPE_PARAM/dump" 2>/dev/null
+
+	if [ -z "$_line" ]; then
+		FAIL_T=$_t; FAIL_GOT="dmesg 里没有 cla-reg 010: 行（dump 没发生？）"
+		return 1
+	fi
+	FAIL_RAW=$_line
+	_rest=${_line#*cla-reg 010: }
+	# shellcheck disable=SC2086
+	set -- $_rest
+	if [ "${2:-}" != "$_cmd" ]; then
+		FAIL_T=$_t; FAIL_GOT="0x14 ${2:-<缺>} != $_cmd"; return 1
+	fi
+	_st=${3:-}
+	case "$_st" in
+	????????) ;;
+	*) FAIL_T=$_t; FAIL_GOT="0x18 解析失败（'$_st'，原始行见下）"; return 1 ;;
+	esac
+	case "$_st" in
+	*[13579bdf]) ;;
+	*) FAIL_T=$_t; FAIL_GOT="0x18=$_st bit0=0 (busy)"; return 1 ;;
+	esac
+	_got=${4:-}
+	[ "$_got" = "$_want" ] || {
+		FAIL_T=$_t; FAIL_GOT="0x1c ${_got:-<缺>} != $_want"; return 1; }
+	return 0
+}
+
+# 把 block1 全部 TRAPS 个 trap 写成同一 qid（一次 4 个 = 驱动 8 对上限）。
+write_block1() {
+	local _q=$1 _t=0
+	while [ "$_t" -lt "$TRAPS" ]; do
+		write_tr4 "$_t" "$_q" || {
+			FAIL_T=$_t
+			FAIL_GOT="写 index 0x$(printf '%x' $((BLOCK1_BASE + _t))) 失败"
+			FAIL_RAW=""
+			return 1
+		}
+		_t=$((_t + 4))
+	done
+	return 0
+}
+
+# 逐条读回 block1 全部 TRAPS 个 trap；返回 0 = 全部一致。
+# 失败不早退：FAIL_LIST 收集全部不符的 trap（0..127），FAIL_N 为个数，
+# FIRST_T/FIRST_GOT/FIRST_RAW 另存首个失败点（verify_trap 每轮会重写 FAIL_*）。
+verify_block1() {
+	local _q=$1 _t=0 _rc=0
+	FAIL_LIST=""
+	FAIL_N=0
+	FIRST_T=""
+	FIRST_GOT=""
+	FIRST_RAW=""
+	while [ "$_t" -lt "$TRAPS" ]; do
+		if ! verify_trap "$_t" "$_q"; then
+			if [ "$FAIL_N" -eq 0 ]; then
+				FIRST_T=$FAIL_T
+				FIRST_GOT=$FAIL_GOT
+				FIRST_RAW=$FAIL_RAW
+			fi
+			FAIL_LIST="$FAIL_LIST $_t"
+			FAIL_N=$((FAIL_N + 1))
+			_rc=1
+		fi
+		_t=$((_t + 1))
+	done
+	return $_rc
+}
+
+# 无条件清 block1：先全写 0，再逐条读回核实全 0。
+clear_block1() {
+	FAIL_LIST=""
+	FAIL_N=0
+	FIRST_T=""
+	FIRST_GOT=""
+	FIRST_RAW=""
+	write_block1 0 || return 1
+	verify_block1 0
+}
+
+# start 用：写 16 个 trap（4 批）后立即逐条读回这 16 个；任一不符 fail-fast。
+apply_qid() {
+	local _q=$1 _t=0 _i
+	while [ "$_t" -lt "$TRAPS" ]; do
+		write_tr4 "$_t" "$_q" || { FAIL_T=$_t; FAIL_GOT="write failed"; return 1; }
+		write_tr4 "$((_t + 4))" "$_q" || { FAIL_T=$((_t + 4)); FAIL_GOT="write failed"; return 1; }
+		write_tr4 "$((_t + 8))" "$_q" || { FAIL_T=$((_t + 8)); FAIL_GOT="write failed"; return 1; }
+		write_tr4 "$((_t + 12))" "$_q" || { FAIL_T=$((_t + 12)); FAIL_GOT="write failed"; return 1; }
+		_i=0
+		while [ "$_i" -lt "$BATCH" ]; do
+			verify_trap "$((_t + _i))" "$_q" || return 1
+			_i=$((_i + 1))
+		done
+		_t=$((_t + BATCH))
+	done
+	return 0
+}
+
+start() {
+	# 封禁门：2026-11-04 实测判死（单流 -R -22.60 %），分环永不默认开。
+	# 默认 return 0（不是 1），避免开机日志里出现一条"启动失败"。
+	if [ "${RXSPLIT_FORCE:-0}" != "1" ]; then
+		_msg="该功能经 2026-11-04 实测对单流 -R 有害 -22.60 %（rx-split-onbox/20261104-2050/RESULT.md；bidir 也 -3.27 %），分环永不默认开，默认拒绝执行；确需复现请设 RXSPLIT_FORCE=1"
+		echo "e2631-rxsplit: $_msg"
+		log_info "$_msg"
+		return 0
+	fi
+	log_info "RXSPLIT_FORCE=1：实验路径，强制执行分环写入（分环永不默认开）"
+
+	if rx_split_on; then
+		:
+	elif [ "$(uci -q get zx_ffe.settings.rx_split 2>/dev/null)" = 1 ]; then
+		if [ ! -w "$ETH_PARAM/rx_split" ]; then
+			log_err "uci 要求开机打开 rx_split，但 $ETH_PARAM/rx_split 不存在/不可写（驱动没编进来？）"
+			return 1
+		fi
+		printf '1\n' > "$ETH_PARAM/rx_split" 2>/dev/null || {
+			log_err "写 $ETH_PARAM/rx_split=1 失败（setter 拒绝了：kthread/绑核失败？）"
+			return 1; }
+		if ! rx_split_on; then
+			log_err "写 rx_split=1 后读回不是 Y；不写 CLA"
+			return 1
+		fi
+		log_info "按 uci 把 rx_split 0->1（实际状态优先，CLA 随后写）"
+	else
+		# 默认/关闭：不写 CLA、不写 rx_split、不打日志
+		return 0
+	fi
+
+	command -v dmesg >/dev/null 2>&1 || {
+		log_err "没有 dmesg，无法做 CLA 读回校验；拒绝盲写"
+		return 1; }
+
+	if ! wait_ppe; then
+		if [ -e /etc/e2631-ppe-failed ]; then
+			log_err "rx_split=1，但本次开机 ppe 被守卫跳过（/etc/e2631-ppe-failed）；CLA 未写，ring1 会空转"
+		else
+			log_err "rx_split=1，但 cla_write 在 ${WAIT_SECS}s 内没出现（ppe 未加载？）；CLA 未写，ring1 会空转"
+		fi
+		return 1
+	fi
+
+	if apply_qid "$QID"; then
+		log_info "block1 trap 0..127（index 0x100..0x17f）-> qid 1，$TRAPS 个读回全部自洽（0x18 bit0=1、0x1c=1）"
+		return 0
+	fi
+	_ft=$FAIL_T
+	_fg=$FAIL_GOT
+	_fr=$FAIL_RAW
+	log_err "读回不符：trap $_ft（$_fg）；把 block1 全部 $TRAPS 个 trap 无条件回滚为 0"
+	[ -n "$_fr" ] && echo "e2631-rxsplit start: 原始 dmesg 行：$_fr"
+	if clear_block1; then
+		log_err "回滚完成：$TRAPS 个 trap=0 且逐条读回确认"
+	else
+		if [ "$FAIL_N" -gt 0 ]; then
+			log_err "回滚也失败：$FAIL_N 个 trap 未核实为 0（${FAIL_LIST}），首个 trap ${FIRST_T}（${FIRST_GOT}）——lan2 帧可能仍被导向 ring1，手工回退见脚本头"
+			[ -n "$FIRST_RAW" ] && echo "e2631-rxsplit start: 回滚失败原始 dmesg 行：$FIRST_RAW"
+		else
+			log_err "回滚写失败：trap $FAIL_T（$FAIL_GOT）——无法确认已清 0，手工回退见脚本头"
+		fi
+	fi
+	return 1
+}
+
+stop() {
+	PPE_PARAM=$(find_ppe_dir) || {
+		log_info "ppe 未加载，没有可清的 CLA；rx_split 保持原样"
+		return 0; }
+	command -v dmesg >/dev/null 2>&1 || {
+		log_err "没有 dmesg，无法做读回校验；拒绝盲写"
+		return 1; }
+
+	# 无条件清 block1 全部 128 个 trap（不看 rx_split、不看 start 曾写到哪里）。
+	if clear_block1; then
+		log_info "block1 trap 0..127（index 0x100..0x17f）已清 0，$TRAPS/$TRAPS 读回一致；rx_split 未动"
+		return 0
+	fi
+	[ -n "$FIRST_RAW" ] && echo "e2631-rxsplit stop: 首个失败原始 dmesg 行：$FIRST_RAW"
+	if [ "$FAIL_N" -gt 0 ]; then
+		log_err "清零读回失败：$FAIL_N 个 trap 未核实为 0（${FAIL_LIST}），首个 trap ${FIRST_T}（${FIRST_GOT}）；重试一次"
+	else
+		log_err "清零写失败：trap $FAIL_T（$FAIL_GOT）；重试一次"
+	fi
+
+	if clear_block1; then
+		log_info "重试成功：$TRAPS/$TRAPS trap=0 且逐条读回一致"
+		return 0
+	fi
+	[ -n "$FIRST_RAW" ] && echo "e2631-rxsplit stop: 重试后首个失败原始 dmesg 行：$FIRST_RAW"
+	if [ "$FAIL_N" -gt 0 ]; then
+		log_err "最终 rc=1：仍有 $FAIL_N 个 trap 未核实为 0（${FAIL_LIST}），首个 trap ${FIRST_T}（${FIRST_GOT}）；lan2 帧可能仍被导向 ring1，按脚本头手工回退"
+		echo "e2631-rxsplit stop: rc=1 failed_traps=${FAIL_LIST# }"
+	else
+		log_err "最终 rc=1：清零写失败：trap $FAIL_T（$FAIL_GOT）；无法确认已清 0"
+		echo "e2631-rxsplit stop: rc=1 failed_traps=<write-error-at-trap-$FAIL_T>"
+	fi
+	return 1
+}

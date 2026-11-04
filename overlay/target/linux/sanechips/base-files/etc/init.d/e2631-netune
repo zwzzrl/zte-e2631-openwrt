@@ -1,28 +1,27 @@
 #!/bin/sh /etc/rc.common
-# Dual-core load spreading for the gmac ports, applied every boot (sysfs
-# does not persist).  Three independent knobs, each with its evidence:
+# Per-core network tuning for the gmac ports, applied every boot (sysfs does
+# not persist).  Two knobs are left, each with its evidence:
 #
-#  RPS on CPU0 with the IRQ on CPU1 - one RX ring shares one IRQ line for
-#    every port, so the driver's NAPI always runs on the IRQ's core.  Leaving
-#    the protocol stack on the *other* core is what keeps a single core from
-#    carrying both halves.  History: the original tuning put the IRQ on CPU0
-#    and RPS on CPU1 (a split) and measured +4.6 %; a later change pinned the
-#    IRQ to CPU1 as well ("keep the softirq local to the IRQ"), which put both
-#    halves back on one core and was never re-measured on a CPU-bound path.
-#    Measured 2026-10-30 on routed IPv6 with software flow offload (the only
-#    v6 fast path this board has), 8 TCP streams x 15 s, several runs each:
-#       IRQ CPU1 + RPS CPU1 (both halves on one core)
-#                                    341-374 Mbit/s, CPU1 sirq 81-89 %
-#       IRQ CPU1 + RPS CPU0 (split)  392-410 Mbit/s, CPU1 sirq 72-77 %,
-#                                    CPU0 32-34 %
-#    i.e. +12 % and neither core permanently pegged.  On the IPv4 PPE path
-#    the data plane bypasses the CPU entirely, so this knob does not matter
-#    there.  XPS is not touched: the single TX queue's xps_cpus exists in
-#    sysfs but reads ENOENT here, so the old XPS=CPU1 write was a no-op.
+#  IRQ affinity of 92000000.ethernet to CPU1 - one RX ring shares one IRQ line
+#    for every port, so the gmac interrupt, and the NAPI it schedules, are
+#    handled on CPU1.  This is the only per-core placement this script still
+#    makes.
 #
-#  IRQ affinity of 92000000.ethernet to CPU1 - the complement of the above.
-#    Pinning the IRQ alone, with RPS still on the same core, measured no gain:
-#    what matters is that the two halves sit on different cores.
+#  RPS is deliberately not set here any more, for two reasons:
+#    - On the FFE path it cannot apply: an accelerated frame is forwarded
+#      inside the driver's poll and never reaches netif_receive_skb(), and
+#      get_rps_cpu() is called only from there (net/core/dev.c).  On the IPv4
+#      PPE path the data plane bypasses the CPU entirely.
+#    - On the stack path the same sysfs files are already rewritten for us:
+#      netifd's packet_steering (S25packet_steering) runs 1 s after every
+#      interface event and on a firewall reload, and /sbin/e2631-netune-apply
+#      runs every minute from cron.  A third writer at boot changed nothing
+#      and made this script look like it tuned the fast path.
+#    The old "+12 %: IRQ CPU1 + RPS CPU0" numbers were a stack-path (IPv6
+#    software offload) measurement and live in
+#    docs/features/v6-software-fastpath.md §5.  If packet_steering is ever
+#    turned off, set the mask in exactly ONE place - not here plus two
+#    backstops.
 #
 #  PAUSE frames off - the sibling ZX279133 port (cnjn, right.com.cn
 #    thread-8486503) traced a hard upload ceiling to flow-control frames
@@ -66,9 +65,9 @@ tune_port() {
 	[ -d "/sys/class/net/$ifn" ] || return 0
 	for q in "/sys/class/net/$ifn/queues/rx-"*; do
 		[ -d "$q" ] || continue
-		echo 1 > "$q/rps_cpus" 2>/dev/null
 		echo 256 > "$q/rps_flow_cnt" 2>/dev/null
 	done
+	# 注意：本机驱动没有 set_pauseparam（见 zx279128s-main.c 的 ethtool_ops），这两行是 no-op，别以为 pause 被关了
 	command -v ethtool >/dev/null 2>&1 && \
 		ethtool -A "$ifn" rx off tx off 2>/dev/null
 }

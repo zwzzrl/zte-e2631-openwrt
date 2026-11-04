@@ -24,3 +24,30 @@ config settings 'settings'
 	option rx_coalesce_us '250'
 	option rx_coalesce_frames '16'
 	option napi_weight '64'
+	# 1b-A 子环拆分：1 = 开机把 block1（base 0x100 = lan2 入向）的 128 个 CLA
+	# trap 写成 qid=1，并让 rx_split=1 多建一条只扫 ring1 的 NAPI；0 = 关（默认）。
+	# 由 /etc/init.d/e2631-rxsplit 应用；优先级：sysfs rx_split 的实际状态 >
+	# 本项（只在 sysfs 为 N 时把它打开）。默认 0 时脚本一个字节都不写。
+	# 驱动开关本身是 /sys/module/zx279128s_eth/parameters/rx_split（Y/N）。
+	# 回退顺序：先 /etc/init.d/e2631-rxsplit stop（写 0+读回），再关 rx_split。
+	option rx_split '0'
+
+# 多 WAN / 策略路由安全阀（/etc/init.d/zx_ffe_multiwan + sbin/e2631-ffe-multiwan）
+#
+# FFE 硬件条目没有"这条 WAN 还活着"的概念；多 WAN 切路由后旧条目仍按旧出口
+# 转发 ⇒ 流量静默黑洞，要等老化（默认 300 s）。守卫检测到多 WAN/策略路由就写
+# debugfs accel_ipvN=stack 退回纯软件转发；单 WAN 基线下它一次 accel_* 都不写。
+# 判据、恢复与绕过：docs/operations/multiwan-ffe-safety.md
+#
+#   enabled        1 = 守卫生效（默认）；0 = 关守卫，并把之前关掉的快路写回去
+#   families       要守的协议族，空格分隔：6 = IPv6 FFE（交付态 accel_v6=ffe）
+#                  4 = IPv4 ffe/zc；IPv4 的 PPE 硬件 offload 不归这个开关管，
+#                  要关它请用 uci firewall.@defaults[0].flow_offloading_hw=0
+#   poll_interval  没有 ifup 时的兜底重评周期，秒（1..60，默认 5）
+#   hold_seconds   判据全不成立后再等多久才恢复（默认 300，给 failover/failback
+#                  留窗口；0 = 立刻恢复）
+config multiwan 'multiwan'
+	option enabled '1'
+	option families '6'
+	option poll_interval '5'
+	option hold_seconds '300'
