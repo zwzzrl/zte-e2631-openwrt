@@ -1,0 +1,13 @@
+{
+	"admin/status/e2631-temp": {
+		"title": "系统温度",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "status/e2631-temp"
+		},
+		"depends": {
+			"acl": [ "luci-app-e2631-temp" ]
+		}
+	}
+}

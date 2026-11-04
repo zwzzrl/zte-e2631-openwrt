@@ -1,0 +1,12 @@
+{
+	"luci-app-e2631-temp": {
+		"description": "Read-only access to the E2631 temperature sources: SoC debugfs soc_temp plus the mt7915 WiFi hwmon name/temp*_input attributes (real paths, because rpcd's file plugin checks the ACL against realpath())",
+		"read": {
+			"file": {
+				"/sys/kernel/debug/*/soc_temp": [ "read" ],
+				"/sys/devices/platform/soc/*/pci*/*/*/ieee80211/phy*/hwmon*/name": [ "read" ],
+				"/sys/devices/platform/soc/*/pci*/*/*/ieee80211/phy*/hwmon*/temp*_input": [ "read" ]
+			}
+		}
+	}
+}
