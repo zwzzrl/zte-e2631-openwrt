@@ -49,7 +49,7 @@ reg_ro: off=0x354000 len=64 (readl only)
 ## §2 偏移口径（0x354000 是相对谁的）
 
 **相对驱动 reg base `0x92000000`**，也就是整个 gmac 的 4 MiB 窗口。
-`zx279128s-eth.h:35-39` 原文："Register offsets from the start of the block
+`zx279128s-eth.h:36-40` 原文："Register offsets from the start of the block
 (0x92000000)"；`ZX_TM_BASE = 0x340000`（`eth.h:90`）本身也只是这个窗口里的一个
 偏移。因此：
 
@@ -85,3 +85,5 @@ cat $D/reg_ro
 
 对照原厂值之前先确认读的是同一颗 dword：偏移按 §2 的口径换算，别把
 `0x340000` 加两次。
+
+写入请见 [`debugfs-reg-rw.md`](debugfs-reg-rw.md)（可写钩子，默认关闭，风险见该文 §6）。
